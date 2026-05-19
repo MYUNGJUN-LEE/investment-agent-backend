@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 from app.config import settings
 from app.models import PipelineRequest, PipelineResponse
 from app.services.pipeline import run_full_pipeline
-from fastapi.responses import Response
+
 
 app = FastAPI(
     title="Investment Agent API",
