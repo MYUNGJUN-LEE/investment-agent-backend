@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+from app.models import PipelineRequest
+from app.agents import (
+    run_research_agent,
+    run_financial_agent,
+    run_chart_flow_agent,
+    run_devils_advocate_agent,
+    run_final_check_agent,
+)
+
+
+DISCLAIMER = (
+    "본 결과는 공개 데이터 기반의 분석 보조 자료이며, 확정적 매수/매도 지시나 수익 보장이 아닙니다. "
+    "실제 매매 전 최신 시세, 공시, 뉴스, 수급, 본인의 손실 감내 범위를 반드시 확인하세요."
+)
+
+
+def run_full_pipeline(req: PipelineRequest) -> dict:
+    research_result = run_research_agent(req)
+    financial_result = run_financial_agent(req, research_result)
+    chart_flow_result = run_chart_flow_agent(req, research_result, financial_result)
+    devils_result = run_devils_advocate_agent(
+        req,
+        research_result,
+        financial_result,
+        chart_flow_result,
+    )
+    final_result = run_final_check_agent(
+        req,
+        research_result,
+        financial_result,
+        chart_flow_result,
+        devils_result,
+    )
+
+    return {
+        "symbol": req.symbol,
+        "name": req.name,
+        "market": req.market,
+        "strategy_type": req.strategy_type,
+        "final_grade": final_result["final_grade"],
+        "entry_signal": final_result["entry_signal"],
+        "exit_signal": final_result["exit_signal"],
+        "confidence": final_result["confidence"],
+        "summary": final_result["summary"],
+        "disclaimer": DISCLAIMER,
+        "scores": final_result["scores"],
+        "entry_conditions": final_result["entry_conditions"],
+        "avoid_conditions": final_result["avoid_conditions"],
+        "stop_loss_candidates": final_result["stop_loss_candidates"],
+        "take_profit_candidates": final_result["take_profit_candidates"],
+        "time_exit_rule": final_result["time_exit_rule"],
+        "research_result": research_result,
+        "financial_result": financial_result,
+        "chart_flow_result": chart_flow_result,
+        "devils_advocate_result": devils_result,
+    }

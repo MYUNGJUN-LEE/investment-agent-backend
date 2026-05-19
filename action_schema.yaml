@@ -1,0 +1,134 @@
+openapi: 3.1.0
+info:
+  title: Investment Agent API
+  version: 1.0.0
+  description: API for running a five-agent investment analysis pipeline.
+servers:
+  - url: https://strung-barrel-coastland.ngrok-free.dev
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Check whether the investment agent backend is running.
+      responses:
+        "200":
+          description: Server health status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: investment-agent-backend
+
+  /run-full-pipeline:
+    post:
+      operationId: runFullInvestmentPipeline
+      summary: Run full investment analysis pipeline.
+      description: Runs Research, Financial Analysis, Chart & Flow, Devil's Advocate, and Final Check agents in sequence.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - symbol
+                - market
+                - strategy_type
+              properties:
+                symbol:
+                  type: string
+                  description: Stock ticker code. Example 000660 for SK Hynix.
+                  example: "000660"
+                name:
+                  type: string
+                  description: Company name.
+                  example: "SK하이닉스"
+                market:
+                  type: string
+                  enum: ["KR", "US"]
+                  example: "KR"
+                strategy_type:
+                  type: string
+                  enum: ["daytrade", "swing", "midterm"]
+                  example: "daytrade"
+                lookback_hours:
+                  type: integer
+                  example: 24
+                risk_level:
+                  type: string
+                  enum: ["low", "medium", "high"]
+                  example: "medium"
+      responses:
+        "200":
+          description: Full investment pipeline result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  symbol:
+                    type: string
+                  name:
+                    type: string
+                  market:
+                    type: string
+                  strategy_type:
+                    type: string
+                  final_grade:
+                    type: string
+                    enum: ["공격", "중립", "관망", "회피"]
+                  entry_signal:
+                    type: boolean
+                  exit_signal:
+                    type: boolean
+                  confidence:
+                    type: number
+                  summary:
+                    type: string
+                  disclaimer:
+                    type: string
+                  scores:
+                    type: object
+                  entry_conditions:
+                    type: array
+                    items:
+                      type: string
+                  avoid_conditions:
+                    type: array
+                    items:
+                      type: string
+                  stop_loss_candidates:
+                    type: array
+                    items:
+                      type: string
+                  take_profit_candidates:
+                    type: array
+                    items:
+                      type: string
+                  time_exit_rule:
+                    type: string
+                  research_result:
+                    type: object
+                  financial_result:
+                    type: object
+                  chart_flow_result:
+                    type: object
+                  devils_advocate_result:
+                    type: object
