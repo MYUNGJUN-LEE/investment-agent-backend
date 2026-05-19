@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.models import PipelineRequest, PipelineResponse
 from app.services.pipeline import run_full_pipeline
-
+from fastapi.responses import Response
 
 app = FastAPI(
     title="Investment Agent API",
@@ -30,6 +30,19 @@ def verify_api_key(x_api_key: str | None = Header(default=None)):
         if x_api_key != settings.backend_api_key:
             raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": settings.app_name,
+        "message": "Investment Agent Backend is running",
+        "health": "/health",
+        "docs": "/docs"
+    }
 
 @app.get("/health")
 def health_check():
