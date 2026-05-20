@@ -57,12 +57,7 @@ def health_check():
 @app.head("/")
 def root_head():
     return Response(status_code=200)
-
-
-@app.get("/favicon.ico", include_in_schema=False)
-def favicon():
-    return Response(status_code=204)
-
+    
 @app.post(
     "/run-full-pipeline",
     response_model=PipelineResponse,
