@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: API for running a five-agent investment analysis pipeline.
 servers:
-  - url: https://strung-barrel-coastland.ngrok-free.dev
+  - url: https://investment-agent-backend.onrender.com
 
 components:
   securitySchemes:

@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from app.services.naver_news import search_naver_news
 
 from app.config import settings
 from app.models import PipelineRequest, PipelineResponse
@@ -53,6 +54,10 @@ def health_check():
         "auth_enabled": bool(settings.backend_api_key),
     }
 
+@app.get("/naver/news")
+async def get_naver_news(query: str, display: int = 10):
+    return await search_naver_news(query=query, display=display)
+
 
 @app.head("/")
 def root_head():
@@ -62,6 +67,34 @@ def root_head():
     "/run-full-pipeline",
     response_model=PipelineResponse,
     dependencies=[Depends(verify_api_key)],
+    operation_id="runFullPipeline",
+    summary="Run full investment analysis pipeline",
+    description="Runs the full investment analysis pipeline for a requested stock.",
 )
 def run_pipeline(req: PipelineRequest):
     return run_full_pipeline(req)
+
+
+from fastapi import FastAPI, Header, HTTPException
+from app.config import settings
+from app.services.pipeline import run_full_pipeline
+
+@app.post("/runMorningBriefing")
+async def run_morning_briefing(x_api_key: str | None = Header(default=None)):
+    if settings.backend_api_key:
+        if x_api_key != settings.backend_api_key:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+
+    result = await run_full_pipeline(
+        ticker="NVDA",
+        market="US",
+        strategy="swing",
+        recent_hours=72,
+        risk_level="medium"
+    )
+
+    return {
+        "status": "success",
+        "message": "Morning briefing completed",
+        "result": result
+    }
