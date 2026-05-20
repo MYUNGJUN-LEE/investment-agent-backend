@@ -18,43 +18,21 @@ DISCLAIMER = (
 )
 
 
-async def run_full_pipeline(request):
-    ticker = request.ticker
-    company_name = request.company_name if hasattr(request, "company_name") else ticker
-
-    naver_news = await search_naver_news(
-        query=company_name,
-        display=10
-        sort="date"
+def run_full_pipeline(req: PipelineRequest) -> dict:
+    company_name = (
+        getattr(req, "company_name", None)
+        or getattr(req, "name", None)
+        or req.symbol
     )
 
-    # Research Agent에 뉴스 데이터 전달
-    research_result = {
-        "news_source": "Naver Search API",
-        "naver_connected": naver_news.get("connected"),
-        "news_items": naver_news.get("items", []),
-    }
+    naver_news_result = search_naver_news(
+        query=company_name,
+        display=10,
+        sort="date",
+    )
 
-    # 이후 기존 5개 agent 분석에 naver_news를 포함
-    financial_result = ...
-    chart_result = ...
-    devil_result = ...
-    final_result = ...
-
-    return {
-        "ticker": ticker,
-        "company_name": company_name,
-        "naver_news": naver_news["items"],
-        "research_result": research_result,
-        "financial_result": financial_result,
-        "chart_result": chart_result,
-        "devil_result": devil_result,
-        "final_result": final_result
-    }
-
-def run_full_pipeline(req: PipelineRequest) -> dict:
-    naver_news_result = search_naver_news(req)
     research_result = run_research_agent(req)
+
     if isinstance(research_result, dict):
         research_result["naver_news"] = naver_news_result
         research_result["naver_connected"] = naver_news_result.get("connected")
@@ -68,13 +46,20 @@ def run_full_pipeline(req: PipelineRequest) -> dict:
         }
 
     financial_result = run_financial_agent(req, research_result)
-    chart_flow_result = run_chart_flow_agent(req, research_result, financial_result)
+
+    chart_flow_result = run_chart_flow_agent(
+        req,
+        research_result,
+        financial_result,
+    )
+
     devils_result = run_devils_advocate_agent(
         req,
         research_result,
         financial_result,
         chart_flow_result,
     )
+
     final_result = run_final_check_agent(
         req,
         research_result,
@@ -84,9 +69,12 @@ def run_full_pipeline(req: PipelineRequest) -> dict:
     )
 
     return {
+        "debug_code_version": "naver_test_0520",
+        "debug_naver_news": naver_news_result,
+
         "symbol": req.symbol,
         "name": req.name,
-        "company_name": req.company_name if hasattr(req, "company_name") else req.symbol,
+        "company_name": company_name,
         "market": req.market,
         "strategy_type": req.strategy_type,
         "final_grade": final_result["final_grade"],
