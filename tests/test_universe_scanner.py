@@ -103,7 +103,8 @@ def test_auto_trading_empty_symbols_runs_universe_scanner(monkeypatch):
         lambda req: {
             "status": "success",
             "scan_id": "scan-test",
-            "source_symbol_count": 3,
+            "source_symbol_count": 15,
+            "snapshot_count": 15,
             "candidate_count": 2,
             "final_count": 1,
             "final_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
@@ -125,6 +126,57 @@ def test_auto_trading_empty_symbols_runs_universe_scanner(monkeypatch):
     assert result["results"][0]["symbol"] == "__universe__"
     assert result["results"][0]["scan_id"] == "scan-test"
     assert result["results"][1]["symbol"] == "005930"
+
+
+def test_auto_trading_blocks_when_universe_scan_has_too_few_symbols(monkeypatch):
+    scanned_symbol = AutoTradeSymbolConfig(
+        symbol="005930",
+        name="Samsung Electronics",
+        price=70000,
+        decision_price=70000,
+        order_price=70000,
+    )
+    run_calls: list[str] = []
+
+    monkeypatch.setattr(
+        auto_trading,
+        "scan_universe_for_auto_trade",
+        lambda req: {
+            "status": "success",
+            "scan_id": "scan-small",
+            "source_symbol_count": 14,
+            "snapshot_count": 14,
+            "candidate_count": 2,
+            "final_count": 1,
+            "final_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
+            "symbols": [scanned_symbol],
+        },
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "_run_symbol",
+        lambda req, symbol_cfg, session_id=None: run_calls.append(symbol_cfg.symbol),
+    )
+
+    result = auto_trading.run_auto_trading_once(AutoTradeStartRequest())
+
+    assert result["results"] == [
+        {
+            "symbol": "__universe__",
+            "status": "blocked",
+            "scan_id": "scan-small",
+            "source_symbol_count": 14,
+            "snapshot_count": 14,
+            "candidate_count": 2,
+            "final_count": 1,
+            "final_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
+            "message": (
+                "Universe scanner scanned 14 symbols; "
+                "at least 15 symbols are required before trading"
+            ),
+        }
+    ]
+    assert run_calls == []
 
 
 def test_universe_scanner_uses_latest_close_as_watch_when_market_closed(

@@ -275,11 +275,26 @@ def _run_cycle(
                 "status": scan["status"],
                 "scan_id": scan["scan_id"],
                 "source_symbol_count": scan["source_symbol_count"],
+                "snapshot_count": scan.get("snapshot_count", scan["source_symbol_count"]),
                 "candidate_count": scan["candidate_count"],
                 "final_count": scan["final_count"],
                 "final_candidates": scan["final_candidates"],
             }
         )
+        min_scanned_symbols = max(
+            0,
+            int(settings.universe_scanner_min_scanned_symbols_for_trading or 0),
+        )
+        scanned_symbols = int(
+            scan.get("snapshot_count") or scan.get("source_symbol_count") or 0
+        )
+        if min_scanned_symbols and scanned_symbols < min_scanned_symbols:
+            results_prefix[0]["status"] = "blocked"
+            results_prefix[0]["message"] = (
+                f"Universe scanner scanned {scanned_symbols} symbols; "
+                f"at least {min_scanned_symbols} symbols are required before trading"
+            )
+            return results_prefix
         if not symbols:
             results_prefix[0]["message"] = "Universe scanner found no tradable candidates"
             return results_prefix

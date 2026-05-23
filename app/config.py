@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     universe_scanner_final_limit: int = 10
     universe_scanner_max_source_symbols: int = 80
     universe_scanner_symbol_interval_seconds: float = 60.0
+    universe_scanner_min_scanned_symbols_for_trading: int = 15
     embedded_workers_enabled: bool = os.getenv("RENDER_SERVICE_TYPE") == "web"
     embedded_worker_broker_sync_enabled: bool = True
 
