@@ -36,6 +36,7 @@ def test_gpt_health_endpoint_uses_fresh_operation_path():
 def test_action_schema_is_served_for_custom_gpt():
     response = client.get("/action-schema.yaml")
     assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/yaml")
     assert "openapi: 3.1.0" in response.text
     assert "gptBackendHealthCheck" in response.text
 

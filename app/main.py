@@ -3,7 +3,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from app.services.naver_news import search_naver_news
 
 from app.brokers.kis_client import KisClient
@@ -194,9 +194,9 @@ def custom_gpt_action_schema():
     schema_path = Path(__file__).resolve().parents[1] / "action_schema.gpt-control.yaml"
     if not schema_path.exists():
         raise HTTPException(status_code=404, detail="Action schema not found")
-    return Response(
+    return PlainTextResponse(
         content=schema_path.read_text(encoding="utf-8"),
-        media_type="application/yaml",
+        media_type="text/yaml",
     )
 
 
