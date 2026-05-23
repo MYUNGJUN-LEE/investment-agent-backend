@@ -95,14 +95,28 @@ app.add_middleware(
 )
 
 
-def verify_api_key(x_api_key: str | None = Header(default=None)):
+def verify_api_key(
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+):
     """
     If BACKEND_API_KEY is set in .env, every request must include:
     X-API-Key: <BACKEND_API_KEY>
+
+    Custom GPT Actions should be configured with X-API-Key, but accepting a
+    bearer token as a fallback makes production diagnosis less brittle when the
+    action auth type is accidentally set to Bearer.
     """
     if settings.backend_api_key:
-        if x_api_key != settings.backend_api_key:
-            raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+        candidates = [x_api_key]
+        if authorization:
+            scheme, _, token = authorization.partition(" ")
+            candidates.append(token if scheme.lower() == "bearer" and token else authorization)
+        if settings.backend_api_key not in candidates:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing API key. Send X-API-Key or Authorization: Bearer.",
+            )
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
