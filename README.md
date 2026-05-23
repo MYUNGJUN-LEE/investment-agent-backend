@@ -354,6 +354,13 @@ KIS limits access-token issuance. The backend reuses tokens through
 `GET /broker/kis/config-status` to inspect non-secret KIS runtime settings and
 token-cache status.
 
+If KIS returns `OPSQ2000: INPUT INVALID_CHECK_ACNO`, the account number does not
+match the configured KIS app key/environment. Use `KIS_ACCOUNT_NO` for the
+8-digit CANO only, for example `50189471`, and
+`KIS_ACCOUNT_PRODUCT_CODE=01`. Do not include a hyphen or the product code in
+`KIS_ACCOUNT_NO`. When `KIS_IS_PAPER=true`, both the app key and account must be
+from the KIS paper-trading environment.
+
 KIS also rejects excessive per-second API traffic. In the default safe
 configuration, `AUTO_TRADING_SYMBOL_WORKERS=1`,
 `KIS_REQUEST_MIN_INTERVAL_SECONDS=1.5`, and

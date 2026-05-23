@@ -21,11 +21,17 @@ def run_forever(
     poll_seconds = settings.broker_sync_interval_seconds if poll_seconds is None else poll_seconds
     initialize_order_state_db()
     while True:
+        sleep_seconds = float(poll_seconds)
         try:
-            run_once(reconcile_order_state=reconcile_order_state)
+            result = run_once(reconcile_order_state=reconcile_order_state)
+            if result.get("status") == "config_error":
+                sleep_seconds = max(
+                    sleep_seconds,
+                    float(settings.broker_sync_config_error_backoff_seconds or 0),
+                )
         except Exception as exc:
             print(f"broker_worker cycle failed: {exc}", flush=True)
-        time.sleep(float(poll_seconds))
+        time.sleep(sleep_seconds)
 
 
 def main() -> None:

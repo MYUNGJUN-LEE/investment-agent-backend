@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     monitor_default_take_profit_pct: float = 5.0
     monitor_news_display: int = 20
     broker_sync_interval_seconds: int = 60
+    broker_sync_config_error_backoff_seconds: int = 900
     alert_db_path: str = "data/alerts.sqlite3"
     alert_webhook_url: str | None = None
     alert_webhook_timeout: float = 5.0

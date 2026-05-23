@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sqlite3
 
-from app.trading.broker_sync import record_kis_sync
+from app.brokers.kis_client import KisApiError
+from app.trading import broker_sync_worker
+from app.trading.broker_sync import record_kis_sync, sync_kis_account
 
 
 def test_record_kis_sync_stores_positions_and_executions(tmp_path):
@@ -182,3 +184,44 @@ def test_record_kis_sync_does_not_close_missing_positions_without_complete_snaps
         ).fetchall()
 
     assert rows == [("000660", 2), ("005930", 3)]
+
+
+def test_sync_kis_account_returns_config_error_for_invalid_kis_account():
+    class FakeClient:
+        account_no = "50189471"
+        account_product_code = "01"
+        is_paper = True
+
+        def get_balance(self):
+            raise KisApiError(
+                "KIS API error OPSQ2000: ERROR : INPUT INVALID_CHECK_ACNO",
+                error_code="OPSQ2000",
+                error_description="ERROR : INPUT INVALID_CHECK_ACNO",
+            )
+
+    result = sync_kis_account(client=FakeClient())
+
+    assert result["status"] == "config_error"
+    assert result["kis_error_code"] == "OPSQ2000"
+    assert result["account_no_last4"] == "9471"
+    assert "paper/live KIS app key" in result["message"]
+
+
+def test_broker_sync_once_does_not_reconcile_when_sync_has_config_error(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        broker_sync_worker.broker_sync,
+        "sync_kis_account",
+        lambda: {"status": "config_error", "account_no": "50189471"},
+    )
+    monkeypatch.setattr(
+        broker_sync_worker.order_state,
+        "reconcile_all_after_broker_sync",
+        lambda account_no: calls.append(account_no),
+    )
+
+    result = broker_sync_worker.run_broker_sync_once()
+
+    assert result["status"] == "config_error"
+    assert result["order_state_reconcile"] is None
+    assert calls == []

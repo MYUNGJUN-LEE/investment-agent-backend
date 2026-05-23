@@ -6,7 +6,12 @@ import json
 import sqlite3
 from typing import Any
 
-from app.brokers.kis_client import KisClient
+from app.brokers.kis_client import (
+    KisApiError,
+    KisClient,
+    KisConfigError,
+    is_invalid_account_error,
+)
 from app.config import settings
 
 
@@ -63,13 +68,20 @@ def sync_kis_account(
 ) -> dict[str, Any]:
     """Synchronize KIS balance, positions, and recent order executions."""
     client = client or KisClient()
-    balance = client.get_balance()
-    end = datetime.now()
-    start = end - timedelta(days=max(0, lookback_days))
-    executions = client.get_daily_order_executions(
-        start_date=start.strftime("%Y%m%d"),
-        end_date=end.strftime("%Y%m%d"),
-    )
+    try:
+        balance = client.get_balance()
+        end = datetime.now()
+        start = end - timedelta(days=max(0, lookback_days))
+        executions = client.get_daily_order_executions(
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+    except KisConfigError as exc:
+        return _kis_config_error_result(client=client, exc=exc)
+    except KisApiError as exc:
+        if is_invalid_account_error(exc):
+            return _kis_config_error_result(client=client, exc=exc)
+        raise
     return record_kis_sync(
         balance=balance,
         executions=executions,
@@ -209,6 +221,33 @@ def record_kis_sync(
         "total_cash": totals.get("total_cash"),
         "total_value": totals.get("total_value"),
         "synced_at": now,
+    }
+
+
+def _kis_config_error_result(
+    client: KisClient,
+    exc: Exception,
+) -> dict[str, Any]:
+    error_code = getattr(exc, "error_code", None)
+    error_description = getattr(exc, "error_description", None)
+    return {
+        "status": "config_error",
+        "broker": "KIS",
+        "message": (
+            "KIS account configuration is invalid. Check that "
+            "KIS_ACCOUNT_NO is the 8-digit CANO only, "
+            "KIS_ACCOUNT_PRODUCT_CODE is the 2-digit product code, and the "
+            "account belongs to the configured paper/live KIS app key."
+        ),
+        "detail": str(exc),
+        "kis_error_code": error_code,
+        "kis_error_description": error_description,
+        "is_paper": client.is_paper,
+        "account_no_configured": bool(client.account_no),
+        "account_no_length": len(client.account_no or ""),
+        "account_no_last4": (client.account_no or "")[-4:],
+        "account_product_code": client.account_product_code or "",
+        "synced_at": _now(),
     }
 
 

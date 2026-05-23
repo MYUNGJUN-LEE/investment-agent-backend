@@ -7,7 +7,12 @@ import httpx
 import pytest
 
 from app.brokers import kis_client
-from app.brokers.kis_client import KisApiError, KisClient, KisConfigError
+from app.brokers.kis_client import (
+    KisApiError,
+    KisClient,
+    KisConfigError,
+    is_invalid_account_error,
+)
 
 
 def test_issue_access_token_uses_kis_token_endpoint():
@@ -380,6 +385,49 @@ def test_get_balance_requests_paper_balance_endpoint():
 
     assert result["rt_cd"] == "0"
     assert result["output1"][0]["pdno"] == "005930"
+
+
+def test_account_credentials_are_normalized_from_combined_account_value():
+    client = KisClient(
+        app_key="test-app-key",
+        app_secret="test-app-secret",
+        account_no=" 50189471-01 ",
+        is_paper=True,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+    )
+
+    assert client.account_no == "50189471"
+    assert client.account_product_code == "01"
+
+
+def test_get_balance_rejects_invalid_account_format_before_http_call():
+    calls: list[httpx.Request] = []
+
+    client = KisClient(
+        app_key="test-app-key",
+        app_secret="test-app-secret",
+        account_no="501",
+        account_product_code="01",
+        is_paper=True,
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={})
+        ),
+    )
+
+    with pytest.raises(KisConfigError, match="exactly 8 digits"):
+        client.get_balance()
+
+    assert calls == []
+
+
+def test_invalid_account_error_detector_matches_kis_check_account_error():
+    exc = KisApiError(
+        "KIS API error OPSQ2000: ERROR : INPUT INVALID_CHECK_ACNO",
+        error_code="OPSQ2000",
+        error_description="ERROR : INPUT INVALID_CHECK_ACNO",
+    )
+
+    assert is_invalid_account_error(exc) is True
 
 
 def test_get_balance_requires_account_info():

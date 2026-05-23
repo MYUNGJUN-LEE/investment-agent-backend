@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Callable
@@ -19,6 +20,7 @@ KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 _TOKEN_CACHE_LOCK = threading.RLock()
 _REQUEST_THROTTLE_LOCK = threading.RLock()
 _LAST_REQUEST_AT = 0.0
+_INVALID_ACCOUNT_ERROR_CODES = {"OPSQ2000"}
 
 
 class KisConfigError(ValueError):
@@ -65,9 +67,9 @@ class KisClient:
     ) -> None:
         self.app_key = app_key or settings.kis_app_key
         self.app_secret = app_secret or settings.kis_app_secret
-        self.account_no = account_no or settings.kis_account_no
-        self.account_product_code = (
-            account_product_code or settings.kis_account_product_code
+        self.account_no, self.account_product_code = _normalize_account_credentials(
+            account_no or settings.kis_account_no,
+            account_product_code or settings.kis_account_product_code,
         )
         self.is_paper = settings.kis_is_paper if is_paper is None else is_paper
         self.timeout = timeout
@@ -323,10 +325,8 @@ class KisClient:
 
         cano = account_no or self.account_no
         product_code = account_product_code or self.account_product_code
-        if not cano or not product_code:
-            raise KisConfigError(
-                "KIS account_no and account_product_code are required for live orders"
-            )
+        cano, product_code = _normalize_account_credentials(cano, product_code)
+        self._ensure_account_credentials(cano, product_code, purpose="live orders")
 
         token = self.issue_access_token()
         body = {
@@ -377,10 +377,8 @@ class KisClient:
         """Fetch domestic stock account balance as a complete snapshot when possible."""
         cano = account_no or self.account_no
         product_code = account_product_code or self.account_product_code
-        if not cano or not product_code:
-            raise KisConfigError(
-                "KIS account_no and account_product_code are required for balance lookup"
-            )
+        cano, product_code = _normalize_account_credentials(cano, product_code)
+        self._ensure_account_credentials(cano, product_code, purpose="balance lookup")
 
         token = self.issue_access_token()
         tr_id = "VTTC8434R" if self.is_paper else "TTTC8434R"
@@ -443,10 +441,12 @@ class KisClient:
         """Fetch domestic daily order/execution history."""
         cano = account_no or self.account_no
         product_code = account_product_code or self.account_product_code
-        if not cano or not product_code:
-            raise KisConfigError(
-                "KIS account_no and account_product_code are required for order execution lookup"
-            )
+        cano, product_code = _normalize_account_credentials(cano, product_code)
+        self._ensure_account_credentials(
+            cano,
+            product_code,
+            purpose="order execution lookup",
+        )
 
         token = self.issue_access_token()
         tr_id = "VTTC8001R" if self.is_paper else "TTTC8001R"
@@ -475,6 +475,29 @@ class KisClient:
     def _ensure_app_credentials(self) -> None:
         if not self.app_key or not self.app_secret:
             raise KisConfigError("KIS app_key and app_secret are required")
+
+    def _ensure_account_credentials(
+        self,
+        account_no: str | None,
+        account_product_code: str | None,
+        *,
+        purpose: str,
+    ) -> None:
+        if not account_no or not account_product_code:
+            raise KisConfigError(
+                f"KIS account_no and account_product_code are required for {purpose}"
+            )
+        errors: list[str] = []
+        if len(account_no) != 8 or not account_no.isdigit():
+            errors.append("KIS_ACCOUNT_NO must be exactly 8 digits")
+        if len(account_product_code) != 2 or not account_product_code.isdigit():
+            errors.append("KIS_ACCOUNT_PRODUCT_CODE must be exactly 2 digits")
+        if errors:
+            raise KisConfigError(
+                "; ".join(errors)
+                + ". Use CANO only, for example KIS_ACCOUNT_NO=50189471 and "
+                "KIS_ACCOUNT_PRODUCT_CODE=01."
+            )
 
     def _has_valid_token(self) -> bool:
         if not self._access_token or not self._access_token_expires_at:
@@ -700,7 +723,18 @@ class KisClient:
             "app_secret_length": len(self.app_secret or ""),
             "account_no_configured": bool(self.account_no),
             "account_no_length": len(self.account_no or ""),
+            "account_no_last4": (self.account_no or "")[-4:],
+            "account_no_format_valid": bool(
+                self.account_no
+                and self.account_no.isdigit()
+                and len(self.account_no) == 8
+            ),
             "account_product_code": self.account_product_code or "",
+            "account_product_code_format_valid": bool(
+                self.account_product_code
+                and self.account_product_code.isdigit()
+                and len(self.account_product_code) == 2
+            ),
             "token_cache_path": str(self._token_cache_path),
             "token_cache_enabled": self._shared_token_cache_enabled(),
             "request_min_interval_seconds": settings.kis_request_min_interval_seconds,
@@ -711,6 +745,38 @@ class KisClient:
                 else None
             ),
         }
+
+
+def is_invalid_account_error(exc: KisApiError) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (exc.error_code, exc.error_description, exc.response_text, exc)
+    )
+    return (
+        str(exc.error_code or "") in _INVALID_ACCOUNT_ERROR_CODES
+        and "INVALID_CHECK_ACNO" in text
+    )
+
+
+def _normalize_account_credentials(
+    account_no: Any,
+    account_product_code: Any,
+) -> tuple[str | None, str | None]:
+    account_digits = _digits(account_no)
+    product_digits = _digits(account_product_code)
+    if account_digits and len(account_digits) == 10:
+        embedded_account_no = account_digits[:8]
+        embedded_product_code = account_digits[8:]
+        account_digits = embedded_account_no
+        if not product_digits:
+            product_digits = embedded_product_code
+    return account_digits or None, product_digits or None
+
+
+def _digits(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\D", "", str(value).strip())
 
 
 def _safe_response_json(response: httpx.Response) -> dict[str, Any] | list[Any] | None:

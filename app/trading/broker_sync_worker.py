@@ -13,7 +13,7 @@ def run_broker_sync_once(reconcile_order_state: bool = True) -> dict[str, Any]:
     """Synchronize KIS broker state and optionally reconcile position states."""
     sync_result = broker_sync.sync_kis_account()
     reconcile_result: dict[str, Any] | None = None
-    if reconcile_order_state:
+    if reconcile_order_state and sync_result.get("status") == "success":
         reconcile_result = order_state.reconcile_all_after_broker_sync(
             account_no=str(sync_result.get("account_no") or ""),
         )
@@ -35,8 +35,18 @@ def run_broker_sync_forever(
     )
     order_state.initialize_order_state_db()
     while True:
-        run_broker_sync_once(reconcile_order_state=reconcile_order_state)
-        time.sleep(float(poll_seconds))
+        result = run_broker_sync_once(reconcile_order_state=reconcile_order_state)
+        sleep_seconds = _next_sleep_seconds(result, float(poll_seconds))
+        time.sleep(sleep_seconds)
+
+
+def _next_sleep_seconds(result: dict[str, Any], poll_seconds: float) -> float:
+    if result.get("status") == "config_error":
+        return max(
+            poll_seconds,
+            float(settings.broker_sync_config_error_backoff_seconds or poll_seconds),
+        )
+    return poll_seconds
 
 
 def main() -> None:
