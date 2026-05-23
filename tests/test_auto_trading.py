@@ -306,6 +306,26 @@ def test_gpt_auto_trading_control_start_status_stop(tmp_path, monkeypatch):
     assert stop_response.json()["stopped_sessions"][0]["status"] == "stopped"
 
 
+def test_gpt_status_and_start_paper_compatibility_routes(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
+
+    status_response = client.get(
+        "/gpt/auto-trading/status",
+        headers=_auth_headers(),
+    )
+    assert status_response.status_code == 200
+    assert status_response.json()["command"] == "status"
+
+    start_response = client.post(
+        "/gpt/auto-trading/start-paper",
+        headers=_auth_headers(),
+        json={},
+    )
+    assert start_response.status_code == 200
+    assert start_response.json()["status"] == "started"
+    assert start_response.json()["started_session"]["execution_mode"] == "paper"
+
+
 def test_gpt_control_returns_json_diagnostic_for_missing_api_key(monkeypatch):
     monkeypatch.setattr(settings, "backend_api_key", "secret-key")
 
@@ -344,6 +364,27 @@ def test_embedded_worker_status_endpoint_reports_disabled(monkeypatch):
     body = response.json()
     assert body["enabled"] is False
     assert "workers" in body
+
+
+def test_worker_status_compatibility_routes_are_reachable(monkeypatch):
+    monkeypatch.setattr(settings, "embedded_workers_enabled", False)
+
+    assert client.get("/workers/status").status_code == 200
+    assert client.get("/worker/status").status_code == 200
+    assert client.get("/gpt/workers/status").status_code == 200
+    assert client.get("/gpt/worker/status").status_code == 200
+
+
+def test_api_key_query_fallback_for_gpt_routes(monkeypatch):
+    monkeypatch.setattr(settings, "backend_api_key", "secret-key")
+
+    response = client.post(
+        "/gpt/auto-trading/control?api_key=secret-key",
+        json={"command": "status"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "success"
 
 
 def test_auto_trading_dashboard_serves_html():

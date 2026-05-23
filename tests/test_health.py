@@ -42,6 +42,9 @@ def test_action_schema_is_served_for_custom_gpt():
     assert "openapi: 3.1.0" in response.text
     assert "gptBackendHealthCheck" in response.text
     assert "gptBackendHealthCheckPost" in response.text
+    assert "/gpt/workers/status" in response.text
+    assert "/gpt/auto-trading/status" in response.text
+    assert "/gpt/auto-trading/start-paper" in response.text
 
 
 def test_naver_news_endpoint(monkeypatch):

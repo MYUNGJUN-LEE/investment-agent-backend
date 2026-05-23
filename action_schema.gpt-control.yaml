@@ -249,10 +249,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
 
-  /workers/status:
+  /gpt/workers/status:
     get:
-      operationId: getWorkerStatus
-      summary: Check embedded worker status.
+      operationId: getGptWorkerStatus
+      summary: Check embedded worker status through the GPT-compatible route.
       responses:
         "200":
           description: Embedded worker status.
@@ -306,6 +306,36 @@ paths:
       responses:
         "200":
           description: Auto-trading control result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GptAutoTradingControlResponse"
+
+  /gpt/auto-trading/status:
+    get:
+      operationId: getGptAutoTradingStatus
+      summary: Check auto-trading status through the GPT-compatible route.
+      responses:
+        "200":
+          description: Auto-trading status result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GptAutoTradingControlResponse"
+
+  /gpt/auto-trading/start-paper:
+    post:
+      operationId: startGptPaperAutoTrading
+      summary: Start paper auto-trading through the GPT-compatible route.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GptAutoTradingControlRequest"
+      responses:
+        "200":
+          description: Paper auto-trading start result.
           content:
             application/json:
               schema:

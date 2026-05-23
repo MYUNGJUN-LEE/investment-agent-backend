@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Depends, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
@@ -135,6 +136,24 @@ async def request_validation_exception_handler(
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    if _is_gpt_action_path(request):
+        return JSONResponse(
+            status_code=200,
+            content=_gpt_error_payload(
+                error_type="server_error",
+                http_status=500,
+                message=str(exc) or "Unhandled backend error.",
+                detail=str(exc),
+            ),
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc) or "Internal Server Error"},
+    )
+
+
 def _is_gpt_action_path(request: Request) -> bool:
     return request.url.path.rstrip("/").startswith("/gpt/")
 
@@ -164,6 +183,9 @@ def _gpt_error_payload(
 def verify_api_key(
     x_api_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
+    api_key: str | None = Query(default=None),
+    key: str | None = Query(default=None),
+    token: str | None = Query(default=None),
 ):
     """
     If BACKEND_API_KEY is set in .env, every request must include:
@@ -174,7 +196,7 @@ def verify_api_key(
     action auth type is accidentally set to Bearer.
     """
     if settings.backend_api_key:
-        candidates = [x_api_key]
+        candidates = [x_api_key, api_key, key, token]
         if authorization:
             scheme, _, token = authorization.partition(" ")
             candidates.append(token if scheme.lower() == "bearer" and token else authorization)
@@ -410,6 +432,39 @@ def control_auto_trading_endpoint(req: GptAutoTradeControlRequest):
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
+@app.get(
+    "/gpt/auto-trading/status",
+    response_model=GptAutoTradeControlResponse,
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getGptAutoTradingStatus",
+    summary="Get auto-trading status from Custom GPT",
+)
+@app.post(
+    "/gpt/auto-trading/status",
+    response_model=GptAutoTradeControlResponse,
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+def gpt_auto_trading_status_endpoint():
+    return control_auto_trading_from_gpt(GptAutoTradeControlRequest(command="status"))
+
+
+@app.post(
+    "/gpt/auto-trading/start-paper",
+    response_model=GptAutoTradeControlResponse,
+    dependencies=[Depends(verify_api_key)],
+    operation_id="startGptPaperAutoTrading",
+    summary="Start paper auto-trading from Custom GPT",
+)
+def gpt_start_paper_auto_trading_endpoint(
+    payload: dict[str, Any] | None = Body(default=None),
+):
+    data = dict(payload or {})
+    data.update({"command": "start", "execution_mode": "paper"})
+    req = GptAutoTradeControlRequest(**data)
+    return control_auto_trading_from_gpt(req)
+
+
 @app.post(
     "/universe/scan",
     dependencies=[Depends(verify_api_key)],
@@ -552,11 +607,28 @@ def get_market_monitor_status():
 
 @app.get(
     "/workers/status",
-    dependencies=[Depends(verify_api_key)],
     operation_id="getEmbeddedWorkerStatus",
     summary="Get embedded worker status",
 )
+@app.get("/worker/status", include_in_schema=False)
 def get_embedded_worker_status():
+    from app.workers.manager import embedded_worker_status
+
+    return embedded_worker_status()
+
+
+@app.get(
+    "/gpt/workers/status",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getGptWorkerStatus",
+    summary="Get embedded worker status from Custom GPT",
+)
+@app.get(
+    "/gpt/worker/status",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+def get_gpt_embedded_worker_status():
     from app.workers.manager import embedded_worker_status
 
     return embedded_worker_status()
