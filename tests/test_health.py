@@ -10,6 +10,20 @@ def test_health():
     assert response.json()["status"] == "ok"
 
 
+def test_health_allows_head_and_options():
+    assert client.head("/health").status_code == 200
+    response = client.options("/health")
+    assert response.status_code == 204
+    assert "GET" in response.headers["allow"]
+
+
+def test_action_schema_is_served_for_custom_gpt():
+    response = client.get("/action-schema.yaml")
+    assert response.status_code == 200
+    assert "openapi: 3.0.3" in response.text
+    assert "healthCheck" in response.text
+
+
 def test_naver_news_endpoint(monkeypatch):
     def fake_search_naver_news(query: str, display: int = 10):
         return {

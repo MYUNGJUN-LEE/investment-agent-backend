@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -135,6 +136,40 @@ def root():
 
 @app.get("/health")
 def health_check():
+    return _health_payload()
+
+
+@app.head("/health", include_in_schema=False)
+def health_check_head():
+    return Response(status_code=200)
+
+
+@app.options("/health", include_in_schema=False)
+def health_check_options():
+    return Response(
+        status_code=204,
+        headers={"Allow": "GET, HEAD, OPTIONS"},
+    )
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz_check():
+    return _health_payload()
+
+
+@app.get("/action-schema.yaml", include_in_schema=False)
+@app.get("/.well-known/openapi.yaml", include_in_schema=False)
+def custom_gpt_action_schema():
+    schema_path = Path(__file__).resolve().parents[1] / "action_schema.gpt-control.yaml"
+    if not schema_path.exists():
+        raise HTTPException(status_code=404, detail="Action schema not found")
+    return Response(
+        content=schema_path.read_text(encoding="utf-8"),
+        media_type="application/yaml",
+    )
+
+
+def _health_payload():
     return {
         "status": "ok",
         "service": settings.app_name,
