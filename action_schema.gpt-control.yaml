@@ -1,0 +1,142 @@
+openapi: 3.0.3
+info:
+  title: Investment Auto Trading GPT Control API
+  version: 1.0.0
+  description: Minimal Custom GPT action schema for checking and controlling the auto-trading backend.
+servers:
+  - url: https://api.autoinvestmentkorea.online
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        service:
+          type: string
+        auth_enabled:
+          type: boolean
+    WorkerStatusResponse:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        count:
+          type: integer
+        workers:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              alive:
+                type: boolean
+              thread_name:
+                type: string
+    GptAutoTradingControlRequest:
+      type: object
+      required:
+        - command
+      properties:
+        command:
+          type: string
+          enum:
+            - start
+            - stop
+            - status
+        session_id:
+          type: string
+          description: Optional session id. Usually omitted for start and status.
+        symbols:
+          type: array
+          description: Optional manual ticker list. Omit this for automatic universe discovery.
+          items:
+            type: string
+        execution_mode:
+          type: string
+          enum:
+            - paper
+            - live
+          description: Paper mode records simulated trades. Live mode can place broker orders only when backend live trading is enabled.
+    GptAutoTradingControlResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        command:
+          type: string
+        message:
+          type: string
+        started_session:
+          type: object
+          additionalProperties: true
+        stopped_sessions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        active_sessions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        recent_sessions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        worker_status:
+          $ref: "#/components/schemas/WorkerStatusResponse"
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Check backend health.
+      responses:
+        "200":
+          description: Backend health status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /workers/status:
+    get:
+      operationId: getWorkerStatus
+      summary: Check embedded worker status.
+      responses:
+        "200":
+          description: Embedded worker status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkerStatusResponse"
+
+  /gpt/auto-trading/control:
+    post:
+      operationId: controlAutoTradingFromGpt
+      summary: Start, stop, or check auto-trading.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GptAutoTradingControlRequest"
+      responses:
+        "200":
+          description: Auto-trading control result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GptAutoTradingControlResponse"
