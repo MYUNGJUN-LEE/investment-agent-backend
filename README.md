@@ -364,8 +364,8 @@ from the KIS paper-trading environment.
 KIS also rejects excessive per-second API traffic. In the default safe
 configuration, `AUTO_TRADING_SYMBOL_WORKERS=1`,
 `KIS_REQUEST_MIN_INTERVAL_SECONDS=1.5`, and
-`UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS=60`. A 20-symbol universe scan will
-therefore take at least about 20 minutes plus network time, but it keeps the
+`UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS=60`. A 15-symbol universe scan will
+therefore take at least about 15 minutes plus network time, but it keeps the
 single Render process below roughly one KIS request every 1.5 seconds.
 Auto-trading will not start order analysis unless the universe scanner has
 scanned at least `UNIVERSE_SCANNER_MIN_SCANNED_SYMBOLS_FOR_TRADING` symbols,

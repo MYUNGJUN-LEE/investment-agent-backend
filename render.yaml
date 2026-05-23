@@ -37,5 +37,7 @@ services:
         value: "1.5"
       - key: UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS
         value: "60"
+      - key: UNIVERSE_SCANNER_MAX_SOURCE_SYMBOLS
+        value: "15"
       - key: UNIVERSE_SCANNER_MIN_SCANNED_SYMBOLS_FOR_TRADING
         value: "15"

@@ -219,7 +219,7 @@ def _resolve_source_symbols(req: AutoTradeStartRequest) -> dict[str, str | None]
         symbols.setdefault(_normalize_symbol(raw), None)
     for symbol, name in DEFAULT_UNIVERSE.items():
         symbols.setdefault(symbol, name)
-    max_symbols = max(1, int(settings.universe_scanner_max_source_symbols or 80))
+    max_symbols = max(1, int(settings.universe_scanner_max_source_symbols or 15))
     return {
         symbol: name
         for symbol, name in list(symbols.items())[:max_symbols]
