@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import sqlite3
 import time
 from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
+from app.strategies.rule_based import build_strategy_decision
 from app.trading import auto_trading
 from app.trading import auto_trading_store
+from app.trading import paper_trading
 
 
 client = TestClient(app)
@@ -158,6 +161,80 @@ def test_auto_trading_blocks_before_preview_when_cash_is_insufficient(monkeypatc
     assert body["results"][0]["status"] == "blocked"
     assert "Insufficient available cash" in body["results"][0]["message"]
     assert preview_calls == []
+
+
+def test_auto_trading_blocks_new_entries_above_max_open_positions(tmp_path, monkeypatch):
+    paper_db = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr(paper_trading, "DEFAULT_DB_PATH", paper_db)
+    monkeypatch.setattr(settings, "auto_trading_max_open_positions", 1)
+    preview_calls = []
+    monkeypatch.setattr(
+        auto_trading,
+        "create_order_preview",
+        lambda req: preview_calls.append(req),
+    )
+    with sqlite3.connect(paper_db) as conn:
+        conn.row_factory = sqlite3.Row
+        paper_trading.initialize_db(conn)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                symbol, name, market, quantity, avg_price, cost_basis,
+                realized_pnl, updated_at
+            )
+            VALUES ('005930', 'Samsung Electronics', 'KR', 1, 10000, 10000, 0, '2026-05-23T09:00:00')
+            """
+        )
+
+    payload = _auto_trade_payload()
+    payload["symbols"][0]["symbol"] = "000660"
+
+    response = client.post(
+        "/auto-trading/run-once",
+        headers=_auth_headers(),
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"][0]["status"] == "blocked"
+    assert "Maximum open-position count reached" in body["results"][0]["message"]
+    assert preview_calls == []
+
+
+def test_position_expires_when_symbol_disappears_from_scanner_candidates(
+    tmp_path,
+    monkeypatch,
+):
+    paper_db = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr(paper_trading, "DEFAULT_DB_PATH", paper_db)
+    with sqlite3.connect(paper_db) as conn:
+        conn.row_factory = sqlite3.Row
+        paper_trading.initialize_db(conn)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                symbol, name, market, quantity, avg_price, cost_basis,
+                realized_pnl, updated_at
+            )
+            VALUES ('005930', 'Samsung Electronics', 'KR', 3, 70000, 210000, 0, '2026-05-23T09:00:00')
+            """
+        )
+
+    exits = auto_trading._expired_candidate_exit_symbols(
+        req=auto_trading.AutoTradeStartRequest(),
+        active_candidate_symbols={"000660"},
+    )
+    still_valid = auto_trading._expired_candidate_exit_symbols(
+        req=auto_trading.AutoTradeStartRequest(),
+        active_candidate_symbols={"005930"},
+    )
+
+    assert len(exits) == 1
+    assert exits[0].symbol == "005930"
+    assert exits[0].requested_action == "exit"
+    assert exits[0].quantity == 3
+    assert still_valid == []
 
 
 def test_auto_trading_uses_live_broker_cash_before_order_preview(monkeypatch):
@@ -421,6 +498,24 @@ def test_auto_trading_worker_processes_persisted_session(tmp_path, monkeypatch):
     assert session["cycle_count"] == 1
     assert session["status"] == "stopped"
     assert session["last_results"] == [{"symbol": "005930", "status": "mocked"}]
+
+
+def test_requested_exit_forces_sell_strategy_decision():
+    decision = build_strategy_decision(
+        {
+            "entry_signal": False,
+            "exit_signal": False,
+            "confidence": 0.1,
+            "scores": {"final_score": 10, "risk_score": 90},
+            "summary": "candidate removed from scanner table",
+        },
+        requested_action="exit",
+        risk_level="medium",
+    )
+
+    assert decision["approved"] is True
+    assert decision["action"] == "exit"
+    assert decision["side"] == "SELL"
 
 
 def test_auto_trading_runs_symbols_in_parallel(monkeypatch):

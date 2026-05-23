@@ -243,8 +243,12 @@ and all existing risk checks.
 The default auto-trading cycle is 60 seconds. If `/auto-trading/start` is called
 with an empty `symbols` list, the universe scanner runs first, stores KIS price
 snapshots in SQLite, ranks candidates, checks NAVER/OpenDART only for candidates,
-and passes the final 5-10 symbols into the normal analyzer. The scanner calls
-one symbol at a time and waits `UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS`
+and passes only high expected-value swing candidates into the normal analyzer.
+The scanner keeps the top 10 active rows in `scanner_candidates`, archives lower
+ranks in `scanner_candidate_history`, and expires active candidates after
+`UNIVERSE_SCANNER_CANDIDATE_TTL_SECONDS` seconds. Worker selection is ordered by
+`net_edge` and requires `net_edge > UNIVERSE_SCANNER_WORKER_HURDLE_RATE_BPS`.
+The scanner calls one symbol at a time and waits `UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS`
 between symbols. KIS HTTP requests are also serialized by
 `KIS_REQUEST_MIN_INTERVAL_SECONDS`, so each symbol's price, daily, minute,
 orderbook, execution, and investor-flow requests are not fired at once.
@@ -369,7 +373,11 @@ therefore take at least about 15 minutes plus network time, but it keeps the
 single Render process below roughly one KIS request every 1.5 seconds.
 Auto-trading will not start order analysis unless the universe scanner has
 scanned at least `UNIVERSE_SCANNER_MIN_SCANNED_SYMBOLS_FOR_TRADING` symbols,
-which defaults to 15.
+which defaults to 15. The swing scanner stores `raw_score`, `expected_return`,
+`expected_risk`, `trading_cost`, `slippage_cost`, `net_edge`,
+`composite_score`, `rank`, `status`, `claimed_by_worker`, and `expires_at`.
+Only `READY` rows above the worker hurdle are sent to workers. Open positions are
+limited by `AUTO_TRADING_MAX_OPEN_POSITIONS`, which defaults to 5.
 
 Actual KIS paper order placement remains opt-in. Use only a KIS paper account
 and a tiny quantity:

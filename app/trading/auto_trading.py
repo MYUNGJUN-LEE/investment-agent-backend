@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import sqlite3
 import time
 from typing import Any
 from uuid import uuid4
@@ -267,8 +269,17 @@ def _run_cycle(
     symbols = list(req.symbols)
     results_prefix: list[dict[str, Any]] = []
     if req.auto_discover_symbols and not symbols:
-        scan = scan_universe_for_auto_trade(req)
+        scan = scan_universe_for_auto_trade(
+            req,
+            worker_id=session_id or "inline-auto-trading",
+        )
         symbols = scan["symbols"]
+        symbols.extend(
+            _expired_candidate_exit_symbols(
+                req=req,
+                active_candidate_symbols=set(scan.get("active_candidate_symbols") or []),
+            )
+        )
         results_prefix.append(
             {
                 "symbol": "__universe__",
@@ -278,7 +289,11 @@ def _run_cycle(
                 "snapshot_count": scan.get("snapshot_count", scan["source_symbol_count"]),
                 "candidate_count": scan["candidate_count"],
                 "final_count": scan["final_count"],
+                "executable_count": scan.get("executable_count"),
                 "final_candidates": scan["final_candidates"],
+                "ready_candidates": scan.get("ready_candidates", []),
+                "worker_hurdle_rate": scan.get("worker_hurdle_rate"),
+                "active_candidate_symbols": scan.get("active_candidate_symbols", []),
             }
         )
         min_scanned_symbols = max(
@@ -335,6 +350,39 @@ def _sync_live_account_if_needed(req: AutoTradeStartRequest) -> dict[str, Any] |
             "status": "error",
             "message": f"Broker sync failed during auto-trading cycle: {exc}",
         }
+
+
+def _expired_candidate_exit_symbols(
+    *,
+    req: AutoTradeStartRequest,
+    active_candidate_symbols: set[str],
+) -> list[AutoTradeSymbolConfig]:
+    positions = _open_positions(req.execution_mode)
+    exit_symbols: list[AutoTradeSymbolConfig] = []
+    for symbol, position in positions.items():
+        if symbol in active_candidate_symbols:
+            continue
+        quantity = int(position.get("quantity") or 0)
+        if quantity <= 0:
+            continue
+        price = _to_float(position.get("current_price"))
+        exit_symbols.append(
+            AutoTradeSymbolConfig(
+                symbol=symbol,
+                name=position.get("name"),
+                market="KR",
+                strategy_type="swing",
+                risk_level="medium",
+                requested_action="exit",
+                price=price,
+                decision_price=price,
+                order_price=price,
+                quantity=quantity,
+                signal_score=0,
+                expected_holding_days=5.0,
+            )
+        )
+    return exit_symbols
 
 
 def _prepare_symbols_for_account_balance(
@@ -443,11 +491,17 @@ def _allocate_cash_to_symbols(
 ) -> dict[str, Any]:
     remaining_cash = float(account["cash_available"])
     account_equity = float(account["account_equity"])
+    max_open_positions = max(1, int(settings.auto_trading_max_open_positions or 5))
+    open_symbols = set(_open_positions(str(account.get("mode") or "paper")).keys())
+    projected_open_count = len(open_symbols)
     blocked_by_index: dict[int, dict[str, Any]] = {}
     allocated_by_index: dict[int, AutoTradeSymbolConfig] = {}
     order = sorted(
         range(len(symbols)),
-        key=lambda index: float(symbols[index].signal_score or 0),
+        key=lambda index: (
+            symbols[index].requested_action == "exit",
+            float(symbols[index].signal_score or 0),
+        ),
         reverse=True,
     )
 
@@ -455,6 +509,8 @@ def _allocate_cash_to_symbols(
         symbol_cfg = symbols[index]
         if symbol_cfg.requested_action == "exit":
             allocated_by_index[index] = symbol_cfg
+            open_symbols.discard(symbol_cfg.symbol)
+            projected_open_count = max(0, projected_open_count - 1)
             continue
 
         price = float(symbol_cfg.price or symbol_cfg.order_price or 0)
@@ -465,6 +521,21 @@ def _allocate_cash_to_symbols(
                 account=account,
                 reason="missing price",
             )
+            continue
+
+        opens_new_position = symbol_cfg.symbol not in open_symbols
+        if opens_new_position and projected_open_count >= max_open_positions:
+            blocked_by_index[index] = {
+                "symbol": symbol_cfg.symbol,
+                "status": "blocked",
+                "message": (
+                    "Maximum open-position count reached; no order preview or "
+                    "broker order was attempted."
+                ),
+                "max_open_positions": max_open_positions,
+                "open_position_count": projected_open_count,
+                "open_symbols": sorted(open_symbols),
+            }
             continue
 
         requested_quantity = symbol_cfg.quantity
@@ -508,6 +579,9 @@ def _allocate_cash_to_symbols(
             allocation = recommended_quantity * price
 
         remaining_cash = max(0.0, remaining_cash - allocation)
+        if opens_new_position:
+            open_symbols.add(symbol_cfg.symbol)
+            projected_open_count += 1
         allocated_by_index[index] = symbol_cfg.model_copy(
             update={
                 "account_equity": account_equity,
@@ -776,6 +850,51 @@ def _resolve_loop_price(symbol_cfg: AutoTradeSymbolConfig) -> dict[str, Any]:
         "source": price_data.get("source", "market_data"),
         "message": price_data.get("message") or "No usable current price; provide price",
     }
+
+
+def _open_positions(mode: str) -> dict[str, dict[str, Any]]:
+    if mode == "live":
+        return _open_live_positions()
+    return _open_paper_positions()
+
+
+def _open_paper_positions() -> dict[str, dict[str, Any]]:
+    path = Path(paper_trading.DEFAULT_DB_PATH)
+    if not path.exists():
+        return {}
+    try:
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT symbol, name, quantity, avg_price AS current_price
+                FROM positions
+                WHERE quantity > 0
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {str(row["symbol"]): dict(row) for row in rows}
+
+
+def _open_live_positions() -> dict[str, dict[str, Any]]:
+    path = Path(settings.broker_sync_db_path)
+    if not path.exists():
+        return {}
+    try:
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT symbol, name, quantity, current_price
+                FROM broker_positions
+                WHERE broker = 'KIS'
+                  AND quantity > 0
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {str(row["symbol"]): dict(row) for row in rows}
 
 
 def _to_float(value: Any) -> float | None:

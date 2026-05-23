@@ -19,6 +19,8 @@ services:
         value: "7200"
       - key: AUTO_TRADING_SYMBOL_WORKERS
         value: "1"
+      - key: AUTO_TRADING_MAX_OPEN_POSITIONS
+        value: "5"
       - key: MONITOR_PRICE_INTERVAL_SECONDS
         value: "60"
       - key: MONITOR_DISCLOSURE_INTERVAL_SECONDS
@@ -41,3 +43,11 @@ services:
         value: "15"
       - key: UNIVERSE_SCANNER_MIN_SCANNED_SYMBOLS_FOR_TRADING
         value: "15"
+      - key: UNIVERSE_SCANNER_CANDIDATE_TTL_SECONDS
+        value: "3600"
+      - key: UNIVERSE_SCANNER_WORKER_HURDLE_RATE_BPS
+        value: "50"
+      - key: UNIVERSE_SCANNER_DEFAULT_SPREAD_BPS
+        value: "5"
+      - key: UNIVERSE_SCANNER_DEFAULT_SLIPPAGE_BPS
+        value: "10"

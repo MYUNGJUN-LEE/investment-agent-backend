@@ -31,6 +31,10 @@ def build_strategy_decision(
 
     if requested_action not in ("auto", "entry", "exit"):
         blocking_reasons.append("requested_action must be auto, entry, or exit")
+    elif requested_action == "exit":
+        action = "exit"
+        side = "SELL"
+        signal_type = "exit"
     elif requested_action in ("auto", "exit") and exit_signal:
         action = "exit"
         side = "SELL"

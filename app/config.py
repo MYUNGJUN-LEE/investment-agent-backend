@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     auto_trading_worker_poll_seconds: float = 2.0
     auto_trading_worker_lock_seconds: int = 7200
     auto_trading_symbol_workers: int = 1
+    auto_trading_max_open_positions: int = 5
     broker_sync_db_path: str = "data/broker_sync.sqlite3"
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120
@@ -83,6 +84,10 @@ class Settings(BaseSettings):
     universe_scanner_max_source_symbols: int = 15
     universe_scanner_symbol_interval_seconds: float = 60.0
     universe_scanner_min_scanned_symbols_for_trading: int = 15
+    universe_scanner_candidate_ttl_seconds: int = 3600
+    universe_scanner_worker_hurdle_rate_bps: float = 50.0
+    universe_scanner_default_spread_bps: float = 5.0
+    universe_scanner_default_slippage_bps: float = 10.0
     embedded_workers_enabled: bool = os.getenv("RENDER_SERVICE_TYPE") == "web"
     embedded_worker_broker_sync_enabled: bool = True
 

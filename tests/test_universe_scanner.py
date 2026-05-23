@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.trading import auto_trading
 from app.trading import universe_scanner
@@ -14,6 +16,11 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
         universe_scanner.settings,
         "universe_scanner_symbol_interval_seconds",
         0,
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "_paper_average_realized_return_bps",
+        lambda: None,
     )
 
     price_rows = {
@@ -84,8 +91,11 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
     assert result["symbols"][0].account_equity == 10_000_000
     assert result["symbols"][0].risk_per_trade == 0.005
     assert result["symbols"][0].stop_loss == 70000 * 0.97
+    assert result["symbols"][0].strategy_type == "swing"
+    assert result["symbols"][0].expected_gross_edge_bps is not None
     assert latest["scan_id"] == result["scan_id"]
     assert latest["candidates"][0]["symbol"] == "005930"
+    assert latest["candidates"][0]["net_edge"] > result["worker_hurdle_rate"]
 
 
 def test_auto_trading_empty_symbols_runs_universe_scanner(monkeypatch):
@@ -100,14 +110,18 @@ def test_auto_trading_empty_symbols_runs_universe_scanner(monkeypatch):
     monkeypatch.setattr(
         auto_trading,
         "scan_universe_for_auto_trade",
-        lambda req: {
+        lambda req, **kwargs: {
             "status": "success",
             "scan_id": "scan-test",
             "source_symbol_count": 15,
             "snapshot_count": 15,
             "candidate_count": 2,
             "final_count": 1,
+            "executable_count": 1,
             "final_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
+            "ready_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
+            "worker_hurdle_rate": 50,
+            "active_candidate_symbols": ["005930"],
             "symbols": [scanned_symbol],
         },
     )
@@ -141,14 +155,18 @@ def test_auto_trading_blocks_when_universe_scan_has_too_few_symbols(monkeypatch)
     monkeypatch.setattr(
         auto_trading,
         "scan_universe_for_auto_trade",
-        lambda req: {
+        lambda req, **kwargs: {
             "status": "success",
             "scan_id": "scan-small",
             "source_symbol_count": 14,
             "snapshot_count": 14,
             "candidate_count": 2,
             "final_count": 1,
+            "executable_count": 1,
             "final_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
+            "ready_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
+            "worker_hurdle_rate": 50,
+            "active_candidate_symbols": ["005930"],
             "symbols": [scanned_symbol],
         },
     )
@@ -169,7 +187,11 @@ def test_auto_trading_blocks_when_universe_scan_has_too_few_symbols(monkeypatch)
             "snapshot_count": 14,
             "candidate_count": 2,
             "final_count": 1,
+            "executable_count": 1,
             "final_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
+            "ready_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
+            "worker_hurdle_rate": 50,
+            "active_candidate_symbols": ["005930"],
             "message": (
                 "Universe scanner scanned 14 symbols; "
                 "at least 15 symbols are required before trading"
@@ -193,6 +215,11 @@ def test_universe_scanner_uses_latest_close_as_watch_when_market_closed(
         0,
     )
     monkeypatch.setattr(universe_scanner, "_is_kr_regular_market_open", lambda: False)
+    monkeypatch.setattr(
+        universe_scanner,
+        "_paper_average_realized_return_bps",
+        lambda: None,
+    )
     monkeypatch.setattr(
         universe_scanner,
         "fetch_price_data",
@@ -226,6 +253,75 @@ def test_universe_scanner_uses_latest_close_as_watch_when_market_closed(
     assert result["final_candidates"][0]["decision"] == "watch"
     assert result["final_candidates"][0]["current_price"] == 70000
     assert "market closed" in result["final_candidates"][0]["reason"]
+
+
+def test_universe_scanner_keeps_only_top_ten_execution_candidates(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "universe.sqlite3"
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_seed_symbols", "")
+    monkeypatch.setattr(universe_scanner.settings, "monitor_watchlist_symbols", "")
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 12)
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_scanner_symbol_interval_seconds",
+        0,
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "_paper_average_realized_return_bps",
+        lambda: None,
+    )
+
+    def fake_fetch_price_data(symbol: str) -> dict:
+        rank_bonus = int(symbol[-2:]) if symbol[-2:].isdigit() else 1
+        return {
+            "symbol": symbol,
+            "current_price": 10000 + rank_bonus,
+            "change_rate": 2.0,
+            "volume": 2_000_000 + rank_bonus,
+            "volume_ratio": 2.5,
+            "turnover_value": 80_000_000_000 + rank_bonus,
+            "intraday": {"minute_volume_ratio": 2.0},
+            "overheated": False,
+            "source": "test",
+        }
+
+    monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
+    monkeypatch.setattr(
+        universe_scanner,
+        "search_naver_news",
+        lambda query, display=5, sort="date": {"items": [{"title": query}]},
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "fetch_opendart_disclosures",
+        lambda symbol, lookback_hours: [],
+    )
+
+    result = universe_scanner.scan_universe_for_auto_trade(
+        AutoTradeStartRequest(universe_candidate_limit=12, universe_final_limit=10),
+        db_path=db_path,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        active_count = conn.execute("SELECT COUNT(*) FROM scanner_candidates").fetchone()[0]
+        history_count = conn.execute(
+            "SELECT COUNT(*) FROM scanner_candidate_history"
+        ).fetchone()[0]
+        max_active_rank = conn.execute(
+            "SELECT MAX(rank) FROM scanner_candidates"
+        ).fetchone()[0]
+        archived_count = conn.execute(
+            "SELECT COUNT(*) FROM scanner_candidate_history WHERE status = 'ARCHIVED'"
+        ).fetchone()[0]
+
+    assert result["candidate_count"] == 12
+    assert active_count == 10
+    assert history_count == 12
+    assert max_active_rank == 10
+    assert archived_count == 2
 
 
 def test_universe_scanner_collects_symbols_sequentially(monkeypatch):
