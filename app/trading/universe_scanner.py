@@ -336,6 +336,43 @@ def get_ready_execution_candidates(
     return [dict(row) for row in rows]
 
 
+def get_active_scanner_candidates(
+    *,
+    db_path: Path | str | None = None,
+    limit: int | None = None,
+    include_expired: bool = True,
+) -> list[dict[str, Any]]:
+    path = _db_path(db_path)
+    initialize_universe_db(path)
+    limit = max(1, min(int(limit or settings.universe_scanner_final_limit or 10), 10))
+    where = ""
+    params: list[Any] = []
+    if not include_expired:
+        where = "WHERE expires_at > ?"
+        params.append(_now())
+    params.append(limit)
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM scanner_candidates
+            {where}
+            ORDER BY rank ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def scanner_candidate_to_symbol_config(
+    req: AutoTradeStartRequest,
+    candidate: dict[str, Any],
+) -> AutoTradeSymbolConfig:
+    return _to_symbol_config(req, candidate)
+
+
 def initialize_universe_db(db_path: Path | str | None = None) -> None:
     path = _db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)

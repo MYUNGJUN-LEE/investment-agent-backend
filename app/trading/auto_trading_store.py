@@ -171,6 +171,58 @@ def list_events(
     return [_row_to_event(row) for row in rows]
 
 
+def record_session_event(
+    session_id: str,
+    *,
+    event_type: str,
+    status: str,
+    message: str,
+    results: list[dict[str, Any]],
+    update_last_results: bool = True,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    path = _db_path(db_path)
+    if not path.exists():
+        return None
+    now = _now()
+    with sqlite3.connect(path) as conn:
+        conn.executescript(SCHEMA_SQL)
+        row = conn.execute(
+            "SELECT status FROM auto_trading_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if update_last_results:
+            conn.execute(
+                """
+                UPDATE auto_trading_sessions
+                SET updated_at = ?, last_error = NULL, last_results_json = ?
+                WHERE session_id = ?
+                """,
+                (now, _json(results), session_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE auto_trading_sessions
+                SET updated_at = ?
+                WHERE session_id = ?
+                """,
+                (now, session_id),
+            )
+        _insert_event(
+            conn=conn,
+            session_id=session_id,
+            event_type=event_type,
+            status=status,
+            message=message,
+            results=results,
+            created_at=now,
+        )
+    return get_session(session_id, db_path=db_path)
+
+
 def stop_session(
     session_id: str,
     db_path: Path | str | None = None,

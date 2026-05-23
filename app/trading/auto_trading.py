@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 import sqlite3
 import time
@@ -27,7 +28,10 @@ from app.trading import auto_trading_store
 from app.trading import broker_sync
 from app.trading import paper_trading
 from app.trading import risk_manager
-from app.trading.universe_scanner import scan_universe_for_auto_trade
+from app.trading.universe_scanner import (
+    scan_universe_for_auto_trade,
+    scanner_candidate_to_symbol_config,
+)
 
 
 class AutoTradingError(ValueError):
@@ -350,6 +354,153 @@ def _sync_live_account_if_needed(req: AutoTradeStartRequest) -> dict[str, Any] |
             "status": "error",
             "message": f"Broker sync failed during auto-trading cycle: {exc}",
         }
+
+
+def run_orchestrated_candidates_once(
+    req: AutoTradeStartRequest,
+    *,
+    active_candidates: list[dict[str, Any]],
+    session_id: str | None = None,
+    execute_entries: bool | None = None,
+) -> dict[str, Any]:
+    execute_entries = (
+        settings.trade_orchestrator_execute_entries
+        if execute_entries is None
+        else execute_entries
+    )
+    plan = build_orchestrated_symbol_plan(
+        req,
+        active_candidates=active_candidates,
+        execute_entries=bool(execute_entries),
+    )
+    results: list[dict[str, Any]] = []
+
+    for symbol_cfg in plan["exit_symbols"]:
+        results.append(_run_symbol(req, symbol_cfg, session_id=session_id))
+
+    if plan["entry_symbols"]:
+        prepared = _prepare_symbols_for_account_balance(req, plan["entry_symbols"])
+        results.extend(prepared["results"])
+        results.extend(
+            _run_symbols_for_orchestrator(
+                req=req,
+                symbols=prepared["symbols"],
+                session_id=session_id,
+            )
+        )
+
+    status = "idle"
+    if any(result.get("status") in ("confirmed", "success", "pending") for result in results):
+        status = "executed"
+    elif results:
+        status = "blocked"
+
+    return {
+        "status": status,
+        "message": "Trade orchestrator compared scanner candidates with open positions",
+        "active_candidate_symbols": plan["active_candidate_symbols"],
+        "planned_exit_count": len(plan["exit_symbols"]),
+        "planned_entry_count": len(plan["entry_symbols"]),
+        "planned_exits": [
+            {"symbol": item.symbol, "quantity": item.quantity}
+            for item in plan["exit_symbols"]
+        ],
+        "planned_entries": [
+            {"symbol": item.symbol, "signal_score": item.signal_score}
+            for item in plan["entry_symbols"]
+        ],
+        "results": results,
+    }
+
+
+def build_orchestrated_symbol_plan(
+    req: AutoTradeStartRequest,
+    *,
+    active_candidates: list[dict[str, Any]],
+    execute_entries: bool = True,
+) -> dict[str, Any]:
+    active_candidate_symbols = {
+        str(candidate.get("symbol"))
+        for candidate in active_candidates
+        if candidate.get("symbol")
+    }
+    positions = _open_positions(req.execution_mode)
+    exit_symbols = _expired_candidate_exit_symbols(
+        req=req,
+        active_candidate_symbols=active_candidate_symbols,
+    )
+
+    entry_symbols: list[AutoTradeSymbolConfig] = []
+    if execute_entries:
+        entry_symbols = _entry_symbols_from_scanner_candidates(
+            req=req,
+            active_candidates=active_candidates,
+            open_symbols=set(positions.keys()),
+        )
+
+    return {
+        "active_candidate_symbols": sorted(active_candidate_symbols),
+        "open_symbols": sorted(positions.keys()),
+        "exit_symbols": exit_symbols,
+        "entry_symbols": entry_symbols,
+    }
+
+
+def _entry_symbols_from_scanner_candidates(
+    *,
+    req: AutoTradeStartRequest,
+    active_candidates: list[dict[str, Any]],
+    open_symbols: set[str],
+) -> list[AutoTradeSymbolConfig]:
+    now = _now()
+    hurdle_rate = float(settings.universe_scanner_worker_hurdle_rate_bps or 0.0)
+    rows = sorted(
+        active_candidates,
+        key=lambda item: (
+            float(item.get("net_edge") or 0),
+            float(item.get("composite_score") or 0),
+            -int(item.get("rank") or 999),
+        ),
+        reverse=True,
+    )
+    symbols: list[AutoTradeSymbolConfig] = []
+    for candidate in rows:
+        symbol = str(candidate.get("symbol") or "")
+        if not symbol or symbol in open_symbols:
+            continue
+        if candidate.get("status") not in ("READY", "CLAIMED"):
+            continue
+        if str(candidate.get("expires_at") or "") <= now:
+            continue
+        if float(candidate.get("net_edge") or 0.0) <= hurdle_rate:
+            continue
+        symbols.append(scanner_candidate_to_symbol_config(req, candidate))
+    return symbols
+
+
+def _run_symbols_for_orchestrator(
+    *,
+    req: AutoTradeStartRequest,
+    symbols: list[AutoTradeSymbolConfig],
+    session_id: str | None,
+) -> list[dict[str, Any]]:
+    if not symbols:
+        return []
+    if len(symbols) <= 1:
+        return [_run_symbol(req, symbols[0], session_id=session_id)]
+    max_workers = max(
+        1,
+        min(len(symbols), int(settings.auto_trading_symbol_workers or 1)),
+    )
+    results: list[dict[str, Any] | None] = [None] * len(symbols)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_run_symbol, req, symbol_cfg, session_id): index
+            for index, symbol_cfg in enumerate(symbols)
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return [result for result in results if result is not None]
 
 
 def _expired_candidate_exit_symbols(
@@ -904,6 +1055,10 @@ def _to_float(value: Any) -> float | None:
         return float(str(value).replace(",", "").strip())
     except (TypeError, ValueError):
         return None
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def _validate_start_request(req: AutoTradeStartRequest) -> None:

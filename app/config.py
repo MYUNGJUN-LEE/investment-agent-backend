@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     auto_trading_worker_lock_seconds: int = 7200
     auto_trading_symbol_workers: int = 1
     auto_trading_max_open_positions: int = 5
+    trade_orchestrator_enabled: bool = True
+    trade_orchestrator_interval_seconds: int = 60
+    trade_orchestrator_execute_entries: bool = True
     broker_sync_db_path: str = "data/broker_sync.sqlite3"
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120

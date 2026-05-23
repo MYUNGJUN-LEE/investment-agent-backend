@@ -5,7 +5,14 @@ import threading
 from typing import Callable
 
 from app.config import settings
-from app.workers import broker_worker, dart_worker, market_worker, news_worker, trading_worker
+from app.workers import (
+    broker_worker,
+    dart_worker,
+    market_worker,
+    news_worker,
+    orchestrator_worker,
+    trading_worker,
+)
 
 
 @dataclass(frozen=True)
@@ -61,10 +68,13 @@ def start_on_app_startup_if_enabled() -> dict[str, object]:
 def _worker_specs() -> list[WorkerSpec]:
     specs = [
         WorkerSpec("trading_worker", trading_worker.run_forever),
+        WorkerSpec("orchestrator_worker", orchestrator_worker.run_forever),
         WorkerSpec("market_worker", market_worker.run_forever),
         WorkerSpec("news_worker", news_worker.run_forever),
         WorkerSpec("dart_worker", dart_worker.run_forever),
     ]
+    if not settings.trade_orchestrator_enabled:
+        specs = [spec for spec in specs if spec.name != "orchestrator_worker"]
     if settings.embedded_worker_broker_sync_enabled:
         specs.append(WorkerSpec("broker_worker", broker_worker.run_forever))
     return specs

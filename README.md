@@ -256,6 +256,7 @@ Auto-trading, market monitoring, and broker sync now run as separate workers:
 
 ```bash
 python -m app.trading.auto_trading_worker
+python -m app.workers.orchestrator_worker
 python -m app.trading.market_monitor_worker
 python -m app.trading.broker_sync_worker
 ```
@@ -328,6 +329,10 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 When enabled, the API process starts these worker threads:
 
 - `app.workers.trading_worker`: claims and processes auto-trading sessions.
+- `app.workers.orchestrator_worker`: compares current `scanner_candidates` top
+  10, worker hurdle rate, and actual open positions. It sends removed holdings
+  to exit and sends higher `net_edge` candidates to entry while respecting the
+  max open-position limit.
 - `app.workers.market_worker`: 1-minute KIS price/volume/change watch.
 - `app.workers.dart_worker`: 5-minute OpenDART disclosure watch.
 - `app.workers.news_worker`: 10-minute NAVER news watch.
@@ -377,7 +382,10 @@ which defaults to 15. The swing scanner stores `raw_score`, `expected_return`,
 `expected_risk`, `trading_cost`, `slippage_cost`, `net_edge`,
 `composite_score`, `rank`, `status`, `claimed_by_worker`, and `expires_at`.
 Only `READY` rows above the worker hurdle are sent to workers. Open positions are
-limited by `AUTO_TRADING_MAX_OPEN_POSITIONS`, which defaults to 5.
+limited by `AUTO_TRADING_MAX_OPEN_POSITIONS`, which defaults to 5. The
+orchestrator runs every `TRADE_ORCHESTRATOR_INTERVAL_SECONDS` seconds. A held
+symbol remains valid while it is still present in `scanner_candidates`; once a
+new scan removes it from the top 10, the orchestrator creates an exit candidate.
 
 Actual KIS paper order placement remains opt-in. Use only a KIS paper account
 and a tiny quantity:

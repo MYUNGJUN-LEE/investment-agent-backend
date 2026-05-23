@@ -6,10 +6,13 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
+from app.models import AutoTradeStartRequest
 from app.strategies.rule_based import build_strategy_decision
+from app.workers import manager as worker_manager
 from app.trading import auto_trading
 from app.trading import auto_trading_store
 from app.trading import paper_trading
+from app.trading import trade_orchestrator
 
 
 client = TestClient(app)
@@ -237,6 +240,115 @@ def test_position_expires_when_symbol_disappears_from_scanner_candidates(
     assert still_valid == []
 
 
+def test_trade_orchestrator_executes_exit_for_removed_holding(
+    tmp_path,
+    monkeypatch,
+):
+    auto_db = tmp_path / "auto.sqlite3"
+    paper_db = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(auto_db))
+    monkeypatch.setattr(paper_trading, "DEFAULT_DB_PATH", paper_db)
+
+    with sqlite3.connect(paper_db) as conn:
+        conn.row_factory = sqlite3.Row
+        paper_trading.initialize_db(conn)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                symbol, name, market, quantity, avg_price, cost_basis,
+                realized_pnl, updated_at
+            )
+            VALUES ('005930', 'Samsung Electronics', 'KR', 3, 70000, 210000, 0, '2026-05-23T09:00:00')
+            """
+        )
+
+    session = auto_trading_store.create_session(
+        AutoTradeStartRequest(run_immediately=False)
+    )
+    run_calls = []
+    monkeypatch.setattr(
+        trade_orchestrator,
+        "get_active_scanner_candidates",
+        lambda limit, include_expired: [
+            {
+                "symbol": "000660",
+                "name": "SK hynix",
+                "rank": 1,
+                "status": "READY",
+                "current_price": 180000,
+                "net_edge": 120,
+                "composite_score": 80,
+                "expires_at": "2999-01-01T00:00:00",
+            }
+        ],
+    )
+
+    def fake_run_symbol(req, symbol_cfg, session_id=None):
+        run_calls.append((symbol_cfg.symbol, symbol_cfg.requested_action, symbol_cfg.quantity))
+        return {
+            "symbol": symbol_cfg.symbol,
+            "status": "confirmed",
+            "action": symbol_cfg.requested_action,
+        }
+
+    monkeypatch.setattr(auto_trading, "_run_symbol", fake_run_symbol)
+
+    result = trade_orchestrator.run_trade_orchestrator_once(worker_id="orch-test")
+    events = auto_trading_store.list_events(session["session_id"])
+
+    assert result["status"] == "executed"
+    assert ("005930", "exit", 3) in run_calls
+    assert any(event["event_type"] == "orchestrator_completed" for event in events)
+
+
+def test_orchestrated_entries_follow_net_edge_priority(monkeypatch):
+    run_calls = []
+    monkeypatch.setattr(
+        auto_trading,
+        "_open_positions",
+        lambda mode: {},
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "_prepare_symbols_for_account_balance",
+        lambda req, symbols: {"symbols": symbols, "results": []},
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "_run_symbol",
+        lambda req, symbol_cfg, session_id=None: run_calls.append(symbol_cfg.symbol)
+        or {"symbol": symbol_cfg.symbol, "status": "confirmed"},
+    )
+
+    result = auto_trading.run_orchestrated_candidates_once(
+        AutoTradeStartRequest(),
+        active_candidates=[
+            {
+                "symbol": "005930",
+                "rank": 2,
+                "status": "READY",
+                "current_price": 70000,
+                "net_edge": 80,
+                "composite_score": 75,
+                "expires_at": "2999-01-01T00:00:00",
+            },
+            {
+                "symbol": "000660",
+                "rank": 1,
+                "status": "READY",
+                "current_price": 180000,
+                "net_edge": 140,
+                "composite_score": 70,
+                "expires_at": "2999-01-01T00:00:00",
+            },
+        ],
+        session_id="session-test",
+    )
+
+    assert result["status"] == "executed"
+    assert run_calls[:2] == ["000660", "005930"]
+
+
 def test_auto_trading_uses_live_broker_cash_before_order_preview(monkeypatch):
     preview_calls = []
     monkeypatch.setattr(settings, "enable_live_trading", True)
@@ -450,6 +562,14 @@ def test_worker_status_compatibility_routes_are_reachable(monkeypatch):
     assert client.get("/worker/status").status_code == 200
     assert client.get("/gpt/workers/status").status_code == 200
     assert client.get("/gpt/worker/status").status_code == 200
+
+
+def test_embedded_worker_specs_include_orchestrator(monkeypatch):
+    monkeypatch.setattr(settings, "trade_orchestrator_enabled", True)
+
+    names = [spec.name for spec in worker_manager._worker_specs()]
+
+    assert "orchestrator_worker" in names
 
 
 def test_api_key_query_fallback_for_gpt_routes(monkeypatch):
