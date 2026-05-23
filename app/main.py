@@ -1,9 +1,10 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi import FastAPI, Header, HTTPException, Depends, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from app.services.naver_news import search_naver_news
 
 from app.brokers.kis_client import KisClient
@@ -97,6 +98,69 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if _is_gpt_action_path(request):
+        return JSONResponse(
+            status_code=200,
+            content=_gpt_error_payload(
+                error_type="http_error",
+                http_status=exc.status_code,
+                message=str(exc.detail),
+                detail=exc.detail,
+            ),
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+):
+    if _is_gpt_action_path(request):
+        return JSONResponse(
+            status_code=200,
+            content=_gpt_error_payload(
+                error_type="validation_error",
+                http_status=422,
+                message="Invalid Custom GPT action request body or parameters.",
+                detail=exc.errors(),
+            ),
+        )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+def _is_gpt_action_path(request: Request) -> bool:
+    return request.url.path.rstrip("/").startswith("/gpt/")
+
+
+def _gpt_error_payload(
+    *,
+    error_type: str,
+    http_status: int,
+    message: str,
+    detail,
+) -> dict:
+    return {
+        "status": "error",
+        "command": "unknown",
+        "message": message,
+        "error_type": error_type,
+        "http_status": http_status,
+        "detail": detail,
+        "started_session": None,
+        "stopped_sessions": [],
+        "active_sessions": [],
+        "recent_sessions": [],
+        "worker_status": None,
+    }
+
+
 def verify_api_key(
     x_api_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
@@ -170,6 +234,12 @@ def healthz_check():
 @app.get("/gpt/health")
 @app.get("/gpt/health/", include_in_schema=False)
 def gpt_health_check():
+    return _health_payload()
+
+
+@app.post("/gpt/health", include_in_schema=False)
+@app.post("/gpt/health/", include_in_schema=False)
+def gpt_health_check_post():
     return _health_payload()
 
 

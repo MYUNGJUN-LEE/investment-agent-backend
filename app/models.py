@@ -524,8 +524,11 @@ class GptAutoTradeControlRequest(BaseModel):
 
 class GptAutoTradeControlResponse(BaseModel):
     status: str
-    command: GptAutoTradeCommand
+    command: GptAutoTradeCommand | str
     message: str
+    error_type: str | None = None
+    http_status: int | None = None
+    detail: Any | None = None
     started_session: AutoTradeStartResponse | None = None
     stopped_sessions: list[AutoTradeStopResponse] = Field(default_factory=list)
     active_sessions: list[AutoTradeStatusResponse] = Field(default_factory=list)

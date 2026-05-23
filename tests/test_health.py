@@ -29,6 +29,8 @@ def test_health_tolerates_gateway_variants():
 def test_gpt_health_endpoint_uses_fresh_operation_path():
     assert client.get("/gpt/health").status_code == 200
     assert client.get("/gpt/health/").status_code == 200
+    assert client.post("/gpt/health").status_code == 200
+    assert client.post("/gpt/health/").status_code == 200
     assert client.head("/gpt/health").status_code == 200
     assert client.options("/gpt/health").status_code == 204
 
@@ -39,6 +41,7 @@ def test_action_schema_is_served_for_custom_gpt():
     assert response.headers["content-type"].startswith("text/yaml")
     assert "openapi: 3.1.0" in response.text
     assert "gptBackendHealthCheck" in response.text
+    assert "gptBackendHealthCheckPost" in response.text
 
 
 def test_naver_news_endpoint(monkeypatch):

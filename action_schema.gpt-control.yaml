@@ -169,6 +169,24 @@ components:
           type: string
         message:
           type: string
+        error_type:
+          type: string
+          nullable: true
+          description: Present when the GPT-specific endpoint converted an HTTP error into a JSON diagnostic response.
+        http_status:
+          type: integer
+          nullable: true
+          description: Original HTTP status when status is error.
+        detail:
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+          nullable: true
         started_session:
           type: object
           additionalProperties: true
@@ -211,6 +229,17 @@ paths:
     get:
       operationId: gptBackendHealthCheck
       summary: Check backend health using a GPT-specific path.
+      security: []
+      responses:
+        "200":
+          description: Backend health status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+    post:
+      operationId: gptBackendHealthCheckPost
+      summary: Check backend health using a GPT-specific POST path.
       security: []
       responses:
         "200":

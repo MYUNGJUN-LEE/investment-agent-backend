@@ -306,6 +306,35 @@ def test_gpt_auto_trading_control_start_status_stop(tmp_path, monkeypatch):
     assert stop_response.json()["stopped_sessions"][0]["status"] == "stopped"
 
 
+def test_gpt_control_returns_json_diagnostic_for_missing_api_key(monkeypatch):
+    monkeypatch.setattr(settings, "backend_api_key", "secret-key")
+
+    response = client.post(
+        "/gpt/auto-trading/control",
+        json={"command": "status"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["error_type"] == "http_error"
+    assert body["http_status"] == 401
+    assert "API key" in body["message"]
+
+
+def test_gpt_control_returns_json_diagnostic_for_invalid_body():
+    response = client.post(
+        "/gpt/auto-trading/control",
+        json={"command": "bad-command"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["error_type"] == "validation_error"
+    assert body["http_status"] == 422
+
+
 def test_embedded_worker_status_endpoint_reports_disabled(monkeypatch):
     monkeypatch.setattr(settings, "embedded_workers_enabled", False)
 
