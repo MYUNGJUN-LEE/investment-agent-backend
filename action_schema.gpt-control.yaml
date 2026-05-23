@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: Minimal Custom GPT action schema for checking and controlling the auto-trading backend.
 servers:
-  - url: https://api.autoinvestmentkorea.online
+  - url: https://investment-agent-backend.onrender.com
 
 components:
   securitySchemes:
