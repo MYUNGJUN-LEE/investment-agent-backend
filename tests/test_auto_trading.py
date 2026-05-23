@@ -136,6 +136,84 @@ def test_auto_trading_applies_request_sizing_defaults(monkeypatch):
     assert preview_calls[0].stop_loss == 9700
 
 
+def test_auto_trading_blocks_before_preview_when_cash_is_insufficient(monkeypatch):
+    preview_calls = []
+    monkeypatch.setattr(
+        auto_trading,
+        "create_order_preview",
+        lambda req: preview_calls.append(req),
+    )
+
+    payload = _auto_trade_payload(account_equity=5_000, cash_available=5_000)
+    payload["symbols"][0].pop("quantity")
+
+    response = client.post(
+        "/auto-trading/run-once",
+        headers=_auth_headers(),
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"][0]["status"] == "blocked"
+    assert "Insufficient available cash" in body["results"][0]["message"]
+    assert preview_calls == []
+
+
+def test_auto_trading_uses_live_broker_cash_before_order_preview(monkeypatch):
+    preview_calls = []
+    monkeypatch.setattr(settings, "enable_live_trading", True)
+    monkeypatch.setattr(settings, "kis_is_paper", False)
+    monkeypatch.setattr(settings, "live_trading_confirm_token", "confirm-live")
+    monkeypatch.setattr(
+        auto_trading.broker_sync,
+        "sync_kis_account",
+        lambda: {
+            "status": "success",
+            "total_cash": 40_000,
+            "total_value": 1_000_000,
+        },
+    )
+
+    def fake_create_order_preview(req):
+        preview_calls.append(req)
+        return {
+            "status": "blocked",
+            "preview_id": 7,
+            "preview_token": None,
+            "symbol": req.symbol,
+            "signal_type": "entry",
+            "side": "BUY",
+            "price": req.price,
+            "quantity": req.quantity,
+            "amount": 0,
+            "recommended_quantity": None,
+            "message": "captured",
+            "strategy_decision": {},
+            "risk_decision": None,
+            "cost_edge_decision": None,
+        }
+
+    monkeypatch.setattr(auto_trading, "create_order_preview", fake_create_order_preview)
+
+    payload = _auto_trade_payload(
+        execution_mode="live",
+        live_confirm_token="confirm-live",
+        account_equity=10_000_000,
+    )
+    payload["symbols"][0].pop("quantity")
+
+    response = client.post(
+        "/auto-trading/run-once",
+        headers=_auth_headers(),
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    assert preview_calls[0].account_equity == 1_000_000
+    assert preview_calls[0].cash_available == 40_000
+
+
 def test_auto_trading_start_status_and_stop(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
 

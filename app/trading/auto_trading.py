@@ -23,6 +23,8 @@ from app.trading.order_approval import (
 )
 from app.trading import auto_trading_store
 from app.trading import broker_sync
+from app.trading import paper_trading
+from app.trading import risk_manager
 from app.trading.universe_scanner import scan_universe_for_auto_trade
 
 
@@ -282,6 +284,12 @@ def _run_cycle(
             results_prefix[0]["message"] = "Universe scanner found no tradable candidates"
             return results_prefix
 
+    prepared = _prepare_symbols_for_account_balance(req, symbols)
+    results_prefix.extend(prepared["results"])
+    symbols = prepared["symbols"]
+    if not symbols:
+        return results_prefix
+
     if len(symbols) <= 1:
         return results_prefix + [
             _run_symbol(req, symbol_cfg, session_id=session_id) for symbol_cfg in symbols
@@ -312,6 +320,222 @@ def _sync_live_account_if_needed(req: AutoTradeStartRequest) -> dict[str, Any] |
             "status": "error",
             "message": f"Broker sync failed during auto-trading cycle: {exc}",
         }
+
+
+def _prepare_symbols_for_account_balance(
+    req: AutoTradeStartRequest,
+    symbols: list[AutoTradeSymbolConfig],
+) -> dict[str, Any]:
+    priced_symbols: list[AutoTradeSymbolConfig] = []
+    blocked_results: list[dict[str, Any]] = []
+    for symbol_cfg in symbols:
+        price_result = _resolve_loop_price(symbol_cfg)
+        if not price_result.get("price"):
+            blocked_results.append(
+                {
+                    "symbol": symbol_cfg.symbol,
+                    "status": "blocked",
+                    "message": price_result["message"],
+                    "price_source": price_result["source"],
+                }
+            )
+            continue
+        price = float(price_result["price"])
+        priced_symbols.append(
+            _apply_order_sizing_defaults(
+                req,
+                symbol_cfg.model_copy(
+                    update={
+                        "price": symbol_cfg.price or price,
+                        "decision_price": symbol_cfg.decision_price or price,
+                        "order_price": symbol_cfg.order_price or price,
+                    }
+                ),
+                price,
+            )
+        )
+
+    if not priced_symbols:
+        return {"symbols": [], "results": blocked_results}
+
+    account = _resolve_account_balance(req)
+    if account["status"] != "ready":
+        return {
+            "symbols": [],
+            "results": [
+                *blocked_results,
+                {
+                    "symbol": "__account__",
+                    "status": "blocked",
+                    "message": account["message"],
+                    "account": account,
+                },
+            ],
+        }
+
+    allocated = _allocate_cash_to_symbols(priced_symbols, account)
+    return {
+        "symbols": allocated["symbols"],
+        "results": [*blocked_results, *allocated["blocked_results"]],
+    }
+
+
+def _resolve_account_balance(req: AutoTradeStartRequest) -> dict[str, Any]:
+    if req.execution_mode == "live":
+        try:
+            sync_result = broker_sync.sync_kis_account()
+        except Exception as exc:
+            return {
+                "status": "blocked",
+                "mode": "live",
+                "message": f"Live account balance check failed; no orders will be attempted: {exc}",
+            }
+        cash_available = _to_float(sync_result.get("total_cash"))
+        account_equity = _to_float(sync_result.get("total_value")) or req.account_equity
+        if cash_available is None:
+            return {
+                "status": "blocked",
+                "mode": "live",
+                "message": "Live account cash balance is unavailable; no orders will be attempted.",
+                "broker_sync": sync_result,
+            }
+        return {
+            "status": "ready",
+            "mode": "live",
+            "account_equity": float(account_equity),
+            "cash_available": max(0.0, float(cash_available)),
+            "broker_sync": sync_result,
+        }
+
+    snapshot = paper_trading.get_paper_account_snapshot(
+        account_equity=req.account_equity,
+    )
+    cash_available = float(snapshot["cash_available"])
+    if req.cash_available is not None:
+        cash_available = min(cash_available, float(req.cash_available))
+    return {
+        "status": "ready",
+        "mode": "paper",
+        "account_equity": float(snapshot["account_equity"]),
+        "cash_available": max(0.0, cash_available),
+        "paper_account": snapshot,
+    }
+
+
+def _allocate_cash_to_symbols(
+    symbols: list[AutoTradeSymbolConfig],
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    remaining_cash = float(account["cash_available"])
+    account_equity = float(account["account_equity"])
+    blocked_by_index: dict[int, dict[str, Any]] = {}
+    allocated_by_index: dict[int, AutoTradeSymbolConfig] = {}
+    order = sorted(
+        range(len(symbols)),
+        key=lambda index: float(symbols[index].signal_score or 0),
+        reverse=True,
+    )
+
+    for index in order:
+        symbol_cfg = symbols[index]
+        if symbol_cfg.requested_action == "exit":
+            allocated_by_index[index] = symbol_cfg
+            continue
+
+        price = float(symbol_cfg.price or symbol_cfg.order_price or 0)
+        if price <= 0:
+            blocked_by_index[index] = _insufficient_cash_result(
+                symbol_cfg=symbol_cfg,
+                available_cash=remaining_cash,
+                account=account,
+                reason="missing price",
+            )
+            continue
+
+        requested_quantity = symbol_cfg.quantity
+        if requested_quantity is not None:
+            required_cash = price * int(requested_quantity)
+            if required_cash > remaining_cash:
+                blocked_by_index[index] = _insufficient_cash_result(
+                    symbol_cfg=symbol_cfg,
+                    available_cash=remaining_cash,
+                    account=account,
+                    reason=f"required {required_cash:.2f}",
+                )
+                continue
+            allocation = required_cash
+        else:
+            if symbol_cfg.stop_loss is None:
+                blocked_by_index[index] = _insufficient_cash_result(
+                    symbol_cfg=symbol_cfg,
+                    available_cash=remaining_cash,
+                    account=account,
+                    reason="missing stop_loss",
+                )
+                continue
+            recommendation = risk_manager.recommend_order_quantity(
+                price=price,
+                stop_loss=float(symbol_cfg.stop_loss),
+                account_equity=account_equity,
+                risk_per_trade=float(symbol_cfg.risk_per_trade or 0.005),
+                cash_available=remaining_cash,
+            )
+            recommended_quantity = int(recommendation["recommended_quantity"])
+            if recommended_quantity <= 0:
+                blocked_by_index[index] = _insufficient_cash_result(
+                    symbol_cfg=symbol_cfg,
+                    available_cash=remaining_cash,
+                    account=account,
+                    reason="available cash is below the minimum executable quantity",
+                    recommendation=recommendation,
+                )
+                continue
+            allocation = recommended_quantity * price
+
+        remaining_cash = max(0.0, remaining_cash - allocation)
+        allocated_by_index[index] = symbol_cfg.model_copy(
+            update={
+                "account_equity": account_equity,
+                "cash_available": allocation,
+            }
+        )
+
+    return {
+        "symbols": [
+            allocated_by_index[index]
+            for index in range(len(symbols))
+            if index in allocated_by_index
+        ],
+        "blocked_results": [
+            blocked_by_index[index]
+            for index in range(len(symbols))
+            if index in blocked_by_index
+        ],
+    }
+
+
+def _insufficient_cash_result(
+    *,
+    symbol_cfg: AutoTradeSymbolConfig,
+    available_cash: float,
+    account: dict[str, Any],
+    reason: str,
+    recommendation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol_cfg.symbol,
+        "status": "blocked",
+        "message": (
+            "Insufficient available cash; no order preview or broker order was attempted "
+            f"({reason})."
+        ),
+        "account": {
+            "mode": account.get("mode"),
+            "account_equity": account.get("account_equity"),
+            "cash_available": round(float(available_cash), 2),
+        },
+        "recommendation": recommendation,
+    }
 
 
 def _run_symbol(
@@ -537,6 +761,15 @@ def _resolve_loop_price(symbol_cfg: AutoTradeSymbolConfig) -> dict[str, Any]:
         "source": price_data.get("source", "market_data"),
         "message": price_data.get("message") or "No usable current price; provide price",
     }
+
+
+def _to_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _validate_start_request(req: AutoTradeStartRequest) -> None:

@@ -191,6 +191,33 @@ def initialize_db(conn: sqlite3.Connection) -> None:
     )
 
 
+def get_paper_account_snapshot(
+    db_path: Path | str | None = None,
+    account_equity: float | None = None,
+) -> dict[str, Any]:
+    """Return simulated account equity, invested capital, and available cash."""
+    equity = float(account_equity or risk_manager.DEFAULT_LIMITS.portfolio_value)
+    resolved_db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
+    with _connect(resolved_db_path) as conn:
+        initialize_db(conn)
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(cost_basis), 0) AS invested_amount
+            FROM positions
+            WHERE quantity > 0
+            """
+        ).fetchone()
+    invested_amount = float(row["invested_amount"] or 0)
+    cash_available = max(0.0, equity - invested_amount)
+    return {
+        "mode": "paper",
+        "account_equity": equity,
+        "invested_amount": round(invested_amount, 2),
+        "cash_available": round(cash_available, 2),
+    }
+
+
 def _ensure_order_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "paper_orders", "realized_pnl", "REAL NOT NULL DEFAULT 0")
     _ensure_column(conn, "paper_orders", "effective_price", "REAL")
