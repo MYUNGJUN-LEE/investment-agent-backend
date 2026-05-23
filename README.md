@@ -345,6 +345,12 @@ checks quote, balance, execution-history, and SQLite sync connectivity.
 python -m app.trading.kis_paper_e2e --symbol 005930
 ```
 
+KIS limits access-token issuance. The backend reuses tokens through
+`KIS_TOKEN_CACHE_PATH`; if KIS returns `EGW00133`, wait for the configured
+`KIS_TOKEN_ISSUE_COOLDOWN_SECONDS` before retrying. Use
+`GET /broker/kis/config-status` to inspect non-secret KIS runtime settings and
+token-cache status.
+
 Actual KIS paper order placement remains opt-in. Use only a KIS paper account
 and a tiny quantity:
 

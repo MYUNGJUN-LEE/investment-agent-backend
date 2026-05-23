@@ -23,3 +23,7 @@ services:
         value: "600"
       - key: BROKER_SYNC_INTERVAL_SECONDS
         value: "60"
+      - key: KIS_TOKEN_CACHE_PATH
+        value: "data/kis_token_cache.json"
+      - key: KIS_TOKEN_ISSUE_COOLDOWN_SECONDS
+        value: "70"

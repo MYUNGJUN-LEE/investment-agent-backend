@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 data/*.sqlite3
+data/kis_token_cache*.json
 .cloudflared/
 deploy/cloudflare/*.json
 deploy/cloudflare/cert.pem

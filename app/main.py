@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from app.services.naver_news import search_naver_news
 
+from app.brokers.kis_client import KisClient
 from app.config import settings
 from app.models import (
     AutoTradeEventsResponse,
@@ -380,6 +381,27 @@ def preflight_kis_paper_state(symbol: str = "005930"):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get(
+    "/broker/kis/config-status",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getKisConfigStatus",
+    summary="Inspect non-secret KIS runtime configuration",
+)
+def get_kis_config_status():
+    client = KisClient()
+    diagnostics = client.runtime_diagnostics()
+    diagnostics.update(
+        {
+            "enable_live_trading": settings.enable_live_trading,
+            "embedded_worker_broker_sync_enabled": (
+                settings.embedded_worker_broker_sync_enabled
+            ),
+            "broker_sync_interval_seconds": settings.broker_sync_interval_seconds,
+        }
+    )
+    return diagnostics
 
 
 @app.get(

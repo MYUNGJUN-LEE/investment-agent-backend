@@ -6,7 +6,7 @@ import json
 import httpx
 import pytest
 
-from app.brokers.kis_client import KisClient, KisConfigError
+from app.brokers.kis_client import KisApiError, KisClient, KisConfigError
 
 
 def test_issue_access_token_uses_kis_token_endpoint():
@@ -40,6 +40,108 @@ def test_issue_access_token_uses_kis_token_endpoint():
     assert token == "mock-token"
     assert cached_token == "mock-token"
     assert len(calls) == 1
+
+
+def test_issue_access_token_reuses_shared_file_cache_across_clients(tmp_path):
+    calls: list[httpx.Request] = []
+    cache_path = tmp_path / "kis_token_cache.json"
+    expires_at = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "shared-token",
+                "access_token_token_expired": expires_at,
+                "token_type": "Bearer",
+            },
+        )
+
+    first_client = KisClient(
+        app_key="shared-app-key",
+        app_secret="shared-app-secret",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=cache_path,
+    )
+    second_client = KisClient(
+        app_key="shared-app-key",
+        app_secret="shared-app-secret",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=cache_path,
+    )
+
+    assert first_client.issue_access_token() == "shared-token"
+    assert second_client.issue_access_token() == "shared-token"
+    assert [request.url.path for request in calls] == ["/oauth2/tokenP"]
+
+
+def test_http_error_exposes_kis_error_body():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            request=request,
+            json={
+                "error_code": "EGW00133",
+                "error_description": "접근토큰 발급 잠시 후 다시 시도하세요(1분당 1회)",
+            },
+        )
+
+    client = KisClient(
+        app_key="test-app-key",
+        app_secret="test-app-secret",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(KisApiError) as exc_info:
+        client.issue_access_token()
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.error_code == "EGW00133"
+    assert "1분당 1회" in str(exc_info.value)
+
+
+def test_token_rate_limit_sets_shared_cooldown(tmp_path):
+    calls: list[httpx.Request] = []
+    cache_path = tmp_path / "kis_token_cache.json"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            403,
+            request=request,
+            json={
+                "error_code": "EGW00133",
+                "error_description": "접근토큰 발급 잠시 후 다시 시도하세요(1분당 1회)",
+            },
+        )
+
+    first_client = KisClient(
+        app_key="cooldown-app-key",
+        app_secret="cooldown-app-secret",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=cache_path,
+    )
+    second_client = KisClient(
+        app_key="cooldown-app-key",
+        app_secret="cooldown-app-secret",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=cache_path,
+    )
+
+    with pytest.raises(KisApiError):
+        first_client.issue_access_token()
+    with pytest.raises(KisApiError) as exc_info:
+        second_client.issue_access_token()
+
+    assert exc_info.value.error_code == "EGW00133"
+    assert "cooling down" in str(exc_info.value)
+    assert [request.url.path for request in calls] == ["/oauth2/tokenP"]
 
 
 def test_get_current_price_requests_domestic_stock_quote():

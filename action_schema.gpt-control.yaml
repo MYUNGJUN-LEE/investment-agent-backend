@@ -40,6 +40,42 @@ components:
                 type: boolean
               thread_name:
                 type: string
+    KisConfigStatusResponse:
+      type: object
+      properties:
+        base_url:
+          type: string
+        is_paper:
+          type: boolean
+        app_key_configured:
+          type: boolean
+        app_key_length:
+          type: integer
+        app_secret_configured:
+          type: boolean
+        app_secret_length:
+          type: integer
+        account_no_configured:
+          type: boolean
+        account_no_length:
+          type: integer
+        account_product_code:
+          type: string
+        token_cache_path:
+          type: string
+        token_cache_enabled:
+          type: boolean
+        cached_token_available:
+          type: boolean
+        token_issue_cooldown_until:
+          type: string
+          nullable: true
+        enable_live_trading:
+          type: boolean
+        embedded_worker_broker_sync_enabled:
+          type: boolean
+        broker_sync_interval_seconds:
+          type: integer
     GptAutoTradingControlRequest:
       type: object
       required:
@@ -122,6 +158,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WorkerStatusResponse"
+
+  /broker/kis/config-status:
+    get:
+      operationId: getKisConfigStatus
+      summary: Inspect non-secret KIS runtime configuration.
+      responses:
+        "200":
+          description: Non-secret KIS runtime configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KisConfigStatusResponse"
 
   /gpt/auto-trading/control:
     post:

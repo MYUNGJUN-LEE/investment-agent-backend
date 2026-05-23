@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+import threading
 from typing import Any
 
 import httpx
@@ -10,6 +15,7 @@ from app.config import settings
 
 KIS_PROD_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
+_TOKEN_CACHE_LOCK = threading.RLock()
 
 
 class KisConfigError(ValueError):
@@ -18,6 +24,21 @@ class KisConfigError(ValueError):
 
 class KisApiError(RuntimeError):
     """Raised when KIS returns an HTTP or business-level API error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        error_description: str | None = None,
+        response_text: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.error_description = error_description
+        self.response_text = response_text
 
 
 class KisClient:
@@ -37,6 +58,7 @@ class KisClient:
         is_paper: bool | None = None,
         timeout: float = 10.0,
         transport: httpx.BaseTransport | None = None,
+        token_cache_path: Path | str | None = None,
     ) -> None:
         self.app_key = app_key or settings.kis_app_key
         self.app_secret = app_secret or settings.kis_app_secret
@@ -47,6 +69,12 @@ class KisClient:
         self.is_paper = settings.kis_is_paper if is_paper is None else is_paper
         self.timeout = timeout
         self.transport = transport
+        self._token_cache_path = (
+            Path(token_cache_path)
+            if token_cache_path is not None
+            else Path(settings.kis_token_cache_path)
+        )
+        self._token_cache_path_explicit = token_cache_path is not None
 
         self._access_token: str | None = None
         self._access_token_expires_at: datetime | None = None
@@ -60,11 +88,18 @@ class KisClient:
         Issue or reuse an access token.
 
         KIS token issuance uses /oauth2/tokenP with client_credentials.
+        KIS rate-limits token issuance, so tokens are cached across client
+        instances and embedded workers.
         """
         self._ensure_app_credentials()
 
         if not force_refresh and self._has_valid_token():
             return self._access_token or ""
+
+        if not force_refresh:
+            cached_token = self._load_shared_access_token()
+            if cached_token:
+                return cached_token
 
         payload = {
             "grant_type": "client_credentials",
@@ -72,18 +107,55 @@ class KisClient:
             "appsecret": self.app_secret,
         }
 
-        data = self._post(
-            "/oauth2/tokenP",
-            json=payload,
-            headers=self._base_headers(),
-            check_rt_cd=False,
-        )
+        with _TOKEN_CACHE_LOCK:
+            if not force_refresh:
+                cached_token = self._load_shared_access_token()
+                if cached_token:
+                    return cached_token
+                cooldown_until = self._load_shared_issue_cooldown()
+                if cooldown_until and datetime.now() < cooldown_until:
+                    raise KisApiError(
+                        (
+                            "KIS token issuance is cooling down after EGW00133 "
+                            f"until {cooldown_until.isoformat(timespec='seconds')}"
+                        ),
+                        status_code=403,
+                        error_code="EGW00133",
+                        error_description="KIS token issuance rate limit cooldown",
+                    )
+
+            try:
+                data = self._post(
+                    "/oauth2/tokenP",
+                    json=payload,
+                    headers=self._base_headers(),
+                    check_rt_cd=False,
+                )
+            except KisApiError as exc:
+                if exc.error_code == "EGW00133":
+                    self._store_shared_issue_cooldown(
+                        datetime.now()
+                        + timedelta(
+                            seconds=max(
+                                1,
+                                settings.kis_token_issue_cooldown_seconds,
+                            )
+                        )
+                    )
+                    cached_token = self._load_shared_access_token()
+                    if cached_token:
+                        return cached_token
+                raise
         token = data.get("access_token")
         if not token:
             raise KisApiError("KIS token response did not include access_token")
 
         self._access_token = str(token)
         self._access_token_expires_at = self._parse_token_expiry(data)
+        self._store_shared_access_token(
+            token=self._access_token,
+            expires_at=self._access_token_expires_at,
+        )
         return self._access_token
 
     def get_current_price(
@@ -475,16 +547,41 @@ class KisClient:
         response: httpx.Response,
         check_rt_cd: bool = True,
     ) -> dict[str, Any]:
+        body = _safe_response_json(response)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise KisApiError(f"KIS HTTP error: {exc.response.status_code}") from exc
+            error_code = _pick_error_code(body)
+            error_description = _pick_error_description(body)
+            path = exc.response.request.url.path if exc.response.request else ""
+            message = f"KIS HTTP error: {exc.response.status_code}"
+            if error_code:
+                message += f" {error_code}"
+            if error_description:
+                message += f": {error_description}"
+            if path == "/oauth2/tokenP" and error_code == "EGW00133":
+                message += (
+                    " (KIS token issuance is limited; cached tokens will be "
+                    "reused when available.)"
+                )
+            raise KisApiError(
+                message,
+                status_code=exc.response.status_code,
+                error_code=error_code,
+                error_description=error_description,
+                response_text=exc.response.text[:1000],
+            ) from exc
 
-        data = response.json()
+        data = body if isinstance(body, dict) else response.json()
         if check_rt_cd and data.get("rt_cd") not in (None, "0"):
             msg_cd = data.get("msg_cd", "unknown")
             msg1 = data.get("msg1", "Unknown KIS API error")
-            raise KisApiError(f"KIS API error {msg_cd}: {msg1}")
+            raise KisApiError(
+                f"KIS API error {msg_cd}: {msg1}",
+                error_code=str(msg_cd),
+                error_description=str(msg1),
+                response_text=response.text[:1000],
+            )
         return data
 
     def _parse_token_expiry(self, data: dict[str, Any]) -> datetime:
@@ -500,6 +597,148 @@ class KisClient:
             return datetime.now() + timedelta(seconds=float(expires_in))
 
         return datetime.now() + timedelta(hours=23)
+
+    def _shared_token_cache_enabled(self) -> bool:
+        return bool(self._token_cache_path) and (
+            self.transport is None or self._token_cache_path_explicit
+        )
+
+    def _load_shared_access_token(self) -> str | None:
+        if not self._shared_token_cache_enabled():
+            return None
+        with _TOKEN_CACHE_LOCK:
+            cache = _read_token_cache(self._token_cache_path)
+            row = cache.get(self._token_cache_key())
+            if not isinstance(row, dict):
+                return None
+            token = row.get("access_token")
+            expires_at = _parse_cached_datetime(row.get("expires_at"))
+            if not token or not expires_at:
+                return None
+            if datetime.now() >= expires_at - timedelta(minutes=1):
+                return None
+            self._access_token = str(token)
+            self._access_token_expires_at = expires_at
+            return self._access_token
+
+    def _store_shared_access_token(self, token: str, expires_at: datetime) -> None:
+        if not self._shared_token_cache_enabled():
+            return
+        with _TOKEN_CACHE_LOCK:
+            cache = _read_token_cache(self._token_cache_path)
+            cache[self._token_cache_key()] = {
+                "access_token": token,
+                "expires_at": expires_at.isoformat(timespec="seconds"),
+                "base_url": self.base_url,
+                "is_paper": self.is_paper,
+                "cooldown_until": None,
+                "last_error_code": None,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            _write_token_cache(self._token_cache_path, cache)
+
+    def _load_shared_issue_cooldown(self) -> datetime | None:
+        if not self._shared_token_cache_enabled():
+            return None
+        cache = _read_token_cache(self._token_cache_path)
+        row = cache.get(self._token_cache_key())
+        if not isinstance(row, dict):
+            return None
+        return _parse_cached_datetime(row.get("cooldown_until"))
+
+    def _store_shared_issue_cooldown(self, cooldown_until: datetime) -> None:
+        if not self._shared_token_cache_enabled():
+            return
+        cache = _read_token_cache(self._token_cache_path)
+        row = cache.get(self._token_cache_key())
+        if not isinstance(row, dict):
+            row = {}
+        row["cooldown_until"] = cooldown_until.isoformat(timespec="seconds")
+        row["last_error_code"] = "EGW00133"
+        row["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        cache[self._token_cache_key()] = row
+        _write_token_cache(self._token_cache_path, cache)
+
+    def _token_cache_key(self) -> str:
+        raw = f"{self.base_url}|{self.app_key or ''}"
+        return sha256(raw.encode("utf-8")).hexdigest()
+
+    def runtime_diagnostics(self) -> dict[str, Any]:
+        """Return non-secret KIS runtime settings for production troubleshooting."""
+        return {
+            "base_url": self.base_url,
+            "is_paper": self.is_paper,
+            "app_key_configured": bool(self.app_key),
+            "app_key_length": len(self.app_key or ""),
+            "app_secret_configured": bool(self.app_secret),
+            "app_secret_length": len(self.app_secret or ""),
+            "account_no_configured": bool(self.account_no),
+            "account_no_length": len(self.account_no or ""),
+            "account_product_code": self.account_product_code or "",
+            "token_cache_path": str(self._token_cache_path),
+            "token_cache_enabled": self._shared_token_cache_enabled(),
+            "cached_token_available": bool(self._load_shared_access_token()),
+            "token_issue_cooldown_until": (
+                self._load_shared_issue_cooldown().isoformat(timespec="seconds")
+                if self._load_shared_issue_cooldown()
+                else None
+            ),
+        }
+
+
+def _safe_response_json(response: httpx.Response) -> dict[str, Any] | list[Any] | None:
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def _pick_error_code(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    value = body.get("error_code") or body.get("msg_cd") or body.get("code")
+    return str(value) if value else None
+
+
+def _pick_error_description(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    value = (
+        body.get("error_description")
+        or body.get("msg1")
+        or body.get("message")
+        or body.get("msg")
+    )
+    return str(value) if value else None
+
+
+def _read_token_cache(path: Path) -> dict[str, Any]:
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_token_cache(path: Path, cache: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, path)
+
+
+def _parse_cached_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _merge_balance_pages(

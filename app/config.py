@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     kis_account_no: str | None = None
     kis_account_product_code: str | None = None
     kis_is_paper: bool = True
+    kis_token_cache_path: str = "data/kis_token_cache.json"
+    kis_token_issue_cooldown_seconds: int = 70
 
     # Optional JSON feed used by app.data_sources.market_context.
     market_context_url: str | None = None
