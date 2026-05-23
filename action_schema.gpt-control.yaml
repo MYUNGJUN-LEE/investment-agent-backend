@@ -76,6 +76,26 @@ components:
           type: boolean
         broker_sync_interval_seconds:
           type: integer
+    KisPaperPreflightResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        symbol:
+          type: string
+        current_price:
+          type: number
+        quote_connected:
+          type: boolean
+        balance_connected:
+          type: boolean
+        executions_connected:
+          type: boolean
+        broker_sync:
+          type: object
+          additionalProperties: true
+        message:
+          type: string
     GptAutoTradingControlRequest:
       type: object
       required:
@@ -139,6 +159,7 @@ paths:
     get:
       operationId: healthCheck
       summary: Check backend health.
+      security: []
       responses:
         "200":
           description: Backend health status.
@@ -170,6 +191,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/KisConfigStatusResponse"
+
+  /broker/kis/paper-preflight:
+    post:
+      operationId: preflightKisPaperE2E
+      summary: Validate KIS paper connectivity without placing an order.
+      parameters:
+        - name: symbol
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "005930"
+          description: Korean stock ticker used for the quote connectivity check.
+      responses:
+        "200":
+          description: KIS paper connectivity preflight result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KisPaperPreflightResponse"
 
   /gpt/auto-trading/control:
     post:
