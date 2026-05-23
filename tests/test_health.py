@@ -17,6 +17,15 @@ def test_health_allows_head_and_options():
     assert "GET" in response.headers["allow"]
 
 
+def test_health_tolerates_gateway_variants():
+    assert client.get("/health/").status_code == 200
+    assert client.head("/health/").status_code == 200
+    assert client.options("/health/").status_code == 204
+    assert client.post("/health").status_code == 200
+    assert client.post("/health/").status_code == 200
+    assert client.get("/healthz").status_code == 200
+
+
 def test_action_schema_is_served_for_custom_gpt():
     response = client.get("/action-schema.yaml")
     assert response.status_code == 200

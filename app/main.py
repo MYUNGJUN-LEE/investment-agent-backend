@@ -135,16 +135,19 @@ def root():
     }
 
 @app.get("/health")
+@app.get("/health/", include_in_schema=False)
 def health_check():
     return _health_payload()
 
 
 @app.head("/health", include_in_schema=False)
+@app.head("/health/", include_in_schema=False)
 def health_check_head():
     return Response(status_code=200)
 
 
 @app.options("/health", include_in_schema=False)
+@app.options("/health/", include_in_schema=False)
 def health_check_options():
     return Response(
         status_code=204,
@@ -152,7 +155,14 @@ def health_check_options():
     )
 
 
+@app.post("/health", include_in_schema=False)
+@app.post("/health/", include_in_schema=False)
+def health_check_post():
+    return _health_payload()
+
+
 @app.get("/healthz", include_in_schema=False)
+@app.get("/healthz/", include_in_schema=False)
 def healthz_check():
     return _health_payload()
 
