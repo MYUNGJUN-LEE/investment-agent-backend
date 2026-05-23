@@ -1,3 +1,5 @@
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -75,7 +77,7 @@ class Settings(BaseSettings):
     universe_scanner_candidate_limit: int = 20
     universe_scanner_final_limit: int = 10
     universe_scanner_max_source_symbols: int = 80
-    embedded_workers_enabled: bool = False
+    embedded_workers_enabled: bool = os.getenv("RENDER_SERVICE_TYPE") == "web"
     embedded_worker_broker_sync_enabled: bool = True
 
     model_config = SettingsConfigDict(
