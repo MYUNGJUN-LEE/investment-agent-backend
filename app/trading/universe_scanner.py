@@ -403,18 +403,34 @@ def _to_symbol_config(
         stop_loss=stop_loss,
         take_profit=take_profit,
         signal_score=_to_float(candidate.get("score")),
-        account_equity=_first_symbol_attr(req, "account_equity"),
-        risk_per_trade=_first_symbol_attr(req, "risk_per_trade"),
-        cash_available=_first_symbol_attr(req, "cash_available"),
+        account_equity=_first_symbol_attr(
+            req,
+            "account_equity",
+            fallback=req.account_equity,
+        ),
+        risk_per_trade=_first_symbol_attr(
+            req,
+            "risk_per_trade",
+            fallback=req.risk_per_trade,
+        ),
+        cash_available=_first_symbol_attr(
+            req,
+            "cash_available",
+            fallback=req.cash_available,
+        ),
     )
 
 
-def _first_symbol_attr(req: AutoTradeStartRequest, name: str) -> Any:
+def _first_symbol_attr(
+    req: AutoTradeStartRequest,
+    name: str,
+    fallback: Any = None,
+) -> Any:
     for item in req.symbols:
         value = getattr(item, name, None)
         if value is not None:
             return value
-    return None
+    return fallback
 
 
 def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:

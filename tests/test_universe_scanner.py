@@ -76,6 +76,9 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
     assert result["candidate_count"] == 2
     assert result["final_count"] == 1
     assert result["symbols"][0].symbol == "005930"
+    assert result["symbols"][0].account_equity == 10_000_000
+    assert result["symbols"][0].risk_per_trade == 0.005
+    assert result["symbols"][0].stop_loss == 70000 * 0.97
     assert latest["scan_id"] == result["scan_id"]
     assert latest["candidates"][0]["symbol"] == "005930"
 

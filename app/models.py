@@ -397,6 +397,22 @@ class AutoTradeStartRequest(BaseModel):
     )
     run_immediately: bool = True
     auto_confirm_paper: bool = True
+    account_equity: float = Field(
+        10_000_000,
+        gt=0,
+        description="Default account equity used for automatic quantity sizing.",
+    )
+    risk_per_trade: float = Field(
+        0.005,
+        gt=0,
+        le=0.02,
+        description="Default risk fraction per trade used for automatic quantity sizing.",
+    )
+    cash_available: float | None = Field(
+        None,
+        ge=0,
+        description="Optional cash cap used for automatic quantity sizing.",
+    )
     live_confirm_token: str | None = Field(
         None,
         description="Required only when execution_mode is live.",
@@ -480,6 +496,22 @@ class GptAutoTradeControlRequest(BaseModel):
     universe_candidate_limit: int = Field(20, ge=1, le=50)
     universe_final_limit: int = Field(10, ge=1, le=20)
     auto_confirm_paper: bool = True
+    account_equity: float = Field(
+        10_000_000,
+        gt=0,
+        description="Default account equity used for automatic quantity sizing.",
+    )
+    risk_per_trade: float = Field(
+        0.005,
+        gt=0,
+        le=0.02,
+        description="Default risk fraction per trade used for automatic quantity sizing.",
+    )
+    cash_available: float | None = Field(
+        None,
+        ge=0,
+        description="Optional cash cap used for automatic quantity sizing.",
+    )
     force_new: bool = Field(
         False,
         description="When false, start reuses an already active auto-trading session.",

@@ -155,6 +155,9 @@ def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, 
         max_cycles=req.max_cycles,
         run_immediately=True,
         auto_confirm_paper=req.auto_confirm_paper,
+        account_equity=req.account_equity,
+        risk_per_trade=req.risk_per_trade,
+        cash_available=req.cash_available,
         live_confirm_token=req.live_confirm_token,
     )
     started = start_auto_trading(start_req)
@@ -327,6 +330,7 @@ def _run_symbol(
             }
 
         price = float(price_result["price"])
+        symbol_cfg = _apply_order_sizing_defaults(req, symbol_cfg, price)
         preview_req = _to_preview_request(symbol_cfg, price)
         preview = create_order_preview(preview_req)
         result: dict[str, Any] = {
@@ -422,6 +426,23 @@ def _to_preview_request(
         is_short=symbol_cfg.is_short,
         market_beta=symbol_cfg.market_beta,
     )
+
+
+def _apply_order_sizing_defaults(
+    req: AutoTradeStartRequest,
+    symbol_cfg: AutoTradeSymbolConfig,
+    price: float,
+) -> AutoTradeSymbolConfig:
+    updates: dict[str, Any] = {}
+    if symbol_cfg.account_equity is None:
+        updates["account_equity"] = req.account_equity
+    if symbol_cfg.risk_per_trade is None:
+        updates["risk_per_trade"] = req.risk_per_trade
+    if symbol_cfg.cash_available is None and req.cash_available is not None:
+        updates["cash_available"] = req.cash_available
+    if symbol_cfg.stop_loss is None and symbol_cfg.quantity is None:
+        updates["stop_loss"] = price * (1 - settings.monitor_default_stop_loss_pct / 100)
+    return symbol_cfg.model_copy(update=updates) if updates else symbol_cfg
 
 
 def _to_live_order_request(

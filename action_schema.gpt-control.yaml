@@ -121,6 +121,45 @@ components:
             - paper
             - live
           description: Paper mode records simulated trades. Live mode can place broker orders only when backend live trading is enabled.
+        interval_seconds:
+          type: integer
+          default: 60
+        max_cycles:
+          type: integer
+          description: Optional cycle limit. Omit to keep running until stopped.
+        auto_discover_symbols:
+          type: boolean
+          default: true
+        universe_seed_symbols:
+          type: array
+          items:
+            type: string
+        universe_candidate_limit:
+          type: integer
+          default: 20
+        universe_final_limit:
+          type: integer
+          default: 10
+        auto_confirm_paper:
+          type: boolean
+          default: true
+        account_equity:
+          type: number
+          default: 10000000
+          description: Default account equity used for automatic quantity sizing.
+        risk_per_trade:
+          type: number
+          default: 0.005
+          description: Default risk fraction per trade used for automatic quantity sizing.
+        cash_available:
+          type: number
+          description: Optional cash cap used for automatic quantity sizing.
+        force_new:
+          type: boolean
+          default: false
+        live_confirm_token:
+          type: string
+          description: Required only when execution_mode is live.
     GptAutoTradingControlResponse:
       type: object
       properties:

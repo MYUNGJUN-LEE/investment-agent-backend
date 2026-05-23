@@ -91,6 +91,51 @@ def test_auto_trading_run_once_confirms_pending_paper_preview(monkeypatch):
     assert confirm_calls[0].preview_id == 7
 
 
+def test_auto_trading_applies_request_sizing_defaults(monkeypatch):
+    preview_calls = []
+
+    def fake_create_order_preview(req):
+        preview_calls.append(req)
+        return {
+            "status": "blocked",
+            "preview_id": 7,
+            "preview_token": None,
+            "symbol": req.symbol,
+            "signal_type": "entry",
+            "side": "BUY",
+            "price": req.price,
+            "quantity": req.quantity,
+            "amount": 0,
+            "recommended_quantity": None,
+            "message": "captured",
+            "strategy_decision": {},
+            "risk_decision": None,
+            "cost_edge_decision": None,
+        }
+
+    monkeypatch.setattr(auto_trading, "create_order_preview", fake_create_order_preview)
+
+    payload = _auto_trade_payload(
+        account_equity=20_000_000,
+        risk_per_trade=0.004,
+        cash_available=500_000,
+    )
+    payload["symbols"][0].pop("quantity")
+    payload["symbols"][0].pop("stop_loss")
+
+    response = client.post(
+        "/auto-trading/run-once",
+        headers=_auth_headers(),
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    assert preview_calls[0].account_equity == 20_000_000
+    assert preview_calls[0].risk_per_trade == 0.004
+    assert preview_calls[0].cash_available == 500_000
+    assert preview_calls[0].stop_loss == 9700
+
+
 def test_auto_trading_start_status_and_stop(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
 
