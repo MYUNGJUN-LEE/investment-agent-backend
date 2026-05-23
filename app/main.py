@@ -167,6 +167,27 @@ def healthz_check():
     return _health_payload()
 
 
+@app.get("/gpt/health")
+@app.get("/gpt/health/", include_in_schema=False)
+def gpt_health_check():
+    return _health_payload()
+
+
+@app.head("/gpt/health", include_in_schema=False)
+@app.head("/gpt/health/", include_in_schema=False)
+def gpt_health_check_head():
+    return Response(status_code=200)
+
+
+@app.options("/gpt/health", include_in_schema=False)
+@app.options("/gpt/health/", include_in_schema=False)
+def gpt_health_check_options():
+    return Response(
+        status_code=204,
+        headers={"Allow": "GET, HEAD, OPTIONS"},
+    )
+
+
 @app.get("/action-schema.yaml", include_in_schema=False)
 @app.get("/.well-known/openapi.yaml", include_in_schema=False)
 def custom_gpt_action_schema():
