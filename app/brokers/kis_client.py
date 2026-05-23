@@ -6,7 +6,8 @@ import json
 import os
 from pathlib import Path
 import threading
-from typing import Any
+import time
+from typing import Any, Callable
 
 import httpx
 
@@ -16,6 +17,8 @@ from app.config import settings
 KIS_PROD_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 _TOKEN_CACHE_LOCK = threading.RLock()
+_REQUEST_THROTTLE_LOCK = threading.RLock()
+_LAST_REQUEST_AT = 0.0
 
 
 class KisConfigError(ValueError):
@@ -499,6 +502,23 @@ class KisClient:
         )
         return headers
 
+    def _send_with_throttle(self, send: Callable[[], httpx.Response]) -> httpx.Response:
+        if self.transport is not None:
+            return send()
+        interval = float(settings.kis_request_min_interval_seconds or 0)
+        if interval <= 0:
+            return send()
+
+        global _LAST_REQUEST_AT
+        with _REQUEST_THROTTLE_LOCK:
+            elapsed = time.monotonic() - _LAST_REQUEST_AT
+            wait_seconds = interval - elapsed
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            response = send()
+            _LAST_REQUEST_AT = time.monotonic()
+            return response
+
     def _get(
         self,
         path: str,
@@ -510,7 +530,9 @@ class KisClient:
             timeout=self.timeout,
             transport=self.transport,
         ) as client:
-            response = client.get(path, params=params, headers=headers)
+            response = self._send_with_throttle(
+                lambda: client.get(path, params=params, headers=headers)
+            )
         return self._parse_response(response)
 
     def _get_with_headers(
@@ -524,7 +546,9 @@ class KisClient:
             timeout=self.timeout,
             transport=self.transport,
         ) as client:
-            response = client.get(path, params=params, headers=headers)
+            response = self._send_with_throttle(
+                lambda: client.get(path, params=params, headers=headers)
+            )
         return self._parse_response(response), response.headers
 
     def _post(
@@ -539,7 +563,9 @@ class KisClient:
             timeout=self.timeout,
             transport=self.transport,
         ) as client:
-            response = client.post(path, json=json, headers=headers)
+            response = self._send_with_throttle(
+                lambda: client.post(path, json=json, headers=headers)
+            )
         return self._parse_response(response, check_rt_cd=check_rt_cd)
 
     def _parse_response(
@@ -677,6 +703,7 @@ class KisClient:
             "account_product_code": self.account_product_code or "",
             "token_cache_path": str(self._token_cache_path),
             "token_cache_enabled": self._shared_token_cache_enabled(),
+            "request_min_interval_seconds": settings.kis_request_min_interval_seconds,
             "cached_token_available": bool(self._load_shared_access_token()),
             "token_issue_cooldown_until": (
                 self._load_shared_issue_cooldown().isoformat(timespec="seconds")

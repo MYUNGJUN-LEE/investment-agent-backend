@@ -15,6 +15,10 @@ services:
         value: "true"
       - key: AUTO_TRADING_WORKER_POLL_SECONDS
         value: "2"
+      - key: AUTO_TRADING_WORKER_LOCK_SECONDS
+        value: "7200"
+      - key: AUTO_TRADING_SYMBOL_WORKERS
+        value: "1"
       - key: MONITOR_PRICE_INTERVAL_SECONDS
         value: "60"
       - key: MONITOR_DISCLOSURE_INTERVAL_SECONDS
@@ -27,3 +31,7 @@ services:
         value: "data/kis_token_cache.json"
       - key: KIS_TOKEN_ISSUE_COOLDOWN_SECONDS
         value: "70"
+      - key: KIS_REQUEST_MIN_INTERVAL_SECONDS
+        value: "1.5"
+      - key: UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS
+        value: "60"

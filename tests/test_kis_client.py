@@ -6,6 +6,7 @@ import json
 import httpx
 import pytest
 
+from app.brokers import kis_client
 from app.brokers.kis_client import KisApiError, KisClient, KisConfigError
 
 
@@ -193,6 +194,30 @@ def test_get_current_price_requests_domestic_stock_quote():
         "/oauth2/tokenP",
         "/uapi/domestic-stock/v1/quotations/inquire-price",
     ]
+
+
+def test_send_with_throttle_waits_between_real_kis_requests(monkeypatch):
+    sleeps: list[float] = []
+    moments = iter([10.25, 12.0])
+    sent: list[str] = []
+    client = KisClient(
+        app_key="test-app-key",
+        app_secret="test-app-secret",
+        is_paper=True,
+    )
+
+    monkeypatch.setattr(kis_client, "_LAST_REQUEST_AT", 10.0)
+    monkeypatch.setattr(kis_client.settings, "kis_request_min_interval_seconds", 1.5)
+    monkeypatch.setattr(kis_client.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(kis_client.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    response = client._send_with_throttle(
+        lambda: sent.append("request") or httpx.Response(200, json={"rt_cd": "0"})
+    )
+
+    assert response.status_code == 200
+    assert sent == ["request"]
+    assert sleeps == [1.25]
 
 
 def test_get_daily_prices_requests_domestic_stock_chart():

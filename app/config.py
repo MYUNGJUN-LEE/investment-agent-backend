@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     kis_is_paper: bool = True
     kis_token_cache_path: str = "data/kis_token_cache.json"
     kis_token_issue_cooldown_seconds: int = 70
+    kis_request_min_interval_seconds: float = 1.5
 
     # Optional JSON feed used by app.data_sources.market_context.
     market_context_url: str | None = None
@@ -49,8 +50,8 @@ class Settings(BaseSettings):
     max_order_price_deviation_bps: float = 300.0
     auto_trading_db_path: str = "data/auto_trading.sqlite3"
     auto_trading_worker_poll_seconds: float = 2.0
-    auto_trading_worker_lock_seconds: int = 300
-    auto_trading_symbol_workers: int = 4
+    auto_trading_worker_lock_seconds: int = 7200
+    auto_trading_symbol_workers: int = 1
     broker_sync_db_path: str = "data/broker_sync.sqlite3"
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120
@@ -79,6 +80,7 @@ class Settings(BaseSettings):
     universe_scanner_candidate_limit: int = 20
     universe_scanner_final_limit: int = 10
     universe_scanner_max_source_symbols: int = 80
+    universe_scanner_symbol_interval_seconds: float = 60.0
     embedded_workers_enabled: bool = os.getenv("RENDER_SERVICE_TYPE") == "web"
     embedded_worker_broker_sync_enabled: bool = True
 

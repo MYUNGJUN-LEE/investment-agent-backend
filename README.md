@@ -243,8 +243,11 @@ and all existing risk checks.
 The default auto-trading cycle is 60 seconds. If `/auto-trading/start` is called
 with an empty `symbols` list, the universe scanner runs first, stores KIS price
 snapshots in SQLite, ranks candidates, checks NAVER/OpenDART only for candidates,
-and passes the final 5-10 symbols into the normal analyzer. Multiple symbols in
-the same session are processed in parallel up to `AUTO_TRADING_SYMBOL_WORKERS`.
+and passes the final 5-10 symbols into the normal analyzer. The scanner calls
+one symbol at a time and waits `UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS`
+between symbols. KIS HTTP requests are also serialized by
+`KIS_REQUEST_MIN_INTERVAL_SECONDS`, so each symbol's price, daily, minute,
+orderbook, execution, and investor-flow requests are not fired at once.
 Auto-trading, market monitoring, and broker sync now run as separate workers:
 
 ```bash
@@ -350,6 +353,13 @@ KIS limits access-token issuance. The backend reuses tokens through
 `KIS_TOKEN_ISSUE_COOLDOWN_SECONDS` before retrying. Use
 `GET /broker/kis/config-status` to inspect non-secret KIS runtime settings and
 token-cache status.
+
+KIS also rejects excessive per-second API traffic. In the default safe
+configuration, `AUTO_TRADING_SYMBOL_WORKERS=1`,
+`KIS_REQUEST_MIN_INTERVAL_SECONDS=1.5`, and
+`UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS=60`. A 20-symbol universe scan will
+therefore take at least about 20 minutes plus network time, but it keeps the
+single Render process below roughly one KIS request every 1.5 seconds.
 
 Actual KIS paper order placement remains opt-in. Use only a KIS paper account
 and a tiny quantity:

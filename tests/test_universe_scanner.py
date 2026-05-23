@@ -10,6 +10,11 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_seed_symbols", "")
     monkeypatch.setattr(universe_scanner.settings, "monitor_watchlist_symbols", "")
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 3)
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_scanner_symbol_interval_seconds",
+        0,
+    )
 
     price_rows = {
         "005930": {
@@ -130,6 +135,11 @@ def test_universe_scanner_uses_latest_close_as_watch_when_market_closed(
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_seed_symbols", "")
     monkeypatch.setattr(universe_scanner.settings, "monitor_watchlist_symbols", "")
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 1)
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_scanner_symbol_interval_seconds",
+        0,
+    )
     monkeypatch.setattr(universe_scanner, "_is_kr_regular_market_open", lambda: False)
     monkeypatch.setattr(
         universe_scanner,
@@ -164,3 +174,25 @@ def test_universe_scanner_uses_latest_close_as_watch_when_market_closed(
     assert result["final_candidates"][0]["decision"] == "watch"
     assert result["final_candidates"][0]["current_price"] == 70000
     assert "market closed" in result["final_candidates"][0]["reason"]
+
+
+def test_universe_scanner_collects_symbols_sequentially(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_scanner_symbol_interval_seconds",
+        0,
+    )
+
+    def fake_fetch_price_data(symbol: str) -> dict:
+        calls.append(symbol)
+        return {"symbol": symbol, "current_price": 1000, "source": "test"}
+
+    monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
+
+    snapshots = universe_scanner._collect_price_snapshots(
+        {"005930": "Samsung Electronics", "000660": "SK hynix"}
+    )
+
+    assert calls == ["005930", "000660"]
+    assert [item["symbol"] for item in snapshots] == ["005930", "000660"]

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time
 import json
 from pathlib import Path
 import sqlite3
+import time as time_module
 from typing import Any
 from uuid import uuid4
 
@@ -228,26 +228,25 @@ def _resolve_source_symbols(req: AutoTradeStartRequest) -> dict[str, str | None]
 
 
 def _collect_price_snapshots(source_symbols: dict[str, str | None]) -> list[dict[str, Any]]:
-    max_workers = max(1, min(4, int(settings.auto_trading_symbol_workers or 1)))
     snapshots: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(fetch_price_data, symbol): (symbol, name)
-            for symbol, name in source_symbols.items()
-        }
-        for future in as_completed(futures):
-            symbol, name = futures[future]
-            try:
-                price_data = future.result()
-            except Exception as exc:
-                price_data = {
-                    "status": "error",
-                    "symbol": symbol,
-                    "message": str(exc),
-                }
-            price_data["symbol"] = _normalize_symbol(price_data.get("symbol") or symbol)
-            price_data["name"] = name or DEFAULT_UNIVERSE.get(symbol)
-            snapshots.append(price_data)
+    symbol_interval_seconds = max(
+        0.0,
+        float(settings.universe_scanner_symbol_interval_seconds or 0),
+    )
+    for index, (symbol, name) in enumerate(source_symbols.items()):
+        if index and symbol_interval_seconds:
+            time_module.sleep(symbol_interval_seconds)
+        try:
+            price_data = fetch_price_data(symbol)
+        except Exception as exc:
+            price_data = {
+                "status": "error",
+                "symbol": symbol,
+                "message": str(exc),
+            }
+        price_data["symbol"] = _normalize_symbol(price_data.get("symbol") or symbol)
+        price_data["name"] = name or DEFAULT_UNIVERSE.get(symbol)
+        snapshots.append(price_data)
     return snapshots
 
 
