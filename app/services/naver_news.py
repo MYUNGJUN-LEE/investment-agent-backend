@@ -1,8 +1,9 @@
-import os
 import re
 from html import unescape
 
 import httpx
+
+from app.config import settings
 
 
 def clean_html(text: str | None) -> str:
@@ -13,8 +14,8 @@ def clean_html(text: str | None) -> str:
 
 
 def search_naver_news(query: str, display: int = 10, sort: str = "date") -> dict:
-    client_id = os.getenv("NAVER_CLIENT_ID")
-    client_secret = os.getenv("NAVER_CLIENT_SECRET")
+    client_id = settings.naver_client_id
+    client_secret = settings.naver_client_secret
 
     if not client_id or not client_secret:
         return {

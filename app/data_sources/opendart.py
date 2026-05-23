@@ -7,6 +7,7 @@ import httpx
 
 from app.config import settings
 from app.scoring import classify_text_impact
+from app.storage.market_data import record_disclosure_events
 
 
 CORP_MAP_PATH = Path("data/corp_map.csv")
@@ -116,4 +117,5 @@ def fetch_opendart_disclosures(symbol: str, lookback_hours: int) -> list[dict]:
             }
         )
 
+    record_disclosure_events(symbol, result)
     return result

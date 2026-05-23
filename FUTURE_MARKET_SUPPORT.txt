@@ -1,0 +1,7 @@
+Future market support note
+
+- The current backend API accepts KR market requests only.
+- US market support may be added later, but it should be implemented with
+  separate market data, order routing, cost, tax, FX, and broker safety checks.
+- Do not expose market="US" in runtime request models or action schemas until
+  those checks are implemented and tested end to end.

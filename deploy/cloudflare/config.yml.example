@@ -1,0 +1,21 @@
+# Cloudflare Tunnel config template for exposing the local FastAPI backend.
+#
+# Copy this file to one of these locations and edit hostname/credentials-file:
+# - %USERPROFILE%\.cloudflared\investment-agent-backend.yml
+# - deploy/cloudflare/config.yml
+#
+# Create credentials with:
+#   cloudflared tunnel login
+#   cloudflared tunnel create investment-agent-backend
+#   cloudflared tunnel route dns investment-agent-backend api.your-domain.com
+
+tunnel: investment-agent-backend
+credentials-file: C:/Users/user/.cloudflared/investment-agent-backend.json
+
+ingress:
+  - hostname: api.your-domain.com
+    service: http://127.0.0.1:8010
+    originRequest:
+      connectTimeout: 10s
+      httpHostHeader: api.your-domain.com
+  - service: http_status:404

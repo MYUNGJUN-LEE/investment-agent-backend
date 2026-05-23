@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: investment-agent-backend
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: EMBEDDED_WORKERS_ENABLED
+        value: "true"
+      - key: EMBEDDED_WORKER_BROKER_SYNC_ENABLED
+        value: "true"
+      - key: MARKET_MONITOR_ENABLED
+        value: "true"
+      - key: AUTO_TRADING_WORKER_POLL_SECONDS
+        value: "2"
+      - key: MONITOR_PRICE_INTERVAL_SECONDS
+        value: "60"
+      - key: MONITOR_DISCLOSURE_INTERVAL_SECONDS
+        value: "300"
+      - key: MONITOR_NEWS_INTERVAL_SECONDS
+        value: "600"
+      - key: BROKER_SYNC_INTERVAL_SECONDS
+        value: "60"

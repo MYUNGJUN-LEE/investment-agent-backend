@@ -77,6 +77,7 @@ def run_full_pipeline(req: PipelineRequest) -> dict:
         "company_name": company_name,
         "market": req.market,
         "strategy_type": req.strategy_type,
+        "risk_level": req.risk_level,
         "final_grade": final_result["final_grade"],
         "entry_signal": final_result["entry_signal"],
         "exit_signal": final_result["exit_signal"],

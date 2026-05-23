@@ -1,4 +1,4 @@
-openapi: 3.1.0
+﻿openapi: 3.1.0
 info:
   title: Investment Agent API
   version: 1.0.0
@@ -12,6 +12,7 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
+  schemas: {}
 
 security:
   - ApiKeyAuth: []
@@ -59,10 +60,10 @@ paths:
                 name:
                   type: string
                   description: Company name.
-                  example: "SK하이닉스"
+                  example: "SK?섏씠?됱뒪"
                 market:
                   type: string
-                  enum: ["KR", "US"]
+                  enum: ["KR"]
                   example: "KR"
                 strategy_type:
                   type: string
@@ -93,7 +94,6 @@ paths:
                     type: string
                   final_grade:
                     type: string
-                    enum: ["공격", "중립", "관망", "회피"]
                   entry_signal:
                     type: boolean
                   exit_signal:
@@ -106,6 +106,7 @@ paths:
                     type: string
                   scores:
                     type: object
+                    properties: {}
                   entry_conditions:
                     type: array
                     items:
@@ -126,9 +127,1090 @@ paths:
                     type: string
                   research_result:
                     type: object
+                    properties: {}
                   financial_result:
                     type: object
+                    properties: {}
                   chart_flow_result:
                     type: object
+                    properties: {}
                   devils_advocate_result:
                     type: object
+                    properties: {}
+
+  /market-context/run-once:
+    post:
+      operationId: runMarketContextOnce
+      summary: Fetch, calculate, and store daily market context.
+      description: Calculates KOSPI/KOSDAQ trend, USD/KRW, VIX, rates, market_regime, risk_on_score, and sector relative strength. If payload is omitted, the backend reads MARKET_CONTEXT_URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                symbol:
+                  type: string
+                  nullable: true
+                  example: "005930"
+                sector:
+                  type: string
+                  nullable: true
+                  example: "semiconductor"
+                persist:
+                  type: boolean
+                  example: true
+                payload:
+                  type: object
+                  properties: {}
+                  nullable: true
+                  description: Optional pre-fetched context with indices, fx, vix, rates, and sectors.
+      responses:
+        "200":
+          description: Daily market context result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  trade_date:
+                    type: string
+                  market_regime:
+                    type: string
+                  risk_on_score:
+                    type: number
+                    nullable: true
+                  kospi:
+                    type: object
+                    properties: {}
+                  kosdaq:
+                    type: object
+                    properties: {}
+                  usdkrw:
+                    type: object
+                    properties: {}
+                  vix:
+                    type: object
+                    properties: {}
+                  rates:
+                    type: object
+                    properties: {}
+                  sector_relative_strength:
+                    type: object
+                    properties: {}
+                  snapshot_id:
+                    type: integer
+                    nullable: true
+
+  /orders/preview:
+    post:
+      operationId: previewOrder
+      summary: Create a strategy and risk checked paper-order preview.
+      description: Runs the investment pipeline, converts the result into a conservative order candidate, applies risk checks, and returns a preview token if the order is ready for user confirmation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - symbol
+                - market
+                - strategy_type
+                - price
+              properties:
+                symbol:
+                  type: string
+                  example: "005930"
+                name:
+                  type: string
+                  example: "?쇱꽦?꾩옄"
+                market:
+                  type: string
+                  enum: ["KR"]
+                  example: "KR"
+                strategy_type:
+                  type: string
+                  enum: ["daytrade", "swing", "midterm"]
+                  example: "daytrade"
+                lookback_hours:
+                  type: integer
+                  example: 24
+                risk_level:
+                  type: string
+                  enum: ["low", "medium", "high"]
+                  example: "medium"
+                requested_action:
+                  type: string
+                  enum: ["auto", "entry", "exit"]
+                  example: "auto"
+                price:
+                  type: number
+                  example: 75000
+                quantity:
+                  type: integer
+                  nullable: true
+                  description: Optional. If omitted for an entry preview, the API recommends quantity from account_equity, risk_per_trade, and stop_loss.
+                  example: 3
+                signal_time:
+                  type: string
+                  nullable: true
+                decision_price:
+                  type: number
+                  nullable: true
+                order_price:
+                  type: number
+                  nullable: true
+                signal_score:
+                  type: number
+                  nullable: true
+                stop_loss:
+                  type: number
+                  nullable: true
+                take_profit:
+                  type: number
+                  nullable: true
+                market_regime:
+                  type: string
+                  nullable: true
+                model_version:
+                  type: string
+                  example: "rule_based_v1"
+                sector:
+                  type: string
+                  nullable: true
+                account_equity:
+                  type: number
+                  nullable: true
+                risk_per_trade:
+                  type: number
+                  nullable: true
+                cash_available:
+                  type: number
+                  nullable: true
+                expected_gross_edge_bps:
+                  type: number
+                  nullable: true
+                  description: Expected gross edge before trading costs, in basis points.
+                expected_win_bps:
+                  type: number
+                  nullable: true
+                  description: Expected upside in basis points.
+                expected_loss_bps:
+                  type: number
+                  nullable: true
+                  description: Expected downside or stop distance in basis points.
+                expected_sharpe:
+                  type: number
+                  nullable: true
+                commission_rate:
+                  type: number
+                  nullable: true
+                sell_tax_rate:
+                  type: number
+                  nullable: true
+                spread_bps:
+                  type: number
+                  nullable: true
+                slippage_bps:
+                  type: number
+                  nullable: true
+                fx_spread_bps:
+                  type: number
+                  nullable: true
+                leverage:
+                  type: number
+                  example: 1
+                margin_interest_rate:
+                  type: number
+                  nullable: true
+                borrow_fee_rate:
+                  type: number
+                  nullable: true
+                expected_holding_days:
+                  type: number
+                  example: 1
+                fill_probability:
+                  type: number
+                  nullable: true
+                is_short:
+                  type: boolean
+                  example: false
+                market_beta:
+                  type: number
+                  nullable: true
+      responses:
+        "200":
+          description: Order preview result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: ["pending", "blocked"]
+                  preview_id:
+                    type: integer
+                  preview_token:
+                    type: string
+                    nullable: true
+                  symbol:
+                    type: string
+                  signal_type:
+                    type: string
+                    nullable: true
+                  side:
+                    type: string
+                    nullable: true
+                  price:
+                    type: number
+                  quantity:
+                    type: integer
+                  amount:
+                    type: number
+                  recommended_quantity:
+                    type: object
+                    properties: {}
+                    nullable: true
+                  message:
+                    type: string
+                  strategy_decision:
+                    type: object
+                    properties: {}
+                  risk_decision:
+                    type: object
+                    properties: {}
+                    nullable: true
+                  cost_edge_decision:
+                    type: object
+                    properties: {}
+                    nullable: true
+
+  /orders/confirm:
+    post:
+      operationId: confirmOrderPreview
+      summary: Confirm a pending order preview and execute it in paper trading.
+      description: Confirms a preview using preview_id and preview_token, then records the order through the paper trading engine only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - preview_id
+                - preview_token
+              properties:
+                preview_id:
+                  type: integer
+                preview_token:
+                  type: string
+                execution_mode:
+                  type: string
+                  enum: ["paper"]
+                  example: "paper"
+      responses:
+        "200":
+          description: Paper execution result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  preview_id:
+                    type: integer
+                  execution_mode:
+                    type: string
+                  paper_result:
+                    type: object
+                    properties: {}
+
+  /paper/run-once:
+    post:
+      operationId: runPaperTradingOnce
+      summary: Record one paper-trading signal and virtual fill.
+      description: Records an entry or exit signal, applies risk checks, and updates virtual paper-trading orders and positions.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - symbol
+                - market
+                - strategy_type
+                - signal_type
+                - price
+              properties:
+                symbol:
+                  type: string
+                  example: "005930"
+                name:
+                  type: string
+                  example: "?쇱꽦?꾩옄"
+                market:
+                  type: string
+                  enum: ["KR"]
+                  example: "KR"
+                strategy_type:
+                  type: string
+                  enum: ["daytrade", "swing", "midterm"]
+                  example: "daytrade"
+                risk_level:
+                  type: string
+                  enum: ["low", "medium", "high"]
+                  example: "medium"
+                signal_type:
+                  type: string
+                  enum: ["entry", "exit"]
+                  example: "entry"
+                price:
+                  type: number
+                  example: 75000
+                quantity:
+                  type: integer
+                  example: 3
+                confidence:
+                  type: number
+                  example: 0.82
+                reason:
+                  type: string
+                source:
+                  type: string
+                  example: "manual"
+                signal_time:
+                  type: string
+                  nullable: true
+                decision_price:
+                  type: number
+                  nullable: true
+                order_price:
+                  type: number
+                  nullable: true
+                fill_price:
+                  type: number
+                  nullable: true
+                filled_quantity:
+                  type: integer
+                  nullable: true
+                signal_score:
+                  type: number
+                  nullable: true
+                stop_loss:
+                  type: number
+                  nullable: true
+                take_profit:
+                  type: number
+                  nullable: true
+                market_regime:
+                  type: string
+                  nullable: true
+                model_version:
+                  type: string
+                  example: "rule_based_v1"
+                sector:
+                  type: string
+                  nullable: true
+                account_equity:
+                  type: number
+                  nullable: true
+                risk_per_trade:
+                  type: number
+                  nullable: true
+                cash_available:
+                  type: number
+                  nullable: true
+                expected_gross_edge_bps:
+                  type: number
+                  nullable: true
+                expected_win_bps:
+                  type: number
+                  nullable: true
+                expected_loss_bps:
+                  type: number
+                  nullable: true
+                expected_sharpe:
+                  type: number
+                  nullable: true
+                commission_rate:
+                  type: number
+                  nullable: true
+                sell_tax_rate:
+                  type: number
+                  nullable: true
+                spread_bps:
+                  type: number
+                  nullable: true
+                slippage_bps:
+                  type: number
+                  nullable: true
+                fx_spread_bps:
+                  type: number
+                  nullable: true
+                leverage:
+                  type: number
+                  example: 1
+                margin_interest_rate:
+                  type: number
+                  nullable: true
+                borrow_fee_rate:
+                  type: number
+                  nullable: true
+                expected_holding_days:
+                  type: number
+                  example: 1
+                fill_probability:
+                  type: number
+                  nullable: true
+                is_short:
+                  type: boolean
+                  example: false
+                market_beta:
+                  type: number
+                  nullable: true
+      responses:
+        "200":
+          description: Paper trading result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /auto-trading/start:
+    post:
+      operationId: startAutoTrading
+      summary: Create a persistent auto-trading session for the worker.
+      description: Saves an auto-trading session in SQLite. A separate worker runs the pipeline, creates order previews, applies risk checks, and executes approved paper orders by default. Live execution requires live settings and live_confirm_token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                symbols:
+                  type: array
+                  minItems: 0
+                  maxItems: 20
+                  description: Leave empty to let the backend universe scanner discover candidates automatically.
+                  items:
+                    type: object
+                    required:
+                      - symbol
+                    properties:
+                      symbol:
+                        type: string
+                        example: "005930"
+                      name:
+                        type: string
+                        nullable: true
+                      market:
+                        type: string
+                        enum: ["KR"]
+                        example: "KR"
+                      strategy_type:
+                        type: string
+                        enum: ["daytrade", "swing", "midterm"]
+                        example: "daytrade"
+                      risk_level:
+                        type: string
+                        enum: ["low", "medium", "high"]
+                        example: "medium"
+                      requested_action:
+                        type: string
+                        enum: ["auto", "entry", "exit"]
+                        example: "auto"
+                      price:
+                        type: number
+                        nullable: true
+                        description: Fallback price. If omitted, the backend tries to fetch current KIS price.
+                      quantity:
+                        type: integer
+                        nullable: true
+                      stop_loss:
+                        type: number
+                        nullable: true
+                      take_profit:
+                        type: number
+                        nullable: true
+                      account_equity:
+                        type: number
+                        nullable: true
+                      risk_per_trade:
+                        type: number
+                        nullable: true
+                      cash_available:
+                        type: number
+                        nullable: true
+                      expected_gross_edge_bps:
+                        type: number
+                        nullable: true
+                      expected_win_bps:
+                        type: number
+                        nullable: true
+                      expected_loss_bps:
+                        type: number
+                        nullable: true
+                auto_discover_symbols:
+                  type: boolean
+                  example: true
+                  description: If true and symbols is empty, scan the universe and trade only discovered candidates.
+                universe_seed_symbols:
+                  type: array
+                  maxItems: 200
+                  items:
+                    type: string
+                  description: Optional seed tickers for the scanner.
+                universe_candidate_limit:
+                  type: integer
+                  example: 20
+                universe_final_limit:
+                  type: integer
+                  example: 10
+                execution_mode:
+                  type: string
+                  enum: ["paper", "live"]
+                  example: "paper"
+                interval_seconds:
+                  type: integer
+                  example: 60
+                  description: Default is 60 seconds. Each cycle refreshes news, disclosures, and KIS data before deciding.
+                max_cycles:
+                  type: integer
+                  nullable: true
+                  description: Omit to run until stopped.
+                run_immediately:
+                  type: boolean
+                  example: true
+                auto_confirm_paper:
+                  type: boolean
+                  example: true
+                live_confirm_token:
+                  type: string
+                  nullable: true
+                  description: Required only for live execution.
+      responses:
+        "200":
+          description: Auto-trading session started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /auto-trading/run-once:
+    post:
+      operationId: runAutoTradingOnce
+      summary: Run one auto-trading cycle synchronously.
+      description: Useful for testing the same automated decision and execution path without starting a repeating worker.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                symbols:
+                  type: array
+                  minItems: 0
+                  items:
+                    type: object
+                    required:
+                      - symbol
+                    properties:
+                      symbol:
+                        type: string
+                      name:
+                        type: string
+                        nullable: true
+                      market:
+                        type: string
+                        enum: ["KR"]
+                      strategy_type:
+                        type: string
+                        enum: ["daytrade", "swing", "midterm"]
+                      risk_level:
+                        type: string
+                        enum: ["low", "medium", "high"]
+                      requested_action:
+                        type: string
+                        enum: ["auto", "entry", "exit"]
+                      price:
+                        type: number
+                        nullable: true
+                      quantity:
+                        type: integer
+                        nullable: true
+                      stop_loss:
+                        type: number
+                        nullable: true
+                      account_equity:
+                        type: number
+                        nullable: true
+                      risk_per_trade:
+                        type: number
+                        nullable: true
+                      expected_gross_edge_bps:
+                        type: number
+                        nullable: true
+                      expected_win_bps:
+                        type: number
+                        nullable: true
+                      expected_loss_bps:
+                        type: number
+                        nullable: true
+                auto_discover_symbols:
+                  type: boolean
+                  example: true
+                universe_seed_symbols:
+                  type: array
+                  items:
+                    type: string
+                universe_candidate_limit:
+                  type: integer
+                  example: 20
+                universe_final_limit:
+                  type: integer
+                  example: 10
+                execution_mode:
+                  type: string
+                  enum: ["paper", "live"]
+                  example: "paper"
+                live_confirm_token:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: One auto-trading cycle result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /gpt/auto-trading/control:
+    post:
+      operationId: controlAutoTradingFromGpt
+      summary: Turn auto-trading on, off, or check status from Custom GPT.
+      description: Use this from Custom GPT for simple Korean commands such as ?먮룞留ㅻℓ 耳? ?먮룞留ㅻℓ 爰? or ?곹깭 ?뺤씤. Start creates one universe-scanner auto-trading session unless one is already active.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - command
+              properties:
+                command:
+                  type: string
+                  enum: ["start", "stop", "status"]
+                  description: start turns auto-trading on, stop stops all active sessions, status checks active/recent sessions.
+                execution_mode:
+                  type: string
+                  enum: ["paper", "live"]
+                  example: "paper"
+                interval_seconds:
+                  type: integer
+                  example: 60
+                max_cycles:
+                  type: integer
+                  nullable: true
+                auto_discover_symbols:
+                  type: boolean
+                  example: true
+                universe_seed_symbols:
+                  type: array
+                  items:
+                    type: string
+                universe_candidate_limit:
+                  type: integer
+                  example: 20
+                universe_final_limit:
+                  type: integer
+                  example: 10
+                auto_confirm_paper:
+                  type: boolean
+                  example: true
+                force_new:
+                  type: boolean
+                  example: false
+                  description: If false, start will not create a duplicate active session.
+                live_confirm_token:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Auto-trading control result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /auto-trading/status/{session_id}:
+    get:
+      operationId: getAutoTradingStatus
+      summary: Get auto-trading session status.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Auto-trading session status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /auto-trading/sessions:
+    get:
+      operationId: listAutoTradingSessions
+      summary: List persistent auto-trading sessions.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ["active", "stopped", "error"]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+      responses:
+        "200":
+          description: Auto-trading sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /auto-trading/events/{session_id}:
+    get:
+      operationId: listAutoTradingEvents
+      summary: List recent auto-trading events for a session.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+      responses:
+        "200":
+          description: Auto-trading session events.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /auto-trading/stop/{session_id}:
+    post:
+      operationId: stopAutoTrading
+      summary: Stop a background auto-trading loop.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Auto-trading stop result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /auto-trading/restart/{session_id}:
+    post:
+      operationId: restartAutoTrading
+      summary: Restart a stopped or errored background auto-trading loop.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Auto-trading restart result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /live/orders:
+    post:
+      operationId: submitLiveLimitOrder
+      summary: Submit a live KIS limit order when all live-trading gates pass.
+      description: Disabled by default. Requires ENABLE_LIVE_TRADING=true, KIS_IS_PAPER=false, a matching confirm_token, limit order type, and risk approval.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - symbol
+                - market
+                - side
+                - order_type
+                - price
+                - quantity
+                - decision_price
+                - confirm_token
+              properties:
+                symbol:
+                  type: string
+                  example: "005930"
+                market:
+                  type: string
+                  enum: ["KR"]
+                  example: "KR"
+                risk_level:
+                  type: string
+                  enum: ["low", "medium", "high"]
+                  example: "medium"
+                side:
+                  type: string
+                  enum: ["buy", "sell"]
+                  example: "buy"
+                order_type:
+                  type: string
+                  enum: ["limit"]
+                  example: "limit"
+                price:
+                  type: number
+                  example: 75000
+                quantity:
+                  type: integer
+                  example: 3
+                confirm_token:
+                  type: string
+                client_order_id:
+                  type: string
+                  nullable: true
+                  description: Optional idempotency key. Reusing it blocks duplicate live orders.
+                session_id:
+                  type: string
+                  nullable: true
+                  description: Optional auto-trading session id for order-state tracing.
+                reason:
+                  type: string
+                signal_time:
+                  type: string
+                  nullable: true
+                decision_price:
+                  type: number
+                  description: Required reference price used to block abnormal live order price deviation.
+                order_price:
+                  type: number
+                  nullable: true
+                signal_score:
+                  type: number
+                  nullable: true
+                stop_loss:
+                  type: number
+                  nullable: true
+                take_profit:
+                  type: number
+                  nullable: true
+                market_regime:
+                  type: string
+                  nullable: true
+                model_version:
+                  type: string
+                  example: "rule_based_v1"
+                sector:
+                  type: string
+                  nullable: true
+                account_equity:
+                  type: number
+                  nullable: true
+                risk_per_trade:
+                  type: number
+                  nullable: true
+                cash_available:
+                  type: number
+                  nullable: true
+                expected_gross_edge_bps:
+                  type: number
+                  nullable: true
+                expected_win_bps:
+                  type: number
+                  nullable: true
+                expected_loss_bps:
+                  type: number
+                  nullable: true
+                expected_sharpe:
+                  type: number
+                  nullable: true
+                commission_rate:
+                  type: number
+                  nullable: true
+                sell_tax_rate:
+                  type: number
+                  nullable: true
+                spread_bps:
+                  type: number
+                  nullable: true
+                slippage_bps:
+                  type: number
+                  nullable: true
+                fx_spread_bps:
+                  type: number
+                  nullable: true
+                leverage:
+                  type: number
+                  example: 1
+                margin_interest_rate:
+                  type: number
+                  nullable: true
+                borrow_fee_rate:
+                  type: number
+                  nullable: true
+                expected_holding_days:
+                  type: number
+                  example: 1
+                fill_probability:
+                  type: number
+                  nullable: true
+                is_short:
+                  type: boolean
+                  example: false
+                market_beta:
+                  type: number
+                  nullable: true
+      responses:
+        "200":
+          description: KIS live order submission result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+        "403":
+          description: Live trading disabled, paper mode enabled, invalid confirm token, or risk rejection.
+
+  /broker/kis/sync:
+    post:
+      operationId: syncKisBrokerState
+      summary: Synchronize KIS account balance, positions, and recent executions.
+      description: Fetches KIS balance and daily execution history, then stores the latest broker state in SQLite.
+      responses:
+        "200":
+          description: Broker synchronization result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /broker/kis/paper-preflight:
+    post:
+      operationId: preflightKisPaperE2E
+      summary: Validate KIS paper connectivity without placing an order.
+      description: Checks KIS paper quote, balance, execution-history, and SQLite sync connectivity. It never submits an order.
+      parameters:
+        - name: symbol
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "005930"
+      responses:
+        "200":
+          description: KIS paper preflight result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /monitor/status:
+    get:
+      operationId: getMarketMonitorStatus
+      summary: Get periodic market monitor job status.
+      description: Shows the 1-minute KIS watch, 5-minute OpenDART watch, and 10-minute NAVER news watch schedules. The current implementation uses local SQLite, not Supabase.
+      responses:
+        "200":
+          description: Market monitor status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /workers/status:
+    get:
+      operationId: getEmbeddedWorkerStatus
+      summary: Get embedded worker status.
+      description: Shows which in-process Render single-service workers are alive.
+      responses:
+        "200":
+          description: Embedded worker status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /monitor/run-due:
+    post:
+      operationId: runDueMarketMonitorJobs
+      summary: Run currently due market monitor jobs.
+      description: Processes due monitor jobs according to their configured intervals.
+      responses:
+        "200":
+          description: Due monitor job results.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /monitor/run/{job_name}:
+    post:
+      operationId: runMarketMonitorJob
+      summary: Run one market monitor job immediately.
+      description: job_name must be one of kis_market_watch, opendart_disclosures, or naver_news.
+      parameters:
+        - name: job_name
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: ["kis_market_watch", "opendart_disclosures", "naver_news"]
+      responses:
+        "200":
+          description: Monitor job result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
