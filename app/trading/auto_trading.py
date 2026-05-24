@@ -27,6 +27,7 @@ from app.trading.order_approval import (
 )
 from app.trading import auto_trading_store
 from app.trading import broker_sync
+from app.trading import order_state
 from app.trading import paper_trading
 from app.trading import risk_manager
 from app.trading.universe_scanner import (
@@ -44,10 +45,29 @@ class AutoTradingError(ValueError):
 def start_auto_trading(req: AutoTradeStartRequest) -> dict[str, Any]:
     """Persist an auto-trading session for a separate worker process."""
     _validate_start_request(req)
+    account_key = auto_trading_store.account_key_for_request(req)
+    if settings.auto_trading_one_session_per_account:
+        existing = auto_trading_store.get_active_session_for_account(account_key)
+        if existing:
+            return {
+                "session_id": existing["session_id"],
+                "status": existing["status"],
+                "account_key": existing.get("account_key"),
+                "execution_mode": req.execution_mode,
+                "interval_seconds": existing["interval_seconds"],
+                "max_cycles": existing["max_cycles"],
+                "started_at": existing["created_at"],
+                "message": (
+                    "An active auto-trading session already exists for this account; "
+                    "no duplicate session was created."
+                ),
+                "universe_scan": None,
+            }
     session = auto_trading_store.create_session(req)
     return {
         "session_id": session["session_id"],
         "status": session["status"],
+        "account_key": session.get("account_key") or account_key,
         "execution_mode": req.execution_mode,
         "interval_seconds": req.interval_seconds,
         "max_cycles": req.max_cycles,
@@ -320,30 +340,26 @@ def _run_cycle(
             results_prefix[0]["message"] = "Universe scanner found no tradable candidates"
             return results_prefix
 
+    if _requires_live_exit_confirmation(req) and any(
+        symbol_cfg.requested_action == "exit" for symbol_cfg in symbols
+    ):
+        return results_prefix + _run_live_exits_then_entries(
+            req=req,
+            symbols=symbols,
+            session_id=session_id,
+        )
+
     prepared = _prepare_symbols_for_account_balance(req, symbols)
     results_prefix.extend(prepared["results"])
     symbols = prepared["symbols"]
     if not symbols:
         return results_prefix
 
-    if len(symbols) <= 1:
-        return results_prefix + [
-            _run_symbol(req, symbol_cfg, session_id=session_id) for symbol_cfg in symbols
-        ]
-
-    max_workers = max(
-        1,
-        min(len(symbols), int(settings.auto_trading_symbol_workers or 1)),
+    return results_prefix + _run_ordered_symbols(
+        req=req,
+        symbols=symbols,
+        session_id=session_id,
     )
-    results: list[dict[str, Any] | None] = [None] * len(symbols)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_run_symbol, req, symbol_cfg, session_id): index
-            for index, symbol_cfg in enumerate(symbols)
-        }
-        for future in as_completed(futures):
-            results[futures[future]] = future.result()
-    return results_prefix + [result for result in results if result is not None]
 
 
 def _sync_live_account_if_needed(req: AutoTradeStartRequest) -> dict[str, Any] | None:
@@ -377,14 +393,32 @@ def run_orchestrated_candidates_once(
     )
     results: list[dict[str, Any]] = []
 
-    for symbol_cfg in plan["exit_symbols"]:
-        results.append(_run_symbol(req, symbol_cfg, session_id=session_id))
+    if plan["exit_symbols"]:
+        results.extend(
+            _run_symbol_batch(
+                req=req,
+                symbols=plan["exit_symbols"],
+                session_id=session_id,
+            )
+        )
+        if plan["entry_symbols"] and _requires_live_exit_confirmation(req):
+            confirmation = _confirm_live_exits_before_entries(plan["exit_symbols"])
+            results.append(confirmation)
+            if confirmation["status"] != "confirmed":
+                return _orchestrated_result_payload(
+                    status="blocked",
+                    message=(
+                        "Live exits are not fully confirmed yet; entries were held back."
+                    ),
+                    plan=plan,
+                    results=results,
+                )
 
     if plan["entry_symbols"]:
         prepared = _prepare_symbols_for_account_balance(req, plan["entry_symbols"])
         results.extend(prepared["results"])
         results.extend(
-            _run_symbols_for_orchestrator(
+            _run_symbol_batch(
                 req=req,
                 symbols=prepared["symbols"],
                 session_id=session_id,
@@ -397,9 +431,24 @@ def run_orchestrated_candidates_once(
     elif results:
         status = "blocked"
 
+    return _orchestrated_result_payload(
+        status=status,
+        message="Trade orchestrator compared scanner candidates with open positions",
+        plan=plan,
+        results=results,
+    )
+
+
+def _orchestrated_result_payload(
+    *,
+    status: str,
+    message: str,
+    plan: dict[str, Any],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "status": status,
-        "message": "Trade orchestrator compared scanner candidates with open positions",
+        "message": message,
         "active_candidate_symbols": plan["active_candidate_symbols"],
         "planned_exit_count": len(plan["exit_symbols"]),
         "planned_entry_count": len(plan["entry_symbols"]),
@@ -483,7 +532,87 @@ def _entry_symbols_from_scanner_candidates(
     return symbols
 
 
-def _run_symbols_for_orchestrator(
+def _run_ordered_symbols(
+    *,
+    req: AutoTradeStartRequest,
+    symbols: list[AutoTradeSymbolConfig],
+    session_id: str | None,
+) -> list[dict[str, Any]]:
+    exit_symbols = [
+        symbol_cfg
+        for symbol_cfg in symbols
+        if symbol_cfg.requested_action == "exit"
+    ]
+    entry_symbols = [
+        symbol_cfg
+        for symbol_cfg in symbols
+        if symbol_cfg.requested_action != "exit"
+    ]
+    results: list[dict[str, Any]] = []
+    if exit_symbols:
+        results.extend(
+            _run_symbol_batch(
+                req=req,
+                symbols=exit_symbols,
+                session_id=session_id,
+            )
+        )
+        if entry_symbols and _requires_live_exit_confirmation(req):
+            confirmation = _confirm_live_exits_before_entries(exit_symbols)
+            results.append(confirmation)
+            if confirmation["status"] != "confirmed":
+                return results
+    if entry_symbols:
+        results.extend(
+            _run_symbol_batch(
+                req=req,
+                symbols=entry_symbols,
+                session_id=session_id,
+            )
+        )
+    return results
+
+
+def _run_live_exits_then_entries(
+    *,
+    req: AutoTradeStartRequest,
+    symbols: list[AutoTradeSymbolConfig],
+    session_id: str | None,
+) -> list[dict[str, Any]]:
+    exit_symbols = [
+        symbol_cfg
+        for symbol_cfg in symbols
+        if symbol_cfg.requested_action == "exit"
+    ]
+    entry_symbols = [
+        symbol_cfg
+        for symbol_cfg in symbols
+        if symbol_cfg.requested_action != "exit"
+    ]
+    results = _run_symbol_batch(
+        req=req,
+        symbols=exit_symbols,
+        session_id=session_id,
+    )
+    if not entry_symbols:
+        return results
+    confirmation = _confirm_live_exits_before_entries(exit_symbols)
+    results.append(confirmation)
+    if confirmation["status"] != "confirmed":
+        return results
+    prepared = _prepare_symbols_for_account_balance(req, entry_symbols)
+    results.extend(prepared["results"])
+    results.extend(
+        _run_symbol_batch(
+            req=req,
+            symbols=prepared["symbols"],
+            session_id=session_id,
+        )
+    )
+    return results
+
+
+def _run_symbol_batch(
     *,
     req: AutoTradeStartRequest,
     symbols: list[AutoTradeSymbolConfig],
@@ -506,6 +635,76 @@ def _run_symbols_for_orchestrator(
         for future in as_completed(futures):
             results[futures[future]] = future.result()
     return [result for result in results if result is not None]
+
+
+def _requires_live_exit_confirmation(req: AutoTradeStartRequest) -> bool:
+    return bool(
+        req.execution_mode == "live"
+        and settings.live_exit_confirm_before_entry
+    )
+
+
+def _confirm_live_exits_before_entries(
+    exit_symbols: list[AutoTradeSymbolConfig],
+) -> dict[str, Any]:
+    try:
+        sync_result = broker_sync.sync_kis_account()
+    except Exception as exc:
+        return {
+            "symbol": "__exit_confirmation__",
+            "status": "blocked",
+            "message": f"Broker sync failed; entries are blocked until exits are confirmed: {exc}",
+        }
+
+    if sync_result.get("status") != "success":
+        return {
+            "symbol": "__exit_confirmation__",
+            "status": "blocked",
+            "message": "Broker sync did not succeed; entries are blocked until exits are confirmed.",
+            "broker_sync": sync_result,
+        }
+
+    account_no = str(sync_result.get("account_no") or settings.kis_account_no or "")
+    pending: list[dict[str, Any]] = []
+    states: list[dict[str, Any]] = []
+    live_positions = _open_live_positions()
+    for symbol_cfg in exit_symbols:
+        state = order_state.reconcile_after_broker_sync(
+            symbol=symbol_cfg.symbol,
+            market=symbol_cfg.market,
+            account_no=account_no,
+        )
+        position = live_positions.get(symbol_cfg.symbol) or {}
+        observed_quantity = _to_int(state.get("current_quantity"))
+        if observed_quantity is None:
+            observed_quantity = _to_int(position.get("quantity")) or 0
+        state_name = str(state.get("state") or "UNKNOWN")
+        item = {
+            "symbol": symbol_cfg.symbol,
+            "state": state_name,
+            "current_quantity": int(observed_quantity or 0),
+            "order_status": state.get("raw", {}).get("message"),
+        }
+        states.append(item)
+        if state_name in order_state.PENDING_POSITION_STATES or int(observed_quantity or 0) > 0:
+            pending.append(item)
+
+    if pending:
+        return {
+            "symbol": "__exit_confirmation__",
+            "status": "blocked",
+            "message": "One or more live exits are still pending or partially filled; entries were skipped.",
+            "pending_exits": pending,
+            "states": states,
+            "broker_sync": sync_result,
+        }
+    return {
+        "symbol": "__exit_confirmation__",
+        "status": "confirmed",
+        "message": "All live exits are confirmed flat; entries may proceed.",
+        "states": states,
+        "broker_sync": sync_result,
+    }
 
 
 def _expired_candidate_exit_symbols(
@@ -1060,6 +1259,11 @@ def _to_float(value: Any) -> float | None:
         return float(str(value).replace(",", "").strip())
     except (TypeError, ValueError):
         return None
+
+
+def _to_int(value: Any) -> int | None:
+    number = _to_float(value)
+    return int(number) if number is not None else None
 
 
 def _now() -> str:

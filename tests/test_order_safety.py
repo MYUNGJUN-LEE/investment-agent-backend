@@ -6,7 +6,9 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
+from app.models import PaperRunRequest
 from app.trading import paper_trading
+from app.trading import risk_manager
 
 
 client = TestClient(app)
@@ -16,6 +18,46 @@ def _auth_headers() -> dict[str, str]:
     if settings.backend_api_key:
         return {"X-API-Key": settings.backend_api_key}
     return {}
+
+
+def test_dynamic_risk_limits_reduce_order_amount_in_high_vol_bear_market(tmp_path, monkeypatch):
+    db_path = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr(settings, "dynamic_risk_limits_enabled", True)
+    monkeypatch.setattr(settings, "dynamic_risk_min_multiplier", 0.35)
+    monkeypatch.setattr(settings, "dynamic_risk_bear_multiplier", 0.6)
+    monkeypatch.setattr(settings, "dynamic_risk_high_atr_pct", 0.06)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        paper_trading.initialize_db(conn)
+        req = PaperRunRequest(
+            symbol="005930",
+            market="KR",
+            strategy_type="swing",
+            risk_level="medium",
+            signal_type="entry",
+            price=100,
+            quantity=4000,
+            confidence=0.9,
+            account_equity=10_000_000,
+            risk_per_trade=0.005,
+            stop_loss=99,
+            market_regime="bear",
+            expected_loss_bps=1000,
+        )
+        decision = risk_manager.approve_order(
+            conn=conn,
+            req=req,
+            side="BUY",
+            quantity=4000,
+            now="2026-05-20T10:00:00",
+        )
+
+    dynamic_limits = decision.checks["dynamic_limits"]
+    assert not decision.approved
+    assert decision.code == "max_order_amount_exceeded"
+    assert dynamic_limits["multiplier"] < 1
+    assert decision.checks["max_order_amount"] < risk_manager.DEFAULT_LIMITS.max_order_amount
 
 
 def test_position_sizing_blocks_oversized_order(tmp_path, monkeypatch):

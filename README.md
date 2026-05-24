@@ -276,6 +276,18 @@ python -m app.trading.broker_sync_worker
 Broker state is stored in `BROKER_SYNC_DB_PATH`; it can also be synchronized
 manually with `POST /broker/kis/sync`.
 
+Operational safety defaults:
+
+- `AUTO_TRADING_ONE_SESSION_PER_ACCOUNT=true` keeps only one active
+  auto-trading session per account key.
+- `LIVE_EXIT_CONFIRM_BEFORE_ENTRY=true` makes live orchestration submit exits
+  first, reconcile KIS/order-state, and hold entries until the exited symbols are
+  confirmed flat.
+- `DYNAMIC_RISK_LIMITS_ENABLED=true` scales `max_order_amount`,
+  `max_trade_loss_pct`, `max_daily_loss_amount`, symbol weight, and sector
+  weight by market regime, latest ATR/expected-loss proxy, and portfolio
+  correlation.
+
 Universe scanner endpoints:
 
 - `POST /universe/scan`
@@ -405,6 +417,12 @@ new scan removes it from the top 10, the orchestrator creates an exit candidate.
 Entry execution also requires `GET /edge-calibration/gate` to return
 `approved=true`, so the system can keep scanning and learning without forcing
 low-confidence trades.
+
+When running locally, worker loops stop when the computer or terminal stops.
+The SQLite files under `data/` remain on disk and continue accumulating after the
+next start. On hosted environments, keep SQLite on a persistent disk or external
+database; an ephemeral filesystem can lose scanner/calibration history on
+restart or redeploy.
 
 Actual KIS paper order placement remains opt-in. Use only a KIS paper account
 and a tiny quantity:

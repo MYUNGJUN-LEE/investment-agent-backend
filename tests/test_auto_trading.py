@@ -358,6 +358,93 @@ def test_orchestrated_entries_follow_net_edge_priority(monkeypatch):
     assert run_calls[:2] == ["000660", "005930"]
 
 
+def test_start_reuses_active_session_for_same_account(tmp_path, monkeypatch):
+    db_path = tmp_path / "auto.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(db_path))
+    monkeypatch.setattr(settings, "auto_trading_one_session_per_account", True)
+
+    first = auto_trading.start_auto_trading(AutoTradeStartRequest())
+    second = auto_trading.start_auto_trading(AutoTradeStartRequest())
+    active = auto_trading_store.list_sessions(status="active", db_path=db_path)
+
+    assert first["session_id"] == second["session_id"]
+    assert len(active) == 1
+    assert "no duplicate session" in second["message"]
+
+
+def test_live_orchestrator_waits_for_exit_fill_before_entry(monkeypatch):
+    run_calls = []
+    monkeypatch.setattr(settings, "live_exit_confirm_before_entry", True)
+    monkeypatch.setattr(
+        auto_trading,
+        "_open_positions",
+        lambda mode: {
+            "005930": {
+                "symbol": "005930",
+                "quantity": 3,
+                "current_price": 70000,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "_run_symbol",
+        lambda req, symbol_cfg, session_id=None: run_calls.append(symbol_cfg.symbol)
+        or {"symbol": symbol_cfg.symbol, "status": "submitted"},
+    )
+    monkeypatch.setattr(
+        auto_trading.broker_sync,
+        "sync_kis_account",
+        lambda: {"status": "success", "account_no": "acct"},
+    )
+    monkeypatch.setattr(
+        auto_trading.order_state,
+        "reconcile_after_broker_sync",
+        lambda **kwargs: {
+            "symbol": kwargs["symbol"],
+            "state": "EXIT_PENDING",
+            "current_quantity": 3,
+            "raw": {"message": "Fill not confirmed yet"},
+        },
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "edge_entry_gate",
+        lambda candidates=None: {
+            "status": "approved",
+            "approved": True,
+            "message": "test gate approved",
+        },
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "_prepare_symbols_for_account_balance",
+        lambda req, symbols: {"symbols": symbols, "results": []},
+    )
+
+    result = auto_trading.run_orchestrated_candidates_once(
+        AutoTradeStartRequest(execution_mode="live", live_confirm_token="token"),
+        active_candidates=[
+            {
+                "symbol": "000660",
+                "rank": 1,
+                "status": "READY",
+                "current_price": 180000,
+                "net_edge": 140,
+                "composite_score": 70,
+                "expires_at": "2999-01-01T00:00:00",
+            }
+        ],
+        session_id="session-test",
+    )
+
+    assert result["status"] == "blocked"
+    assert run_calls == ["005930"]
+    assert result["planned_entry_count"] == 1
+    assert result["results"][-1]["symbol"] == "__exit_confirmation__"
+    assert result["results"][-1]["status"] == "blocked"
+
+
 def test_auto_trading_uses_live_broker_cash_before_order_preview(monkeypatch):
     preview_calls = []
     monkeypatch.setattr(settings, "enable_live_trading", True)

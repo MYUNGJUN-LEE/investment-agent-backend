@@ -21,11 +21,15 @@ services:
         value: "1"
       - key: AUTO_TRADING_MAX_OPEN_POSITIONS
         value: "5"
+      - key: AUTO_TRADING_ONE_SESSION_PER_ACCOUNT
+        value: "true"
       - key: TRADE_ORCHESTRATOR_ENABLED
         value: "true"
       - key: TRADE_ORCHESTRATOR_INTERVAL_SECONDS
         value: "60"
       - key: TRADE_ORCHESTRATOR_EXECUTE_ENTRIES
+        value: "true"
+      - key: LIVE_EXIT_CONFIRM_BEFORE_ENTRY
         value: "true"
       - key: EDGE_CALIBRATION_ENABLED
         value: "true"
@@ -77,6 +81,24 @@ services:
         value: "70"
       - key: KIS_REQUEST_MIN_INTERVAL_SECONDS
         value: "1.5"
+      - key: DYNAMIC_RISK_LIMITS_ENABLED
+        value: "true"
+      - key: DYNAMIC_RISK_MIN_MULTIPLIER
+        value: "0.35"
+      - key: DYNAMIC_RISK_MAX_MULTIPLIER
+        value: "1.15"
+      - key: DYNAMIC_RISK_HIGH_ATR_PCT
+        value: "0.06"
+      - key: DYNAMIC_RISK_LOW_ATR_PCT
+        value: "0.025"
+      - key: DYNAMIC_RISK_HIGH_CORRELATION
+        value: "0.75"
+      - key: DYNAMIC_RISK_BEAR_MULTIPLIER
+        value: "0.6"
+      - key: DYNAMIC_RISK_BULL_MULTIPLIER
+        value: "1.05"
+      - key: DYNAMIC_RISK_UNKNOWN_MULTIPLIER
+        value: "1.0"
       - key: UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS
         value: "60"
       - key: UNIVERSE_SCANNER_MAX_SOURCE_SYMBOLS

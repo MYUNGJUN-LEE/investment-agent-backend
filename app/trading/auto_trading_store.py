@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS auto_trading_sessions (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     status TEXT NOT NULL,
+    account_key TEXT NOT NULL DEFAULT '',
     execution_mode TEXT NOT NULL,
     interval_seconds INTEGER NOT NULL,
     max_cycles INTEGER,
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS auto_trading_events (
     results_json TEXT NOT NULL DEFAULT '[]',
     FOREIGN KEY(session_id) REFERENCES auto_trading_sessions(session_id)
 );
+
 """
 
 
@@ -48,7 +50,9 @@ def initialize_auto_trading_db(db_path: Path | str | None = None) -> None:
     path = _db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
 
 
 def create_session(
@@ -61,22 +65,39 @@ def create_session(
     next_run_at = now if req.run_immediately else _plus_seconds(now, req.interval_seconds)
     session_id = uuid4().hex
     request_json = _request_json(req)
+    account_key = account_key_for_request(req)
 
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
+        if settings.auto_trading_one_session_per_account:
+            existing = conn.execute(
+                """
+                SELECT *
+                FROM auto_trading_sessions
+                WHERE status = 'active'
+                  AND account_key = ?
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (account_key,),
+            ).fetchone()
+            if existing:
+                return _row_to_session(existing)
         conn.execute(
             """
             INSERT INTO auto_trading_sessions (
-                session_id, created_at, updated_at, status, execution_mode,
+                session_id, created_at, updated_at, status, account_key, execution_mode,
                 interval_seconds, max_cycles, run_immediately, auto_confirm_paper,
                 cycle_count, next_run_at, last_results_json, request_json
             )
-            VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, 0, ?, '[]', ?)
+            VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, 0, ?, '[]', ?)
             """,
             (
                 session_id,
                 now,
                 now,
+                account_key,
                 req.execution_mode,
                 req.interval_seconds,
                 req.max_cycles,
@@ -108,9 +129,35 @@ def get_session(
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
         row = conn.execute(
             "SELECT * FROM auto_trading_sessions WHERE session_id = ?",
             (session_id,),
+        ).fetchone()
+    return _row_to_session(row) if row else None
+
+
+def get_active_session_for_account(
+    account_key: str,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    path = _db_path(db_path)
+    if not path.exists():
+        return None
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
+        row = conn.execute(
+            """
+            SELECT *
+            FROM auto_trading_sessions
+            WHERE status = 'active'
+              AND account_key = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (account_key,),
         ).fetchone()
     return _row_to_session(row) if row else None
 
@@ -133,6 +180,7 @@ def list_sessions(
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
         rows = conn.execute(
             f"""
             SELECT *
@@ -158,6 +206,7 @@ def list_events(
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
         rows = conn.execute(
             """
             SELECT *
@@ -187,6 +236,7 @@ def record_session_event(
     now = _now()
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
         row = conn.execute(
             "SELECT status FROM auto_trading_sessions WHERE session_id = ?",
             (session_id,),
@@ -231,6 +281,7 @@ def stop_session(
     now = _now()
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
         row = conn.execute(
             "SELECT status FROM auto_trading_sessions WHERE session_id = ?",
             (session_id,),
@@ -276,6 +327,7 @@ def restart_session(
     )
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
         conn.execute(
             """
             UPDATE auto_trading_sessions
@@ -309,6 +361,7 @@ def claim_due_sessions(
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
         rows = conn.execute(
             """
             SELECT *
@@ -356,6 +409,7 @@ def complete_cycle(
     path = _db_path(db_path)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
         conn.execute(
             """
             UPDATE auto_trading_sessions
@@ -394,6 +448,7 @@ def fail_cycle(
     now = _now()
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
         conn.execute(
             """
             UPDATE auto_trading_sessions
@@ -426,6 +481,7 @@ def session_to_status(session: dict[str, Any]) -> dict[str, Any]:
     return {
         "session_id": session["session_id"],
         "status": session["status"],
+        "account_key": session.get("account_key"),
         "execution_mode": session["execution_mode"],
         "interval_seconds": session["interval_seconds"],
         "max_cycles": session["max_cycles"],
@@ -484,6 +540,59 @@ def _request_json(req: AutoTradeStartRequest) -> str:
     payload = req.model_dump()
     payload["live_confirm_token"] = None
     return _json(payload)
+
+
+def account_key_for_request(req: AutoTradeStartRequest) -> str:
+    account_no = (settings.kis_account_no or "local").strip() or "local"
+    product_code = (settings.kis_account_product_code or "").strip()
+    broker = "kis" if settings.kis_account_no else "local"
+    return f"{req.execution_mode}:{broker}:{account_no}:{product_code}"
+
+
+def _account_key_from_payload(payload: dict[str, Any]) -> str:
+    execution_mode = str(payload.get("execution_mode") or "paper")
+    account_no = (settings.kis_account_no or "local").strip() or "local"
+    product_code = (settings.kis_account_product_code or "").strip()
+    broker = "kis" if settings.kis_account_no else "local"
+    return f"{execution_mode}:{broker}:{account_no}:{product_code}"
+
+
+def _ensure_session_columns(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "auto_trading_sessions", "account_key", "TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_auto_trading_sessions_account_status
+        ON auto_trading_sessions(account_key, status, updated_at)
+        """
+    )
+    rows = conn.execute(
+        """
+        SELECT session_id, request_json
+        FROM auto_trading_sessions
+        WHERE account_key IS NULL OR account_key = ''
+        """
+    ).fetchall()
+    for session_id, request_json in rows:
+        payload = _parse_json(request_json, {})
+        conn.execute(
+            """
+            UPDATE auto_trading_sessions
+            SET account_key = ?
+            WHERE session_id = ?
+            """,
+            (_account_key_from_payload(payload), session_id),
+        )
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _parse_json(value: str | None, default: Any) -> Any:

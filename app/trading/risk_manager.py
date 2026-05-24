@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
+import json
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -94,7 +96,11 @@ def approve_order(
     limits: RiskLimits | None = None,
 ) -> RiskDecision:
     """Approve or reject an order before paper execution."""
-    limits = limits or DEFAULT_LIMITS
+    limits, dynamic_limits = _dynamic_risk_limits(
+        conn=conn,
+        req=req,
+        limits=limits or DEFAULT_LIMITS,
+    )
     side = side.upper()
     now_dt = _coerce_datetime(now)
     amount = round(req.price * quantity, 2)
@@ -152,6 +158,7 @@ def approve_order(
         "position_sizing": position_sizing,
         "edge": edge_decision,
         "performance_metrics": performance_metrics,
+        "dynamic_limits": dynamic_limits,
     }
 
     if _emergency_stop_active():
@@ -264,6 +271,215 @@ def approve_order(
         message="Risk checks passed",
         checks=checks,
     )
+
+
+def _dynamic_risk_limits(
+    *,
+    conn: sqlite3.Connection,
+    req: PaperRunRequest,
+    limits: RiskLimits,
+) -> tuple[RiskLimits, dict[str, Any]]:
+    if not settings.dynamic_risk_limits_enabled:
+        return limits, {"enabled": False, "multiplier": 1.0}
+
+    multiplier = 1.0
+    reasons: list[str] = []
+    market_regime = _market_regime(req)
+    if market_regime in {"bear", "risk_off", "downtrend", "weak"}:
+        factor = float(settings.dynamic_risk_bear_multiplier or 0.6)
+        multiplier *= factor
+        reasons.append(f"market_regime={market_regime} factor={factor:.2f}")
+    elif market_regime in {"bull", "risk_on", "uptrend", "strong"}:
+        factor = float(settings.dynamic_risk_bull_multiplier or 1.05)
+        multiplier *= factor
+        reasons.append(f"market_regime={market_regime} factor={factor:.2f}")
+    elif market_regime in {"unknown", ""}:
+        factor = float(settings.dynamic_risk_unknown_multiplier or 1.0)
+        multiplier *= factor
+        reasons.append(f"market_regime=unknown factor={factor:.2f}")
+
+    atr_pct = _latest_atr_pct(req)
+    high_atr = max(0.001, float(settings.dynamic_risk_high_atr_pct or 0.06))
+    low_atr = max(0.001, float(settings.dynamic_risk_low_atr_pct or 0.025))
+    if atr_pct is not None:
+        if atr_pct >= high_atr:
+            factor = max(0.45, high_atr / atr_pct)
+            multiplier *= factor
+            reasons.append(f"atr_pct={atr_pct:.4f} high factor={factor:.2f}")
+        elif atr_pct <= low_atr:
+            multiplier *= 1.05
+            reasons.append(f"atr_pct={atr_pct:.4f} low factor=1.05")
+
+    max_corr = _max_portfolio_correlation(conn, req.symbol)
+    high_corr = float(settings.dynamic_risk_high_correlation or 0.75)
+    if max_corr is not None and max_corr >= high_corr:
+        factor = max(0.55, 1.0 - (max_corr - high_corr))
+        multiplier *= factor
+        reasons.append(f"portfolio_correlation={max_corr:.3f} factor={factor:.2f}")
+
+    min_multiplier = float(settings.dynamic_risk_min_multiplier or 0.35)
+    max_multiplier = float(settings.dynamic_risk_max_multiplier or 1.15)
+    multiplier = max(min_multiplier, min(max_multiplier, multiplier))
+    adjusted = replace(
+        limits,
+        max_order_amount=limits.max_order_amount * multiplier,
+        max_trade_loss_pct=limits.max_trade_loss_pct * multiplier,
+        max_daily_loss_amount=limits.max_daily_loss_amount * multiplier,
+        max_symbol_weight=limits.max_symbol_weight * multiplier,
+        max_sector_weight=limits.max_sector_weight * multiplier,
+    )
+    return adjusted, {
+        "enabled": True,
+        "multiplier": round(multiplier, 6),
+        "base": {
+            "max_order_amount": limits.max_order_amount,
+            "max_trade_loss_pct": limits.max_trade_loss_pct,
+            "max_daily_loss_amount": limits.max_daily_loss_amount,
+            "max_symbol_weight": limits.max_symbol_weight,
+            "max_sector_weight": limits.max_sector_weight,
+        },
+        "adjusted": {
+            "max_order_amount": round(adjusted.max_order_amount, 2),
+            "max_trade_loss_pct": round(adjusted.max_trade_loss_pct, 6),
+            "max_daily_loss_amount": round(adjusted.max_daily_loss_amount, 2),
+            "max_symbol_weight": round(adjusted.max_symbol_weight, 6),
+            "max_sector_weight": round(adjusted.max_sector_weight, 6),
+        },
+        "market_regime": market_regime,
+        "atr_pct": atr_pct,
+        "max_portfolio_correlation": max_corr,
+        "reasons": reasons,
+    }
+
+
+def _market_regime(req: PaperRunRequest) -> str:
+    if req.market_regime:
+        return str(req.market_regime).lower()
+    try:
+        from app.storage.market_data import get_latest_market_context
+
+        context = get_latest_market_context() or {}
+    except Exception:
+        context = {}
+    return str(context.get("market_regime") or "unknown").lower()
+
+
+def _latest_atr_pct(req: PaperRunRequest) -> float | None:
+    if req.expected_loss_bps is not None:
+        value = _to_float(req.expected_loss_bps)
+        if value is not None and value > 0:
+            return value / 10_000
+    path = Path(settings.universe_scanner_db_path)
+    if not path.exists():
+        return None
+    try:
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT raw_json
+                FROM universe_price_snapshots
+                WHERE symbol = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (req.symbol,),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    raw = _parse_json(row["raw_json"], {})
+    latest = raw.get("latest_technical_features") or {}
+    atr_pct = _to_float(latest.get("atr_14_pct"))
+    if atr_pct is not None:
+        return atr_pct
+    features = raw.get("technical_features") or []
+    if features and isinstance(features[-1], dict):
+        return _to_float(features[-1].get("atr_14_pct"))
+    return None
+
+
+def _max_portfolio_correlation(
+    conn: sqlite3.Connection,
+    symbol: str,
+) -> float | None:
+    try:
+        rows = conn.execute(
+            """
+            SELECT symbol
+            FROM positions
+            WHERE quantity > 0
+              AND symbol != ?
+            LIMIT 10
+            """,
+            (symbol,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    held_symbols = []
+    for row in rows:
+        value = row["symbol"] if hasattr(row, "keys") else row[0]
+        if value:
+            held_symbols.append(str(value))
+    if not held_symbols:
+        return None
+    target_returns = _recent_snapshot_returns(symbol)
+    if len(target_returns) < 5:
+        return None
+    correlations = []
+    for held_symbol in held_symbols:
+        held_returns = _recent_snapshot_returns(held_symbol)
+        correlation = _pearson_tail(target_returns, held_returns)
+        if correlation is not None:
+            correlations.append(correlation)
+    return max(correlations) if correlations else None
+
+
+def _recent_snapshot_returns(symbol: str, limit: int = 80) -> list[float]:
+    path = Path(settings.universe_scanner_db_path)
+    if not path.exists():
+        return []
+    try:
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT current_price
+                FROM universe_price_snapshots
+                WHERE symbol = ?
+                  AND current_price IS NOT NULL
+                  AND current_price > 0
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (symbol, max(2, int(limit))),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    prices = [float(row["current_price"]) for row in reversed(rows)]
+    returns = []
+    for previous, current in zip(prices, prices[1:]):
+        if previous > 0:
+            returns.append((current - previous) / previous)
+    return returns
+
+
+def _pearson_tail(left: list[float], right: list[float]) -> float | None:
+    size = min(len(left), len(right))
+    if size < 5:
+        return None
+    x_values = left[-size:]
+    y_values = right[-size:]
+    x_mean = sum(x_values) / size
+    y_mean = sum(y_values) / size
+    numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, y_values))
+    x_denominator = sum((x - x_mean) ** 2 for x in x_values) ** 0.5
+    y_denominator = sum((y - y_mean) ** 2 for y in y_values) ** 0.5
+    denominator = x_denominator * y_denominator
+    if denominator <= 0:
+        return None
+    return max(-1.0, min(1.0, numerator / denominator))
 
 
 def _daily_realized_loss(conn: sqlite3.Connection, day: date) -> float:
@@ -543,6 +759,24 @@ def _coerce_datetime(value: datetime | str | None) -> datetime:
     if isinstance(value, str):
         return datetime.fromisoformat(value)
     return datetime.now()
+
+
+def _to_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_json(value: str | None, default: Any) -> Any:
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return default
 
 
 def _reject(code: str, message: str, checks: dict[str, Any]) -> RiskDecision:

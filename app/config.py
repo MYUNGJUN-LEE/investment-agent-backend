@@ -53,9 +53,11 @@ class Settings(BaseSettings):
     auto_trading_worker_lock_seconds: int = 7200
     auto_trading_symbol_workers: int = 1
     auto_trading_max_open_positions: int = 5
+    auto_trading_one_session_per_account: bool = True
     trade_orchestrator_enabled: bool = True
     trade_orchestrator_interval_seconds: int = 60
     trade_orchestrator_execute_entries: bool = True
+    live_exit_confirm_before_entry: bool = True
     edge_calibration_enabled: bool = True
     edge_calibration_db_path: str = "data/edge_calibration.sqlite3"
     edge_calibration_interval_seconds: int = 3600
@@ -78,6 +80,15 @@ class Settings(BaseSettings):
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120
     allow_position_additions: bool = False
+    dynamic_risk_limits_enabled: bool = True
+    dynamic_risk_min_multiplier: float = 0.35
+    dynamic_risk_max_multiplier: float = 1.15
+    dynamic_risk_high_atr_pct: float = 0.06
+    dynamic_risk_low_atr_pct: float = 0.025
+    dynamic_risk_high_correlation: float = 0.75
+    dynamic_risk_bear_multiplier: float = 0.6
+    dynamic_risk_bull_multiplier: float = 1.05
+    dynamic_risk_unknown_multiplier: float = 1.0
     market_monitor_enabled: bool = True
     market_monitor_db_path: str = "data/market_monitor.sqlite3"
     monitor_watchlist_symbols: str = ""

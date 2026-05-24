@@ -422,6 +422,7 @@ class AutoTradeStartRequest(BaseModel):
 class AutoTradeStartResponse(BaseModel):
     session_id: str
     status: AutoTradeSessionStatus
+    account_key: str | None = None
     execution_mode: AutoTradeExecutionMode
     interval_seconds: int
     max_cycles: int | None
@@ -433,6 +434,7 @@ class AutoTradeStartResponse(BaseModel):
 class AutoTradeStatusResponse(BaseModel):
     session_id: str
     status: AutoTradeSessionStatus
+    account_key: str | None = None
     execution_mode: AutoTradeExecutionMode | None = None
     interval_seconds: int | None = None
     max_cycles: int | None = None
