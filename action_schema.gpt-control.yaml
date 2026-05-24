@@ -14,8 +14,14 @@ components:
       name: X-API-Key
   schemas:
     GenericJsonResponse:
-      type: object
-      additionalProperties: true
+  type: object
+  properties:
+    status:
+      type: string
+    message:
+      type: string
+    detail:
+      type: string
     HealthResponse:
       type: object
       additionalProperties: true
