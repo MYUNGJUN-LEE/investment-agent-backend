@@ -627,6 +627,20 @@ def test_gpt_control_returns_json_diagnostic_for_missing_api_key(monkeypatch):
     assert "API key" in body["message"]
 
 
+def test_gpt_kis_routes_return_json_diagnostic_for_missing_api_key(monkeypatch):
+    monkeypatch.setattr(settings, "backend_api_key", "secret-key")
+
+    config_response = client.get("/gpt/broker/kis/config-status")
+    preflight_response = client.post("/gpt/broker/kis/paper-preflight")
+
+    assert config_response.status_code == 200
+    assert config_response.json()["status"] == "error"
+    assert config_response.json()["http_status"] == 401
+    assert preflight_response.status_code == 200
+    assert preflight_response.json()["status"] == "error"
+    assert preflight_response.json()["http_status"] == 401
+
+
 def test_gpt_control_returns_json_diagnostic_for_invalid_body():
     response = client.post(
         "/gpt/auto-trading/control",

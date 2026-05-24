@@ -261,10 +261,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/WorkerStatusResponse"
 
-  /broker/kis/config-status:
+  /gpt/broker/kis/config-status:
     get:
-      operationId: getKisConfigStatus
-      summary: Inspect non-secret KIS runtime configuration.
+      operationId: getGptKisConfigStatus
+      summary: Inspect non-secret KIS runtime configuration through the GPT-compatible route.
       responses:
         "200":
           description: Non-secret KIS runtime configuration.
@@ -273,10 +273,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/KisConfigStatusResponse"
 
-  /broker/kis/paper-preflight:
+  /gpt/broker/kis/paper-preflight:
     post:
-      operationId: preflightKisPaperE2E
-      summary: Validate KIS paper connectivity without placing an order.
+      operationId: preflightGptKisPaperE2E
+      summary: Validate KIS paper connectivity through the GPT-compatible route.
       parameters:
         - name: symbol
           in: query

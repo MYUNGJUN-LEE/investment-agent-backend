@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$PublicUrl,
-    [string]$InputPath = "action_schema.yaml",
+    [string]$InputPath = "action_schema.gpt-control.yaml",
     [string]$OutputPath = "action_schema.local-tunnel.yaml"
 )
 

@@ -609,6 +609,16 @@ def preflight_kis_paper_state(symbol: str = "005930"):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.post(
+    "/gpt/broker/kis/paper-preflight",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="preflightGptKisPaperE2E",
+    summary="Validate KIS paper connectivity from Custom GPT",
+)
+def gpt_preflight_kis_paper_state(symbol: str = "005930"):
+    return preflight_kis_paper_state(symbol=symbol)
+
+
 @app.get(
     "/broker/kis/config-status",
     dependencies=[Depends(verify_api_key)],
@@ -628,6 +638,16 @@ def get_kis_config_status():
         }
     )
     return diagnostics
+
+
+@app.get(
+    "/gpt/broker/kis/config-status",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getGptKisConfigStatus",
+    summary="Inspect non-secret KIS runtime configuration from Custom GPT",
+)
+def get_gpt_kis_config_status():
+    return get_kis_config_status()
 
 
 @app.get(
