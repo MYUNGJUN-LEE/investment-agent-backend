@@ -645,6 +645,16 @@ def test_gpt_kis_routes_return_json_diagnostic_for_missing_api_key(monkeypatch):
     assert preflight_response.json()["http_status"] == 401
 
 
+def test_gpt_kis_config_success_uses_gpt_envelope():
+    response = client.get("/gpt/broker/kis/config-status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert "KIS runtime configuration" in body["message"]
+    assert "is_paper" in body
+
+
 def test_gpt_control_returns_json_diagnostic_for_invalid_body():
     response = client.post(
         "/gpt/auto-trading/control",
@@ -674,8 +684,12 @@ def test_worker_status_compatibility_routes_are_reachable(monkeypatch):
 
     assert client.get("/workers/status").status_code == 200
     assert client.get("/worker/status").status_code == 200
-    assert client.get("/gpt/workers/status").status_code == 200
+    gpt_response = client.get("/gpt/workers/status")
+    assert gpt_response.status_code == 200
+    assert gpt_response.json()["status"] == "success"
     assert client.get("/gpt/worker/status").status_code == 200
+    assert client.post("/gpt/workers/status").status_code == 200
+    assert client.post("/gpt/worker/status").status_code == 200
 
 
 def test_embedded_worker_specs_include_orchestrator(monkeypatch):

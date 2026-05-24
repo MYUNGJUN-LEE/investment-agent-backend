@@ -186,6 +186,12 @@ def _gpt_error_payload(
     return payload
 
 
+def _gpt_success_payload(message: str, payload: dict[str, Any]) -> dict[str, Any]:
+    content = {"status": "success", "message": message}
+    content.update(_drop_none_values(payload))
+    return content
+
+
 def _drop_none_values(value):
     if isinstance(value, dict):
         return {
@@ -658,8 +664,16 @@ def preflight_kis_paper_state(symbol: str = "005930"):
     operation_id="preflightGptKisPaperE2E",
     summary="Validate KIS paper connectivity from Custom GPT",
 )
+@app.get(
+    "/gpt/broker/kis/paper-preflight",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def gpt_preflight_kis_paper_state(symbol: str = "005930"):
-    return _drop_none_values(preflight_kis_paper_state(symbol=symbol))
+    result = _drop_none_values(preflight_kis_paper_state(symbol=symbol))
+    result.setdefault("status", "success")
+    result.setdefault("message", "KIS paper connectivity preflight completed")
+    return result
 
 
 @app.get(
@@ -689,8 +703,16 @@ def get_kis_config_status():
     operation_id="getGptKisConfigStatus",
     summary="Inspect non-secret KIS runtime configuration from Custom GPT",
 )
+@app.post(
+    "/gpt/broker/kis/config-status",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def get_gpt_kis_config_status():
-    return _drop_none_values(get_kis_config_status())
+    return _gpt_success_payload(
+        "KIS runtime configuration inspected",
+        get_kis_config_status(),
+    )
 
 
 @app.get(
@@ -726,10 +748,24 @@ def get_embedded_worker_status():
     dependencies=[Depends(verify_api_key)],
     include_in_schema=False,
 )
+@app.post(
+    "/gpt/workers/status",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+@app.post(
+    "/gpt/worker/status",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def get_gpt_embedded_worker_status():
     from app.workers.manager import embedded_worker_status
 
-    return _drop_none_values(embedded_worker_status())
+    status = embedded_worker_status()
+    return _gpt_success_payload(
+        f"{status.get('count', 0)} embedded worker(s) reported",
+        status,
+    )
 
 
 @app.post(
