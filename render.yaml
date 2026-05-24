@@ -7,6 +7,8 @@ services:
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
+      - key: ACTION_SCHEMA_PUBLIC_URL
+        value: "https://api.autoinvestmentkorea.online"
       - key: EMBEDDED_WORKERS_ENABLED
         value: "true"
       - key: EMBEDDED_WORKER_BROKER_SYNC_ENABLED

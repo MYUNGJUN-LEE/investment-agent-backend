@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+import re
 from typing import Any
 
 from fastapi import Body, FastAPI, Header, HTTPException, Depends, Query, Request
@@ -170,19 +171,31 @@ def _gpt_error_payload(
     message: str,
     detail,
 ) -> dict:
-    return {
+    payload = {
         "status": "error",
         "command": "unknown",
         "message": message,
         "error_type": error_type,
         "http_status": http_status,
-        "detail": detail,
-        "started_session": None,
         "stopped_sessions": [],
         "active_sessions": [],
         "recent_sessions": [],
-        "worker_status": None,
     }
+    if detail is not None:
+        payload["detail"] = detail
+    return payload
+
+
+def _drop_none_values(value):
+    if isinstance(value, dict):
+        return {
+            key: _drop_none_values(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, list):
+        return [_drop_none_values(item) for item in value]
+    return value
 
 
 def verify_api_key(
@@ -287,13 +300,39 @@ def gpt_health_check_options():
 
 @app.get("/action-schema.yaml", include_in_schema=False)
 @app.get("/.well-known/openapi.yaml", include_in_schema=False)
-def custom_gpt_action_schema():
+def custom_gpt_action_schema(request: Request):
     schema_path = Path(__file__).resolve().parents[1] / "action_schema.gpt-control.yaml"
     if not schema_path.exists():
         raise HTTPException(status_code=404, detail="Action schema not found")
+    content = schema_path.read_text(encoding="utf-8")
+    content = _set_action_schema_server_url(
+        content,
+        settings.action_schema_public_url or _request_public_url(request),
+    )
     return PlainTextResponse(
-        content=schema_path.read_text(encoding="utf-8"),
+        content=content,
         media_type="text/yaml",
+    )
+
+
+def _request_public_url(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.netloc
+    )
+    proto = proto.split(",", 1)[0].strip()
+    host = host.split(",", 1)[0].strip()
+    return f"{proto}://{host}".rstrip("/")
+
+
+def _set_action_schema_server_url(content: str, public_url: str) -> str:
+    return re.sub(
+        r"(?m)^  - url: https?://[^\s]+$",
+        f"  - url: {public_url.rstrip('/')}",
+        content,
+        count=1,
     )
 
 
@@ -426,6 +465,7 @@ def run_auto_trading_once_endpoint(req: AutoTradeStartRequest):
 @app.post(
     "/gpt/auto-trading/control",
     response_model=GptAutoTradeControlResponse,
+    response_model_exclude_none=True,
     dependencies=[Depends(verify_api_key)],
     operation_id="controlAutoTradingFromGpt",
     summary="Turn auto-trading on or off from Custom GPT",
@@ -440,6 +480,7 @@ def control_auto_trading_endpoint(req: GptAutoTradeControlRequest):
 @app.get(
     "/gpt/auto-trading/status",
     response_model=GptAutoTradeControlResponse,
+    response_model_exclude_none=True,
     dependencies=[Depends(verify_api_key)],
     operation_id="getGptAutoTradingStatus",
     summary="Get auto-trading status from Custom GPT",
@@ -447,6 +488,7 @@ def control_auto_trading_endpoint(req: GptAutoTradeControlRequest):
 @app.post(
     "/gpt/auto-trading/status",
     response_model=GptAutoTradeControlResponse,
+    response_model_exclude_none=True,
     dependencies=[Depends(verify_api_key)],
     include_in_schema=False,
 )
@@ -457,6 +499,7 @@ def gpt_auto_trading_status_endpoint():
 @app.post(
     "/gpt/auto-trading/start-paper",
     response_model=GptAutoTradeControlResponse,
+    response_model_exclude_none=True,
     dependencies=[Depends(verify_api_key)],
     operation_id="startGptPaperAutoTrading",
     summary="Start paper auto-trading from Custom GPT",
@@ -616,7 +659,7 @@ def preflight_kis_paper_state(symbol: str = "005930"):
     summary="Validate KIS paper connectivity from Custom GPT",
 )
 def gpt_preflight_kis_paper_state(symbol: str = "005930"):
-    return preflight_kis_paper_state(symbol=symbol)
+    return _drop_none_values(preflight_kis_paper_state(symbol=symbol))
 
 
 @app.get(
@@ -647,7 +690,7 @@ def get_kis_config_status():
     summary="Inspect non-secret KIS runtime configuration from Custom GPT",
 )
 def get_gpt_kis_config_status():
-    return get_kis_config_status()
+    return _drop_none_values(get_kis_config_status())
 
 
 @app.get(
@@ -686,7 +729,7 @@ def get_embedded_worker_status():
 def get_gpt_embedded_worker_status():
     from app.workers.manager import embedded_worker_status
 
-    return embedded_worker_status()
+    return _drop_none_values(embedded_worker_status())
 
 
 @app.post(

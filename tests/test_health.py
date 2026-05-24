@@ -45,6 +45,26 @@ def test_action_schema_is_served_for_custom_gpt():
     assert "/gpt/workers/status" in response.text
     assert "/gpt/auto-trading/status" in response.text
     assert "/gpt/auto-trading/start-paper" in response.text
+    assert "nullable:" not in response.text
+    assert 'type: "null"' not in response.text
+    assert "GptStartPaperRequest" in response.text
+    assert '$ref: "#/components/schemas/GenericJsonResponse"' in response.text
+    assert "  - url: http://testserver" in response.text
+
+
+def test_action_schema_uses_forwarded_public_host(monkeypatch):
+    monkeypatch.setattr("app.main.settings.action_schema_public_url", None)
+
+    response = client.get(
+        "/action-schema.yaml",
+        headers={
+            "x-forwarded-proto": "https",
+            "x-forwarded-host": "api.autoinvestmentkorea.online",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "  - url: https://api.autoinvestmentkorea.online" in response.text
 
 
 def test_naver_news_endpoint(monkeypatch):

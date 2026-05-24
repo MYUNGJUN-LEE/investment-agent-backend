@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: Minimal Custom GPT action schema for checking and controlling the auto-trading backend.
 servers:
-  - url: https://investment-agent-backend.onrender.com
+  - url: https://api.autoinvestmentkorea.online
 
 components:
   securitySchemes:
@@ -21,8 +21,12 @@ components:
           type: string
         message:
           type: string
-        detail:
+        command:
           type: string
+        error_type:
+          type: string
+        http_status:
+          type: integer
     HealthResponse:
       type: object
       additionalProperties: true
@@ -82,7 +86,6 @@ components:
           type: boolean
         token_issue_cooldown_until:
           type: string
-          nullable: true
         enable_live_trading:
           type: boolean
         embedded_worker_broker_sync_enabled:
@@ -174,6 +177,46 @@ components:
         live_confirm_token:
           type: string
           description: Required only when execution_mode is live.
+    GptStartPaperRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        interval_seconds:
+          type: integer
+          default: 60
+        max_cycles:
+          type: integer
+          description: Optional cycle limit. Omit to keep running until stopped.
+        auto_discover_symbols:
+          type: boolean
+          default: true
+        universe_seed_symbols:
+          type: array
+          items:
+            type: string
+        universe_candidate_limit:
+          type: integer
+          default: 20
+        universe_final_limit:
+          type: integer
+          default: 10
+        auto_confirm_paper:
+          type: boolean
+          default: true
+        account_equity:
+          type: number
+          default: 10000000
+          description: Default account equity used for automatic quantity sizing.
+        risk_per_trade:
+          type: number
+          default: 0.005
+          description: Default risk fraction per trade used for automatic quantity sizing.
+        cash_available:
+          type: number
+          description: Optional cash cap used for automatic quantity sizing.
+        force_new:
+          type: boolean
+          default: false
     GptAutoTradingControlResponse:
       type: object
       additionalProperties: true
@@ -186,27 +229,15 @@ components:
           type: string
         error_type:
           type: string
-          nullable: true
           description: Present when the GPT-specific endpoint converted an HTTP error into a JSON diagnostic response.
         http_status:
           type: integer
-          nullable: true
           description: Original HTTP status when status is error.
         detail:
-          anyOf:
-            - type: string
-            - type: object
-              additionalProperties: true
-            - type: array
-              items:
-                type: object
-                additionalProperties: true
-            - type: "null"
+          description: Optional diagnostic details.
         started_session:
-          anyOf:
-            - type: object
-              additionalProperties: true
-            - type: "null"
+          type: object
+          additionalProperties: true
         stopped_sessions:
           type: array
           items:
@@ -223,9 +254,8 @@ components:
             type: object
             additionalProperties: true
         worker_status:
-          anyOf:
-            - $ref: "#/components/schemas/WorkerStatusResponse"
-            - type: "null"
+          type: object
+          additionalProperties: true
 
 security:
   - ApiKeyAuth: []
@@ -278,7 +308,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/WorkerStatusResponse"
+                $ref: "#/components/schemas/GenericJsonResponse"
 
   /gpt/broker/kis/config-status:
     get:
@@ -290,7 +320,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/KisConfigStatusResponse"
+                $ref: "#/components/schemas/GenericJsonResponse"
 
   /gpt/broker/kis/paper-preflight:
     post:
@@ -310,7 +340,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/KisPaperPreflightResponse"
+                $ref: "#/components/schemas/GenericJsonResponse"
 
   /gpt/auto-trading/control:
     post:
@@ -328,7 +358,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/GptAutoTradingControlResponse"
+                $ref: "#/components/schemas/GenericJsonResponse"
 
   /gpt/auto-trading/status:
     get:
@@ -340,22 +370,21 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/GptAutoTradingControlResponse"
+                $ref: "#/components/schemas/GenericJsonResponse"
 
   /gpt/auto-trading/start-paper:
     post:
       operationId: startGptPaperAutoTrading
       summary: Start paper auto-trading through the GPT-compatible route.
       requestBody:
-        required: false
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/GptAutoTradingControlRequest"
+              $ref: "#/components/schemas/GptStartPaperRequest"
       responses:
         "200":
           description: Paper auto-trading start result.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/GptAutoTradingControlResponse"
+                $ref: "#/components/schemas/GenericJsonResponse"

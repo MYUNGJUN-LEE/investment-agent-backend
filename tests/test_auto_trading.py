@@ -609,6 +609,8 @@ def test_gpt_status_and_start_paper_compatibility_routes(tmp_path, monkeypatch):
     assert start_response.status_code == 200
     assert start_response.json()["status"] == "started"
     assert start_response.json()["started_session"]["execution_mode"] == "paper"
+    assert "error_type" not in start_response.json()
+    assert "detail" not in start_response.json()
 
 
 def test_gpt_control_returns_json_diagnostic_for_missing_api_key(monkeypatch):
@@ -625,6 +627,8 @@ def test_gpt_control_returns_json_diagnostic_for_missing_api_key(monkeypatch):
     assert body["error_type"] == "http_error"
     assert body["http_status"] == 401
     assert "API key" in body["message"]
+    assert "started_session" not in body
+    assert "worker_status" not in body
 
 
 def test_gpt_kis_routes_return_json_diagnostic_for_missing_api_key(monkeypatch):
