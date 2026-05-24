@@ -13,8 +13,12 @@ components:
       in: header
       name: X-API-Key
   schemas:
+    GenericJsonResponse:
+      type: object
+      additionalProperties: true
     HealthResponse:
       type: object
+      additionalProperties: true
       properties:
         status:
           type: string
@@ -24,6 +28,7 @@ components:
           type: boolean
     WorkerStatusResponse:
       type: object
+      additionalProperties: true
       properties:
         enabled:
           type: boolean
@@ -42,6 +47,7 @@ components:
                 type: string
     KisConfigStatusResponse:
       type: object
+      additionalProperties: true
       properties:
         base_url:
           type: string
@@ -78,6 +84,7 @@ components:
           type: integer
     KisPaperPreflightResponse:
       type: object
+      additionalProperties: true
       properties:
         status:
           type: string
@@ -162,6 +169,7 @@ components:
           description: Required only when execution_mode is live.
     GptAutoTradingControlResponse:
       type: object
+      additionalProperties: true
       properties:
         status:
           type: string
@@ -178,7 +186,7 @@ components:
           nullable: true
           description: Original HTTP status when status is error.
         detail:
-          oneOf:
+          anyOf:
             - type: string
             - type: object
               additionalProperties: true
@@ -186,10 +194,12 @@ components:
               items:
                 type: object
                 additionalProperties: true
-          nullable: true
+            - type: "null"
         started_session:
-          type: object
-          additionalProperties: true
+          anyOf:
+            - type: object
+              additionalProperties: true
+            - type: "null"
         stopped_sessions:
           type: array
           items:
@@ -206,7 +216,9 @@ components:
             type: object
             additionalProperties: true
         worker_status:
-          $ref: "#/components/schemas/WorkerStatusResponse"
+          anyOf:
+            - $ref: "#/components/schemas/WorkerStatusResponse"
+            - type: "null"
 
 security:
   - ApiKeyAuth: []
