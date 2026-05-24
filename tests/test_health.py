@@ -43,6 +43,7 @@ def test_action_schema_is_served_for_custom_gpt():
     assert "gptBackendHealthCheck" in response.text
     assert "gptBackendHealthCheckPost" in response.text
     assert "/gpt/workers/status" in response.text
+    assert "/gpt/broker/kis/account-probe" in response.text
     assert "/gpt/auto-trading/status" in response.text
     assert "/gpt/auto-trading/start-paper" in response.text
     assert "nullable:" not in response.text

@@ -655,6 +655,34 @@ def test_gpt_kis_config_success_uses_gpt_envelope():
     assert "is_paper" in body
 
 
+def test_gpt_kis_account_probe_reports_product_code_results(monkeypatch):
+    class FakeProbeClient:
+        def __init__(self, is_paper=True):
+            self.is_paper = is_paper
+
+        def runtime_diagnostics(self):
+            return {"is_paper": self.is_paper, "account_no_last4": "5678"}
+
+        def get_current_price(self, symbol):
+            return {"rt_cd": "0", "output": {"stck_prpr": "75000"}}
+
+        def get_balance(self, account_product_code=None):
+            if account_product_code == "00":
+                return {"rt_cd": "0", "output1": []}
+            raise Exception("rejected")
+
+    monkeypatch.setattr("app.main.KisClient", FakeProbeClient)
+
+    response = client.get("/gpt/broker/kis/account-probe?product_codes=01,00")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["accepted_product_codes"] == ["00"]
+    assert body["balance_probes"][0]["status"] == "error"
+    assert body["balance_probes"][1]["status"] == "ok"
+
+
 def test_gpt_control_returns_json_diagnostic_for_invalid_body():
     response = client.post(
         "/gpt/auto-trading/control",

@@ -342,6 +342,38 @@ paths:
               schema:
                 $ref: "#/components/schemas/GenericJsonResponse"
 
+  /gpt/broker/kis/account-probe:
+    get:
+      operationId: probeGptKisAccount
+      summary: Probe KIS paper account access without placing an order.
+      parameters:
+        - name: symbol
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "005930"
+        - name: product_codes
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "01,00,02"
+          description: Comma-separated account product codes to test.
+        - name: force_token_refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: KIS account probe result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericJsonResponse"
+
   /gpt/auto-trading/control:
     post:
       operationId: controlAutoTradingFromGpt

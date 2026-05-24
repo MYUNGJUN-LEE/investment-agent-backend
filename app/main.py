@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from app.services.naver_news import search_naver_news
 
-from app.brokers.kis_client import KisClient
+from app.brokers.kis_client import KisApiError, KisClient
 from app.config import settings
 from app.models import (
     AutoTradeEventsResponse,
@@ -674,6 +674,132 @@ def gpt_preflight_kis_paper_state(symbol: str = "005930"):
     result.setdefault("status", "success")
     result.setdefault("message", "KIS paper connectivity preflight completed")
     return result
+
+
+@app.get(
+    "/gpt/broker/kis/account-probe",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="probeGptKisAccount",
+    summary="Probe KIS paper account access without placing an order",
+)
+def gpt_probe_kis_account_get(
+    symbol: str = "005930",
+    product_codes: str = "01,00,02",
+    force_token_refresh: bool = False,
+):
+    return _probe_kis_account(
+        symbol=symbol,
+        product_codes=_split_product_codes(product_codes),
+        force_token_refresh=force_token_refresh,
+    )
+
+
+@app.post(
+    "/gpt/broker/kis/account-probe",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+def gpt_probe_kis_account_post(payload: dict[str, Any] | None = Body(default=None)):
+    data = payload or {}
+    return _probe_kis_account(
+        symbol=str(data.get("symbol") or "005930"),
+        product_codes=_split_product_codes(data.get("product_codes") or "01,00,02"),
+        force_token_refresh=bool(data.get("force_token_refresh", False)),
+    )
+
+
+def _probe_kis_account(
+    *,
+    symbol: str,
+    product_codes: list[str],
+    force_token_refresh: bool,
+) -> dict[str, Any]:
+    client = KisClient(is_paper=True)
+    diagnostics = client.runtime_diagnostics()
+    token_refresh: dict[str, Any] = {"requested": force_token_refresh}
+    if force_token_refresh:
+        try:
+            token_refresh["issued"] = bool(client.issue_access_token(force_refresh=True))
+        except Exception as exc:
+            token_refresh.update(
+                {
+                    "issued": False,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+            )
+
+    quote_probe = _kis_probe_call(lambda: client.get_current_price(symbol))
+    balance_probes = [
+        {
+            "account_product_code": product_code,
+            **_kis_probe_call(
+                lambda product_code=product_code: client.get_balance(
+                    account_product_code=product_code
+                )
+            ),
+        }
+        for product_code in product_codes
+    ]
+    ok_products = [
+        row["account_product_code"]
+        for row in balance_probes
+        if row.get("status") == "ok"
+    ]
+    status = "success" if ok_products else "error"
+    message = (
+        f"KIS accepted balance lookup for product code(s): {', '.join(ok_products)}"
+        if ok_products
+        else "KIS rejected balance lookup for every probed product code"
+    )
+    return _gpt_success_payload(
+        message,
+        {
+            "status": status,
+            "symbol": symbol,
+            "diagnostics": diagnostics,
+            "token_refresh": token_refresh,
+            "quote_probe": quote_probe,
+            "balance_probes": balance_probes,
+            "accepted_product_codes": ok_products,
+        },
+    )
+
+
+def _kis_probe_call(call):
+    try:
+        data = call()
+        return {
+            "status": "ok",
+            "keys": sorted(data.keys())[:12] if isinstance(data, dict) else [],
+        }
+    except KisApiError as exc:
+        return {
+            "status": "error",
+            "error_type": "KisApiError",
+            "http_status": exc.status_code,
+            "error_code": exc.error_code,
+            "message": str(exc),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+
+
+def _split_product_codes(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_values = value
+    else:
+        raw_values = str(value or "").split(",")
+    product_codes = []
+    for item in raw_values:
+        code = "".join(ch for ch in str(item) if ch.isdigit())
+        if code and code not in product_codes:
+            product_codes.append(code)
+    return product_codes or ["01"]
 
 
 @app.get(
