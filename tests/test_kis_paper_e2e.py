@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+from app.brokers.kis_client import KisApiError
 from app.trading.kis_paper_e2e import preflight_kis_paper_e2e, run_kis_paper_order_e2e
 
 
@@ -52,6 +53,26 @@ class FakeKisPaperClient:
         }
 
 
+class FakeKisPaperClientWithStaleToken(FakeKisPaperClient):
+    refresh_count = 0
+    balance_attempts = 0
+
+    def get_balance(self):
+        self.balance_attempts += 1
+        if self.balance_attempts == 1:
+            raise KisApiError(
+                "KIS API error OPSQ2000: ERROR : INPUT INVALID_CHECK_ACNO",
+                error_code="OPSQ2000",
+                error_description="ERROR : INPUT INVALID_CHECK_ACNO",
+            )
+        return super().get_balance()
+
+    def issue_access_token(self, force_refresh=False):
+        if force_refresh:
+            self.refresh_count += 1
+        return "fresh-token"
+
+
 def test_kis_paper_e2e_records_filled_order_with_fake_client(tmp_path):
     db_path = tmp_path / "broker.sqlite3"
 
@@ -83,6 +104,19 @@ def test_kis_paper_preflight_does_not_place_order(tmp_path):
     assert result["status"] == "ready"
     assert result["current_price"] == 75000
     assert fake_client.placed_order is False
+
+
+def test_kis_paper_preflight_refreshes_token_once_on_invalid_account(tmp_path):
+    fake_client = FakeKisPaperClientWithStaleToken()
+
+    result = preflight_kis_paper_e2e(
+        client=fake_client,
+        db_path=tmp_path / "broker.sqlite3",
+    )
+
+    assert result["status"] == "ready"
+    assert fake_client.refresh_count == 1
+    assert fake_client.balance_attempts == 2
 
 
 def test_real_kis_paper_e2e_is_opt_in(tmp_path):

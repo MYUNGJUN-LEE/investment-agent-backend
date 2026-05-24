@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from app.brokers.kis_client import KisClient
+from app.brokers.kis_client import KisApiError, KisClient, is_invalid_account_error
 from app.trading import broker_sync
 
 
@@ -31,10 +31,8 @@ def preflight_kis_paper_e2e(
     if resolved_price <= 0:
         raise KisPaperE2EError("KIS paper preflight could not resolve current price")
 
-    balance = client.get_balance()
-    executions = client.get_daily_order_executions(
-        start_date=datetime.now().strftime("%Y%m%d"),
-        end_date=datetime.now().strftime("%Y%m%d"),
+    balance, executions = _load_account_snapshot_with_token_retry(
+        client=client,
         symbol=symbol,
     )
     sync_result = broker_sync.record_kis_sync(
@@ -153,6 +151,38 @@ def _extract_current_price(quote: dict[str, Any]) -> float:
         if value and value > 0:
             return value
     return 0.0
+
+
+def _load_account_snapshot_with_token_retry(
+    *,
+    client: KisClient,
+    symbol: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        return _load_account_snapshot(client=client, symbol=symbol)
+    except KisApiError as exc:
+        if not is_invalid_account_error(exc):
+            raise
+        refresh = getattr(client, "issue_access_token", None)
+        if not callable(refresh):
+            raise
+        refresh(force_refresh=True)
+        return _load_account_snapshot(client=client, symbol=symbol)
+
+
+def _load_account_snapshot(
+    *,
+    client: KisClient,
+    symbol: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    today = datetime.now().strftime("%Y%m%d")
+    balance = client.get_balance()
+    executions = client.get_daily_order_executions(
+        start_date=today,
+        end_date=today,
+        symbol=symbol,
+    )
+    return balance, executions
 
 
 def _extract_order_no(order: dict[str, Any]) -> str:

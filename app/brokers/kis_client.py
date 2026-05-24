@@ -709,7 +709,15 @@ class KisClient:
         _write_token_cache(self._token_cache_path, cache)
 
     def _token_cache_key(self) -> str:
-        raw = f"{self.base_url}|{self.app_key or ''}"
+        raw = "|".join(
+            [
+                self.base_url,
+                self.app_key or "",
+                sha256((self.app_secret or "").encode("utf-8")).hexdigest(),
+                self.account_no or "",
+                self.account_product_code or "",
+            ]
+        )
         return sha256(raw.encode("utf-8")).hexdigest()
 
     def runtime_diagnostics(self) -> dict[str, Any]:
