@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     trade_orchestrator_enabled: bool = True
     trade_orchestrator_interval_seconds: int = 60
     trade_orchestrator_execute_entries: bool = True
+    edge_calibration_enabled: bool = True
+    edge_calibration_db_path: str = "data/edge_calibration.sqlite3"
+    edge_calibration_interval_seconds: int = 3600
+    edge_calibration_horizon_seconds: int = 86400
+    edge_calibration_max_samples: int = 1000
+    edge_calibration_min_samples: int = 30
+    edge_calibration_future_price_limit: int = 96
+    edge_calibration_ridge_lambda: float = 10.0
+    edge_calibration_blend: float = 0.35
     broker_sync_db_path: str = "data/broker_sync.sqlite3"
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120

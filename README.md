@@ -248,6 +248,10 @@ The scanner keeps the top 10 active rows in `scanner_candidates`, archives lower
 ranks in `scanner_candidate_history`, and expires active candidates after
 `UNIVERSE_SCANNER_CANDIDATE_TTL_SECONDS` seconds. Worker selection is ordered by
 `net_edge` and requires `net_edge > UNIVERSE_SCANNER_WORKER_HURDLE_RATE_BPS`.
+Expected return/risk starts with conservative heuristics, then the orchestrator
+periodically calibrates coefficients from `scanner_candidate_history` and later
+`universe_price_snapshots` using a small SQLite ridge-regression pass. It does
+not use pandas or load large tables into memory.
 The scanner calls one symbol at a time and waits `UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS`
 between symbols. KIS HTTP requests are also serialized by
 `KIS_REQUEST_MIN_INTERVAL_SECONDS`, so each symbol's price, daily, minute,
@@ -332,7 +336,8 @@ When enabled, the API process starts these worker threads:
 - `app.workers.orchestrator_worker`: compares current `scanner_candidates` top
   10, worker hurdle rate, and actual open positions. It sends removed holdings
   to exit and sends higher `net_edge` candidates to entry while respecting the
-  max open-position limit.
+  max open-position limit. It also runs edge calibration when due instead of
+  starting another memory-consuming worker thread.
 - `app.workers.market_worker`: 1-minute KIS price/volume/change watch.
 - `app.workers.dart_worker`: 5-minute OpenDART disclosure watch.
 - `app.workers.news_worker`: 10-minute NAVER news watch.
@@ -425,6 +430,8 @@ Useful endpoints:
 - `POST /monitor/run/kis_market_watch`
 - `POST /monitor/run/opendart_disclosures`
 - `POST /monitor/run/naver_news`
+- `GET /edge-calibration/status`
+- `POST /edge-calibration/run`
 
 Configure the monitor in `.env`:
 

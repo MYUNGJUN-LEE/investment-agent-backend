@@ -48,6 +48,10 @@ from app.trading.auto_trading import (
     stop_auto_trading,
 )
 from app.trading.broker_sync import sync_kis_account
+from app.trading.edge_calibration import (
+    calibrate_edge_model,
+    get_edge_calibration_status,
+)
 from app.trading.kis_paper_e2e import KisPaperE2EError, preflight_kis_paper_e2e
 from app.trading.live_trading import LiveTradingError, execute_live_order
 from app.trading.market_monitor import (
@@ -483,6 +487,26 @@ def scan_trading_universe(req: AutoTradeStartRequest):
 )
 def latest_trading_universe():
     return get_latest_universe_scan()
+
+
+@app.get(
+    "/edge-calibration/status",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getEdgeCalibrationStatus",
+    summary="Get expected-return and risk calibration status",
+)
+def edge_calibration_status():
+    return get_edge_calibration_status()
+
+
+@app.post(
+    "/edge-calibration/run",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="runEdgeCalibration",
+    summary="Calibrate expected return and risk coefficients from scanner history",
+)
+def run_edge_calibration():
+    return calibrate_edge_model()
 
 
 @app.get(

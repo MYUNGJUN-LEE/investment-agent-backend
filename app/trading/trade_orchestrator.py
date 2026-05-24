@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from app.config import settings
 from app.trading import auto_trading, auto_trading_store
+from app.trading.edge_calibration import calibrate_edge_model_if_due
 from app.trading.universe_scanner import (
     get_active_scanner_candidates,
     initialize_universe_db,
@@ -20,6 +21,7 @@ def run_trade_orchestrator_once(
     worker_id = worker_id or f"trade-orchestrator-{uuid4().hex[:8]}"
     auto_trading_store.initialize_auto_trading_db()
     initialize_universe_db()
+    calibration_result = calibrate_edge_model_if_due()
 
     sessions = auto_trading_store.list_sessions(status="active", limit=session_limit)
     if not sessions:
@@ -27,6 +29,7 @@ def run_trade_orchestrator_once(
             "status": "idle",
             "worker_id": worker_id,
             "message": "No active auto-trading sessions",
+            "edge_calibration": calibration_result,
             "session_count": 0,
             "results": [],
         }
@@ -40,6 +43,7 @@ def run_trade_orchestrator_once(
             "status": "idle",
             "worker_id": worker_id,
             "message": "scanner_candidates is empty; no orchestrated exit or entry attempted",
+            "edge_calibration": calibration_result,
             "session_count": len(sessions),
             "results": [],
         }
@@ -96,6 +100,7 @@ def run_trade_orchestrator_once(
     return {
         "status": status,
         "worker_id": worker_id,
+        "edge_calibration": calibration_result,
         "session_count": len(sessions),
         "candidate_count": len(active_candidates),
         "candidate_symbols": [item.get("symbol") for item in active_candidates],

@@ -13,6 +13,10 @@ from app.data_sources.kis import fetch_price_data
 from app.data_sources.opendart import fetch_opendart_disclosures
 from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.services.naver_news import search_naver_news
+from app.trading.edge_calibration import (
+    estimate_expected_edges,
+    load_edge_model,
+)
 from app.trading import paper_trading
 
 
@@ -565,7 +569,15 @@ def _rank_execution_candidates(
         scan_time,
         int(settings.universe_scanner_candidate_ttl_seconds or 3600),
     )
-    scored = [_with_expected_value_scores(item, expires_at=expires_at) for item in candidates]
+    edge_model = load_edge_model()
+    scored = [
+        _with_expected_value_scores(
+            item,
+            expires_at=expires_at,
+            edge_model=edge_model,
+        )
+        for item in candidates
+    ]
     ranked = sorted(
         scored,
         key=lambda item: (
@@ -600,10 +612,20 @@ def _with_expected_value_scores(
     candidate: dict[str, Any],
     *,
     expires_at: str,
+    edge_model: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     raw_score = float(candidate.get("score") or 0)
-    expected_return = _estimate_expected_return_bps(candidate, raw_score)
-    expected_risk = _estimate_expected_risk_penalty_bps(candidate, raw_score)
+    calibrated = estimate_expected_edges(candidate, raw_score, model=edge_model)
+    expected_return = (
+        float(calibrated["expected_return"])
+        if calibrated
+        else _estimate_expected_return_bps(candidate, raw_score)
+    )
+    expected_risk = (
+        float(calibrated["expected_risk"])
+        if calibrated
+        else _estimate_expected_risk_penalty_bps(candidate, raw_score)
+    )
     trading_cost = _estimate_round_trip_trading_cost_bps()
     slippage_cost = _estimate_slippage_cost_bps(candidate)
     net_edge = expected_return - expected_risk - trading_cost - slippage_cost
@@ -626,6 +648,7 @@ def _with_expected_value_scores(
         "net_edge": round(net_edge, 4),
         "composite_score": round(max(0.0, min(100.0, composite_score)), 4),
         "expires_at": expires_at,
+        "edge_model": (calibrated or {}).get("edge_model", "heuristic_v1"),
     }
 
 
