@@ -43,6 +43,24 @@ services:
         value: "10"
       - key: EDGE_CALIBRATION_BLEND
         value: "0.35"
+      - key: EDGE_CALIBRATION_TARGET_SAMPLES
+        value: "1000"
+      - key: EDGE_CALIBRATION_SAMPLE_RETENTION_LIMIT
+        value: "10000"
+      - key: EDGE_CALIBRATION_GATE_MIN_SAMPLES
+        value: "1000"
+      - key: EDGE_CALIBRATION_GATE_MIN_OOS_SAMPLES
+        value: "200"
+      - key: EDGE_CALIBRATION_GATE_MAX_MAE_RETURN_BPS
+        value: "180"
+      - key: EDGE_CALIBRATION_GATE_MAX_MAE_RISK_BPS
+        value: "180"
+      - key: EDGE_CALIBRATION_GATE_MIN_TOP10_AVG_RETURN_BPS
+        value: "20"
+      - key: EDGE_CALIBRATION_GATE_MIN_TOP10_WIN_RATE
+        value: "0.52"
+      - key: EDGE_CALIBRATION_GATE_MIN_FILL_ADJUSTED_EDGE_BPS
+        value: "30"
       - key: MONITOR_PRICE_INTERVAL_SECONDS
         value: "60"
       - key: MONITOR_DISCLOSURE_INTERVAL_SECONDS

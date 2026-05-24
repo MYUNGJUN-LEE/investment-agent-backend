@@ -19,6 +19,7 @@ from app.models import (
     OrderPreviewRequest,
 )
 from app.trading.live_trading import LiveTradingError, execute_live_order
+from app.trading.edge_calibration import edge_entry_gate
 from app.trading.order_approval import (
     OrderApprovalError,
     confirm_order_preview,
@@ -298,6 +299,7 @@ def _run_cycle(
                 "ready_candidates": scan.get("ready_candidates", []),
                 "worker_hurdle_rate": scan.get("worker_hurdle_rate"),
                 "active_candidate_symbols": scan.get("active_candidate_symbols", []),
+                "entry_gate": scan.get("entry_gate"),
             }
         )
         min_scanned_symbols = max(
@@ -409,6 +411,7 @@ def run_orchestrated_candidates_once(
             {"symbol": item.symbol, "signal_score": item.signal_score}
             for item in plan["entry_symbols"]
         ],
+        "entry_gate": plan["entry_gate"],
         "results": results,
     }
 
@@ -429,9 +432,10 @@ def build_orchestrated_symbol_plan(
         req=req,
         active_candidate_symbols=active_candidate_symbols,
     )
+    entry_gate = edge_entry_gate(active_candidates)
 
     entry_symbols: list[AutoTradeSymbolConfig] = []
-    if execute_entries:
+    if execute_entries and entry_gate.get("approved", False):
         entry_symbols = _entry_symbols_from_scanner_candidates(
             req=req,
             active_candidates=active_candidates,
@@ -443,6 +447,7 @@ def build_orchestrated_symbol_plan(
         "open_symbols": sorted(positions.keys()),
         "exit_symbols": exit_symbols,
         "entry_symbols": entry_symbols,
+        "entry_gate": entry_gate,
     }
 
 

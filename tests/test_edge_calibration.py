@@ -78,6 +78,59 @@ def test_edge_calibration_if_due_skips_when_recent(tmp_path, monkeypatch):
     assert result["status"] == "not_due"
 
 
+def test_edge_entry_gate_passes_after_oos_and_top10_thresholds(tmp_path, monkeypatch):
+    universe_db = tmp_path / "universe.sqlite3"
+    calibration_db = tmp_path / "edge.sqlite3"
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_min_samples", 5)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_max_samples", 10)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_target_samples", 5)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_horizon_seconds", 3600)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_samples", 5)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_return_bps", 10_000)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_risk_bps", 10_000)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_win_rate", 0.0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 30)
+
+    universe_scanner.initialize_universe_db(universe_db)
+    with sqlite3.connect(universe_db) as conn:
+        for index in range(5):
+            symbol = f"{index + 1:06d}"
+            _insert_candidate(
+                conn,
+                scan_id=f"scan-{index}",
+                scan_time=f"2026-05-24T09:0{index}:00",
+                symbol=symbol,
+                raw_score=70 + index,
+                current_price=100,
+            )
+            _insert_price(
+                conn,
+                scan_id=f"future-{index}",
+                created_at=f"2026-05-24T10:0{index}:00",
+                symbol=symbol,
+                price=105 + index,
+            )
+
+    result = edge_calibration.calibrate_edge_model(
+        universe_db_path=universe_db,
+        calibration_db_path=calibration_db,
+        min_samples=5,
+        max_samples=10,
+    )
+    gate = edge_calibration.edge_entry_gate(
+        [{"symbol": "000001", "net_edge": 80}],
+        calibration_db_path=calibration_db,
+    )
+
+    assert result["status"] == "success"
+    assert result["stored_sample_count"] == 5
+    assert result["oos_sample_count"] >= 1
+    assert gate["approved"] is True
+    assert gate["top10_performance"]["sample_count"] == 5
+
+
 def _insert_candidate(
     conn: sqlite3.Connection,
     *,

@@ -50,6 +50,7 @@ from app.trading.auto_trading import (
 from app.trading.broker_sync import sync_kis_account
 from app.trading.edge_calibration import (
     calibrate_edge_model,
+    edge_entry_gate,
     get_edge_calibration_status,
 )
 from app.trading.kis_paper_e2e import KisPaperE2EError, preflight_kis_paper_e2e
@@ -497,6 +498,16 @@ def latest_trading_universe():
 )
 def edge_calibration_status():
     return get_edge_calibration_status()
+
+
+@app.get(
+    "/edge-calibration/gate",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getEdgeCalibrationGate",
+    summary="Get the calibrated entry-performance gate",
+)
+def edge_calibration_gate():
+    return edge_entry_gate()
 
 
 @app.post(

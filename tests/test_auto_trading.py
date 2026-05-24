@@ -319,6 +319,15 @@ def test_orchestrated_entries_follow_net_edge_priority(monkeypatch):
         lambda req, symbol_cfg, session_id=None: run_calls.append(symbol_cfg.symbol)
         or {"symbol": symbol_cfg.symbol, "status": "confirmed"},
     )
+    monkeypatch.setattr(
+        auto_trading,
+        "edge_entry_gate",
+        lambda candidates=None: {
+            "status": "approved",
+            "approved": True,
+            "message": "test gate approved",
+        },
+    )
 
     result = auto_trading.run_orchestrated_candidates_once(
         AutoTradeStartRequest(),

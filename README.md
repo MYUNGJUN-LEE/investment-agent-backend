@@ -251,7 +251,15 @@ ranks in `scanner_candidate_history`, and expires active candidates after
 Expected return/risk starts with conservative heuristics, then the orchestrator
 periodically calibrates coefficients from `scanner_candidate_history` and later
 `universe_price_snapshots` using a small SQLite ridge-regression pass. It does
-not use pandas or load large tables into memory.
+not use pandas or load large tables into memory. Completed training samples are
+persisted in `edge_training_samples`, retained up to
+`EDGE_CALIBRATION_SAMPLE_RETENTION_LIMIT`, and reused across restarts. New entry
+orders are blocked until the calibration gate passes: at least
+`EDGE_CALIBRATION_GATE_MIN_SAMPLES` stored samples, enough out-of-sample samples,
+MAE limits, positive top-10 realized performance, win-rate threshold, and
+fill-adjusted edge threshold. Paper and KIS broker fills update a persisted
+fill-quality multiplier that reduces expected return when fills/slippage are
+weak.
 The scanner calls one symbol at a time and waits `UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS`
 between symbols. KIS HTTP requests are also serialized by
 `KIS_REQUEST_MIN_INTERVAL_SECONDS`, so each symbol's price, daily, minute,
@@ -272,6 +280,9 @@ Universe scanner endpoints:
 
 - `POST /universe/scan`
 - `GET /universe/latest`
+- `GET /edge-calibration/status`
+- `GET /edge-calibration/gate`
+- `POST /edge-calibration/run`
 - `POST /gpt/auto-trading/control`
 
 Minimal "start only" body:
@@ -391,6 +402,9 @@ limited by `AUTO_TRADING_MAX_OPEN_POSITIONS`, which defaults to 5. The
 orchestrator runs every `TRADE_ORCHESTRATOR_INTERVAL_SECONDS` seconds. A held
 symbol remains valid while it is still present in `scanner_candidates`; once a
 new scan removes it from the top 10, the orchestrator creates an exit candidate.
+Entry execution also requires `GET /edge-calibration/gate` to return
+`approved=true`, so the system can keep scanning and learning without forcing
+low-confidence trades.
 
 Actual KIS paper order placement remains opt-in. Use only a KIS paper account
 and a tiny quantity:

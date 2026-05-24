@@ -22,6 +22,15 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
         "_paper_average_realized_return_bps",
         lambda: None,
     )
+    monkeypatch.setattr(
+        universe_scanner,
+        "edge_entry_gate",
+        lambda candidates=None: {
+            "status": "approved",
+            "approved": True,
+            "message": "test gate approved",
+        },
+    )
 
     price_rows = {
         "005930": {
@@ -192,6 +201,7 @@ def test_auto_trading_blocks_when_universe_scan_has_too_few_symbols(monkeypatch)
             "ready_candidates": [{"symbol": "005930", "decision": "buy_candidate"}],
             "worker_hurdle_rate": 50,
             "active_candidate_symbols": ["005930"],
+            "entry_gate": None,
             "message": (
                 "Universe scanner scanned 14 symbols; "
                 "at least 15 symbols are required before trading"

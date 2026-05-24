@@ -14,6 +14,7 @@ from app.data_sources.opendart import fetch_opendart_disclosures
 from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.services.naver_news import search_naver_news
 from app.trading.edge_calibration import (
+    edge_entry_gate,
     estimate_expected_edges,
     load_edge_model,
 )
@@ -252,6 +253,7 @@ def scan_universe_for_auto_trade(
         "final_count": len(active_candidates),
         "executable_count": len(symbols),
         "worker_hurdle_rate": hurdle_rate,
+        "entry_gate": ranked_candidates[0].get("entry_gate") if ranked_candidates else None,
         "active_candidate_symbols": [
             item.get("symbol")
             for item in active_candidates
@@ -578,6 +580,7 @@ def _rank_execution_candidates(
         )
         for item in candidates
     ]
+    entry_gate = edge_entry_gate(scored)
     ranked = sorted(
         scored,
         key=lambda item: (
@@ -594,6 +597,7 @@ def _rank_execution_candidates(
             rank=rank,
             execution_limit=final_limit,
             hurdle_rate=hurdle_rate,
+            entry_gate=entry_gate,
         )
         prepared.append(
             {
@@ -603,6 +607,7 @@ def _rank_execution_candidates(
                 "status": status,
                 "reason": reason,
                 "worker_hurdle_rate": round(hurdle_rate, 4),
+                "entry_gate": entry_gate,
             }
         )
     return prepared
@@ -658,6 +663,7 @@ def _execution_status_for_candidate(
     rank: int,
     execution_limit: int,
     hurdle_rate: float,
+    entry_gate: dict[str, Any],
 ) -> tuple[str, str]:
     reasons = [str(candidate.get("reason") or "")]
     if rank > execution_limit:
@@ -674,6 +680,9 @@ def _execution_status_for_candidate(
         reasons.append(
             f"net_edge {net_edge:.2f}bps is below worker hurdle {hurdle_rate:.2f}bps"
         )
+        return "SKIPPED", _join_reasons(reasons)
+    if not entry_gate.get("approved", False):
+        reasons.append(str(entry_gate.get("message") or "entry gate blocked"))
         return "SKIPPED", _join_reasons(reasons)
     return "READY", _join_reasons(reasons)
 

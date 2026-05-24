@@ -65,6 +65,15 @@ class Settings(BaseSettings):
     edge_calibration_future_price_limit: int = 96
     edge_calibration_ridge_lambda: float = 10.0
     edge_calibration_blend: float = 0.35
+    edge_calibration_target_samples: int = 1000
+    edge_calibration_sample_retention_limit: int = 10_000
+    edge_calibration_gate_min_samples: int = 1000
+    edge_calibration_gate_min_oos_samples: int = 200
+    edge_calibration_gate_max_mae_return_bps: float = 180.0
+    edge_calibration_gate_max_mae_risk_bps: float = 180.0
+    edge_calibration_gate_min_top10_avg_return_bps: float = 20.0
+    edge_calibration_gate_min_top10_win_rate: float = 0.52
+    edge_calibration_gate_min_fill_adjusted_edge_bps: float = 30.0
     broker_sync_db_path: str = "data/broker_sync.sqlite3"
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120
