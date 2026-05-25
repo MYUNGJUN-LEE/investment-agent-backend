@@ -423,7 +423,7 @@ def _to_int(value: Any) -> int | None:
 
 
 def _db_path(db_path: Path | str | None = None) -> Path:
-    return Path(db_path or settings.broker_sync_db_path)
+    return settings.storage_path(db_path or settings.broker_sync_db_path)
 
 
 def _json(data: Any) -> str:

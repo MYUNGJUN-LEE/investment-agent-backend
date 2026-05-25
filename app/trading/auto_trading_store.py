@@ -392,6 +392,66 @@ def claim_due_sessions(
     return claimed
 
 
+def recover_overdue_active_sessions(
+    *,
+    db_path: Path | str | None = None,
+    min_overdue_seconds: int | float | None = None,
+) -> list[dict[str, Any]]:
+    """Release stale active sessions whose due schedule is stuck behind a lock."""
+    path = _db_path(db_path)
+    if not path.exists():
+        return []
+    now = _now()
+    min_overdue = (
+        max(60.0, float(settings.auto_trading_worker_poll_seconds or 2.0) * 5)
+        if min_overdue_seconds is None
+        else max(0.0, float(min_overdue_seconds))
+    )
+    overdue_before = _minus_seconds(now, min_overdue)
+    recovered_ids: list[str] = []
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA_SQL)
+        _ensure_session_columns(conn)
+        rows = conn.execute(
+            """
+            SELECT session_id
+            FROM auto_trading_sessions
+            WHERE status = 'active'
+              AND (next_run_at IS NULL OR next_run_at <= ?)
+              AND locked_until IS NOT NULL
+              AND locked_until > ?
+            """,
+            (overdue_before, now),
+        ).fetchall()
+        for row in rows:
+            session_id = row["session_id"]
+            conn.execute(
+                """
+                UPDATE auto_trading_sessions
+                SET updated_at = ?, next_run_at = ?, locked_by = NULL,
+                    locked_until = NULL
+                WHERE session_id = ?
+                """,
+                (now, now, session_id),
+            )
+            _insert_event(
+                conn=conn,
+                session_id=session_id,
+                event_type="schedule_recovered",
+                status="active",
+                message="Recovered overdue active session schedule",
+                results=[],
+                created_at=now,
+            )
+            recovered_ids.append(session_id)
+    return [
+        session
+        for session in (get_session(session_id, db_path=path) for session_id in recovered_ids)
+        if session is not None
+    ]
+
+
 def complete_cycle(
     session_id: str,
     results: list[dict[str, Any]],
@@ -609,7 +669,7 @@ def _json(data: Any) -> str:
 
 
 def _db_path(db_path: Path | str | None = None) -> Path:
-    return Path(db_path or settings.auto_trading_db_path)
+    return settings.storage_path(db_path or settings.auto_trading_db_path)
 
 
 def _now() -> str:
@@ -619,4 +679,10 @@ def _now() -> str:
 def _plus_seconds(value: str, seconds: int | float) -> str:
     return (
         datetime.fromisoformat(value) + timedelta(seconds=float(seconds))
+    ).isoformat(timespec="seconds")
+
+
+def _minus_seconds(value: str, seconds: int | float) -> str:
+    return (
+        datetime.fromisoformat(value) - timedelta(seconds=float(seconds))
     ).isoformat(timespec="seconds")

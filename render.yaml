@@ -9,6 +9,8 @@ services:
     envVars:
       - key: ACTION_SCHEMA_PUBLIC_URL
         value: "https://api.autoinvestmentkorea.online"
+      - key: CORS_ALLOW_ORIGINS
+        value: "http://localhost:3000,http://127.0.0.1:3000,https://chat.openai.com,https://chatgpt.com,https://www.chatgpt.com"
       - key: EMBEDDED_WORKERS_ENABLED
         value: "true"
       - key: EMBEDDED_WORKER_BROKER_SYNC_ENABLED

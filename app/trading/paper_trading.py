@@ -6,6 +6,7 @@ import json
 import sqlite3
 from typing import Any
 
+from app.config import settings
 from app.models import PaperRunRequest
 from app.storage.market_data import get_latest_market_context
 from app.trading import cost_model, performance, risk_manager
@@ -132,7 +133,7 @@ def run_paper_once(
 ) -> dict[str, Any]:
     """Record one paper-trading signal and virtual fill."""
     req = _with_market_context_defaults(req)
-    resolved_db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    resolved_db_path = settings.storage_path(db_path or DEFAULT_DB_PATH)
     resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
 
     now = _now()
@@ -197,7 +198,7 @@ def get_paper_account_snapshot(
 ) -> dict[str, Any]:
     """Return simulated account equity, invested capital, and available cash."""
     equity = float(account_equity or risk_manager.DEFAULT_LIMITS.portfolio_value)
-    resolved_db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    resolved_db_path = settings.storage_path(db_path or DEFAULT_DB_PATH)
     resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
     with _connect(resolved_db_path) as conn:
         initialize_db(conn)

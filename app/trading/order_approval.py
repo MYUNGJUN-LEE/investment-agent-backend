@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 from typing import Any
 
+from app.config import settings
 from app.models import (
     OrderConfirmRequest,
     OrderPreviewRequest,
@@ -30,7 +31,7 @@ def create_order_preview(
 ) -> dict[str, Any]:
     """Run analysis, build a strategy candidate, and store a confirmable preview."""
     req, quantity_recommendation = _resolve_preview_quantity(req)
-    resolved_db_path = Path(db_path) if db_path else paper_trading.DEFAULT_DB_PATH
+    resolved_db_path = settings.storage_path(db_path or paper_trading.DEFAULT_DB_PATH)
     resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
 
     pipeline_req = PipelineRequest(
@@ -38,6 +39,7 @@ def create_order_preview(
         name=req.name,
         market=req.market,
         strategy_type=req.strategy_type,
+        sector=req.sector,
         lookback_hours=req.lookback_hours,
         risk_level=req.risk_level,
     )
@@ -119,7 +121,7 @@ def confirm_order_preview(
     db_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Confirm a pending preview and execute it through paper trading."""
-    resolved_db_path = Path(db_path) if db_path else paper_trading.DEFAULT_DB_PATH
+    resolved_db_path = settings.storage_path(db_path or paper_trading.DEFAULT_DB_PATH)
 
     with sqlite3.connect(resolved_db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -343,6 +345,7 @@ def _cost_inputs_from_preview(
         "position_size": req.position_size,
         "stop_loss": req.stop_loss,
         "take_profit": req.take_profit,
+        "trailing_stop": req.trailing_stop,
         "market_regime": req.market_regime or market_context.get("market_regime"),
         "model_version": req.model_version,
         "sector": req.sector,
@@ -393,6 +396,7 @@ def _paper_cost_kwargs(cost_inputs: dict[str, Any]) -> dict[str, Any]:
         "position_size",
         "stop_loss",
         "take_profit",
+        "trailing_stop",
         "market_regime",
         "model_version",
         "sector",

@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: API for running a five-agent investment analysis pipeline.
 servers:
-  - url: https://investment-agent-backend.onrender.com
+  - url: https://api.autoinvestmentkorea.online
 
 components:
   securitySchemes:
@@ -51,7 +51,6 @@ paths:
               required:
                 - symbol
                 - market
-                - strategy_type
               properties:
                 symbol:
                   type: string
@@ -69,6 +68,10 @@ paths:
                   type: string
                   enum: ["daytrade", "swing", "midterm"]
                   example: "daytrade"
+                sector:
+                  type: string
+                  nullable: true
+                  description: Optional sector for relative-strength context.
                 lookback_hours:
                   type: integer
                   example: 24
@@ -219,7 +222,6 @@ paths:
               required:
                 - symbol
                 - market
-                - strategy_type
                 - price
               properties:
                 symbol:
@@ -271,6 +273,9 @@ paths:
                   type: number
                   nullable: true
                 take_profit:
+                  type: number
+                  nullable: true
+                trailing_stop:
                   type: number
                   nullable: true
                 market_regime:
@@ -445,7 +450,6 @@ paths:
               required:
                 - symbol
                 - market
-                - strategy_type
                 - signal_type
                 - price
               properties:
@@ -507,6 +511,9 @@ paths:
                   type: number
                   nullable: true
                 take_profit:
+                  type: number
+                  nullable: true
+                trailing_stop:
                   type: number
                   nullable: true
                 market_regime:
@@ -620,6 +627,7 @@ paths:
                         type: string
                         enum: ["daytrade", "swing", "midterm"]
                         example: "daytrade"
+                        description: Optional. Defaults to daytrade when omitted.
                       risk_level:
                         type: string
                         enum: ["low", "medium", "high"]
@@ -639,6 +647,9 @@ paths:
                         type: number
                         nullable: true
                       take_profit:
+                        type: number
+                        nullable: true
+                      trailing_stop:
                         type: number
                         nullable: true
                       account_equity:
@@ -737,6 +748,7 @@ paths:
                       strategy_type:
                         type: string
                         enum: ["daytrade", "swing", "midterm"]
+                        description: Optional. Defaults to daytrade when omitted.
                       risk_level:
                         type: string
                         enum: ["low", "medium", "high"]
@@ -752,10 +764,19 @@ paths:
                       stop_loss:
                         type: number
                         nullable: true
+                      take_profit:
+                        type: number
+                        nullable: true
+                      trailing_stop:
+                        type: number
+                        nullable: true
                       account_equity:
                         type: number
                         nullable: true
                       risk_per_trade:
+                        type: number
+                        nullable: true
+                      cash_available:
                         type: number
                         nullable: true
                       expected_gross_edge_bps:
@@ -850,6 +871,66 @@ paths:
       responses:
         "200":
           description: Auto-trading control result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /gpt/auto-trading/status:
+    get:
+      operationId: getGptAutoTradingStatus
+      summary: Check auto-trading status through the GPT-compatible route.
+      description: GPT-safe route. It always returns HTTP 200 with a JSON body, converting auth or backend errors into diagnostic JSON.
+      responses:
+        "200":
+          description: Auto-trading status result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+
+  /gpt/auto-trading/start-paper:
+    post:
+      operationId: startGptPaperAutoTrading
+      summary: Start paper auto-trading through the GPT-compatible route.
+      description: GPT-safe route. It always returns HTTP 200 with a JSON body, converting auth or backend errors into diagnostic JSON.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                interval_seconds:
+                  type: integer
+                  example: 60
+                max_cycles:
+                  type: integer
+                  nullable: true
+                auto_discover_symbols:
+                  type: boolean
+                  example: true
+                universe_seed_symbols:
+                  type: array
+                  items:
+                    type: string
+                universe_candidate_limit:
+                  type: integer
+                  example: 20
+                universe_final_limit:
+                  type: integer
+                  example: 10
+                auto_confirm_paper:
+                  type: boolean
+                  example: true
+                force_new:
+                  type: boolean
+                  example: false
+      responses:
+        "200":
+          description: Paper auto-trading start result.
           content:
             application/json:
               schema:
@@ -992,6 +1073,11 @@ paths:
                   type: string
                   enum: ["KR"]
                   example: "KR"
+                strategy_type:
+                  type: string
+                  enum: ["daytrade", "swing", "midterm"]
+                  example: "swing"
+                  description: Optional. Defaults to daytrade when omitted.
                 risk_level:
                   type: string
                   enum: ["low", "medium", "high"]
@@ -1038,6 +1124,9 @@ paths:
                   type: number
                   nullable: true
                 take_profit:
+                  type: number
+                  nullable: true
+                trailing_stop:
                   type: number
                   nullable: true
                 market_regime:

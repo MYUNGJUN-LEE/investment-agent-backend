@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from pathlib import Path
 import sqlite3
 import time
 from typing import Any
@@ -30,6 +29,7 @@ from app.trading import broker_sync
 from app.trading import order_state
 from app.trading import paper_trading
 from app.trading import risk_manager
+from app.trading.atr_exits import atr_exit_levels_from_price_data
 from app.trading.universe_scanner import (
     scan_universe_for_auto_trade,
     scanner_candidate_to_symbol_config,
@@ -234,6 +234,7 @@ def process_due_sessions(
 ) -> list[dict[str, Any]]:
     """Claim and process due persistent sessions once."""
     worker_id = worker_id or f"auto-worker-{uuid4().hex[:8]}"
+    auto_trading_store.recover_overdue_active_sessions()
     sessions = auto_trading_store.claim_due_sessions(worker_id=worker_id, limit=limit)
     processed: list[dict[str, Any]] = []
     for session in sessions:
@@ -430,13 +431,24 @@ def run_orchestrated_candidates_once(
         status = "executed"
     elif results:
         status = "blocked"
+    elif plan["active_candidate_symbols"] and not plan["entry_gate"].get("approved", False):
+        status = "blocked"
 
     return _orchestrated_result_payload(
         status=status,
-        message="Trade orchestrator compared scanner candidates with open positions",
+        message=_orchestrated_message(plan=plan, status=status),
         plan=plan,
         results=results,
     )
+
+
+def _orchestrated_message(*, plan: dict[str, Any], status: str) -> str:
+    if status == "blocked" and not plan["entry_gate"].get("approved", False):
+        return str(
+            plan["entry_gate"].get("message")
+            or "Trade orchestrator entry gate blocked entries"
+        )
+    return "Trade orchestrator compared scanner candidates with open positions"
 
 
 def _orchestrated_result_payload(
@@ -770,6 +782,7 @@ def _prepare_symbols_for_account_balance(
                     }
                 ),
                 price,
+                price_result.get("price_data") or {},
             )
         )
 
@@ -998,7 +1011,12 @@ def _run_symbol(
             }
 
         price = float(price_result["price"])
-        symbol_cfg = _apply_order_sizing_defaults(req, symbol_cfg, price)
+        symbol_cfg = _apply_order_sizing_defaults(
+            req,
+            symbol_cfg,
+            price,
+            price_result.get("price_data") or {},
+        )
         preview_req = _to_preview_request(symbol_cfg, price)
         preview = create_order_preview(preview_req)
         result: dict[str, Any] = {
@@ -1071,6 +1089,7 @@ def _to_preview_request(
         position_size=symbol_cfg.position_size,
         stop_loss=symbol_cfg.stop_loss,
         take_profit=symbol_cfg.take_profit,
+        trailing_stop=symbol_cfg.trailing_stop,
         market_regime=symbol_cfg.market_regime,
         model_version=symbol_cfg.model_version,
         sector=symbol_cfg.sector,
@@ -1100,6 +1119,7 @@ def _apply_order_sizing_defaults(
     req: AutoTradeStartRequest,
     symbol_cfg: AutoTradeSymbolConfig,
     price: float,
+    price_data: dict[str, Any] | None = None,
 ) -> AutoTradeSymbolConfig:
     updates: dict[str, Any] = {}
     if symbol_cfg.account_equity is None:
@@ -1108,8 +1128,24 @@ def _apply_order_sizing_defaults(
         updates["risk_per_trade"] = req.risk_per_trade
     if symbol_cfg.cash_available is None and req.cash_available is not None:
         updates["cash_available"] = req.cash_available
-    if symbol_cfg.stop_loss is None and symbol_cfg.quantity is None:
-        updates["stop_loss"] = price * (1 - settings.monitor_default_stop_loss_pct / 100)
+    if (
+        symbol_cfg.quantity is None
+        and (
+            symbol_cfg.stop_loss is None
+            or symbol_cfg.take_profit is None
+            or symbol_cfg.trailing_stop is None
+        )
+    ):
+        levels = atr_exit_levels_from_price_data(
+            entry_price=price,
+            price_data=price_data or {},
+        )
+        if symbol_cfg.stop_loss is None and levels["stop_loss"] is not None:
+            updates["stop_loss"] = levels["stop_loss"]
+        if symbol_cfg.take_profit is None and levels["take_profit"] is not None:
+            updates["take_profit"] = levels["take_profit"]
+        if symbol_cfg.trailing_stop is None and levels["trailing_stop"] is not None:
+            updates["trailing_stop"] = levels["trailing_stop"]
     return symbol_cfg.model_copy(update=updates) if updates else symbol_cfg
 
 
@@ -1126,6 +1162,7 @@ def _to_live_order_request(
     return LiveOrderRequest(
         symbol=symbol_cfg.symbol,
         market=symbol_cfg.market,
+        strategy_type=symbol_cfg.strategy_type,
         risk_level=symbol_cfg.risk_level,
         side=side,
         order_type="limit",
@@ -1147,6 +1184,7 @@ def _to_live_order_request(
         position_size=symbol_cfg.position_size,
         stop_loss=symbol_cfg.stop_loss,
         take_profit=symbol_cfg.take_profit,
+        trailing_stop=symbol_cfg.trailing_stop,
         market_regime=symbol_cfg.market_regime,
         model_version=symbol_cfg.model_version,
         sector=symbol_cfg.sector,
@@ -1186,10 +1224,24 @@ def _auto_client_order_id(
 
 def _resolve_loop_price(symbol_cfg: AutoTradeSymbolConfig) -> dict[str, Any]:
     if symbol_cfg.price is not None:
+        price_data: dict[str, Any] = {}
+        if (
+            symbol_cfg.quantity is None
+            and (
+                symbol_cfg.stop_loss is None
+                or symbol_cfg.take_profit is None
+                or symbol_cfg.trailing_stop is None
+            )
+        ):
+            try:
+                price_data = fetch_price_data(symbol_cfg.symbol)
+            except Exception:
+                price_data = {}
         return {
             "price": symbol_cfg.price,
             "source": "request",
             "message": "Using request fallback price",
+            "price_data": price_data,
         }
 
     price_data = fetch_price_data(symbol_cfg.symbol)
@@ -1199,6 +1251,7 @@ def _resolve_loop_price(symbol_cfg: AutoTradeSymbolConfig) -> dict[str, Any]:
             "price": float(current_price),
             "source": price_data.get("source", "market_data"),
             "message": "Using current market price",
+            "price_data": price_data,
         }
     return {
         "price": None,
@@ -1214,7 +1267,7 @@ def _open_positions(mode: str) -> dict[str, dict[str, Any]]:
 
 
 def _open_paper_positions() -> dict[str, dict[str, Any]]:
-    path = Path(paper_trading.DEFAULT_DB_PATH)
+    path = settings.storage_path(paper_trading.DEFAULT_DB_PATH)
     if not path.exists():
         return {}
     try:
@@ -1233,7 +1286,7 @@ def _open_paper_positions() -> dict[str, dict[str, Any]]:
 
 
 def _open_live_positions() -> dict[str, dict[str, Any]]:
-    path = Path(settings.broker_sync_db_path)
+    path = settings.storage_path(settings.broker_sync_db_path)
     if not path.exists():
         return {}
     try:

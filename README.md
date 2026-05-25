@@ -260,10 +260,14 @@ MAE limits, positive top-10 realized performance, win-rate threshold, and
 fill-adjusted edge threshold. Paper and KIS broker fills update a persisted
 fill-quality multiplier that reduces expected return when fills/slippage are
 weak.
-The scanner calls one symbol at a time and waits `UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS`
-between symbols. KIS HTTP requests are also serialized by
-`KIS_REQUEST_MIN_INTERVAL_SECONDS`, so each symbol's price, daily, minute,
-orderbook, execution, and investor-flow requests are not fired at once.
+The scanner calls one symbol at a time. By default it uses a fast swing-scan
+path: current price plus daily candles/ATR/momentum only, with the per-symbol
+sleep defaulting to 0 and capped by `UNIVERSE_SCANNER_SYMBOL_INTERVAL_CAP_SECONDS`.
+KIS HTTP requests are still serialized by `KIS_REQUEST_MIN_INTERVAL_SECONDS`.
+Set `UNIVERSE_SCANNER_INTRADAY_ENRICHMENT_ENABLED=true`,
+`UNIVERSE_SCANNER_NEWS_ENRICHMENT_ENABLED=true`, or
+`UNIVERSE_SCANNER_DISCLOSURE_ENRICHMENT_ENABLED=true` only when you want the
+slower intraday/news/disclosure enrichments inside the scanner itself.
 Auto-trading, market monitoring, and broker sync now run as separate workers:
 
 ```bash
@@ -478,8 +482,8 @@ MONITOR_NEWS_INTERVAL_SECONDS=600
 MONITOR_SURGE_CHANGE_PCT=5
 MONITOR_DROP_CHANGE_PCT=-5
 MONITOR_VOLUME_SPIKE_RATIO=3
-MONITOR_DEFAULT_STOP_LOSS_PCT=3
-MONITOR_DEFAULT_TAKE_PROFIT_PCT=5
+# Position exits use ATR14: stop=entry-1.8*ATR14, target=entry+2.5R,
+# trailing_stop=highest_close-2.0*ATR14 after profit.
 BROKER_SYNC_INTERVAL_SECONDS=60
 ALERT_DB_PATH=data/alerts.sqlite3
 ALERT_WEBHOOK_URL=

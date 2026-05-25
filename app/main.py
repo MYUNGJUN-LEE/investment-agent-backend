@@ -161,7 +161,8 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 
 def _is_gpt_action_path(request: Request) -> bool:
-    return request.url.path.rstrip("/").startswith("/gpt/")
+    path = request.url.path.rstrip("/")
+    return path == "/gpt" or path.startswith("/gpt/")
 
 
 def _gpt_error_payload(
@@ -170,10 +171,11 @@ def _gpt_error_payload(
     http_status: int,
     message: str,
     detail,
+    command: str = "unknown",
 ) -> dict:
     payload = {
         "status": "error",
-        "command": "unknown",
+        "command": command,
         "message": message,
         "error_type": error_type,
         "http_status": http_status,
@@ -190,6 +192,31 @@ def _gpt_success_payload(message: str, payload: dict[str, Any]) -> dict[str, Any
     content = {"status": "success", "message": message}
     content.update(_drop_none_values(payload))
     return content
+
+
+def _gpt_json(payload: dict[str, Any]) -> JSONResponse:
+    return JSONResponse(status_code=200, content=_drop_none_values(payload))
+
+
+def _gpt_exception_response(
+    exc: Exception,
+    *,
+    command: str = "unknown",
+    error_type: str = "server_error",
+    http_status: int = 500,
+) -> JSONResponse:
+    if isinstance(exc, AutoTradingError):
+        error_type = "auto_trading_error"
+        http_status = exc.status_code
+    return _gpt_json(
+        _gpt_error_payload(
+            error_type=error_type,
+            http_status=http_status,
+            message=str(exc) or "GPT action failed",
+            detail=str(exc),
+            command=command,
+        )
+    )
 
 
 def _drop_none_values(value):
@@ -476,11 +503,16 @@ def run_auto_trading_once_endpoint(req: AutoTradeStartRequest):
     operation_id="controlAutoTradingFromGpt",
     summary="Turn auto-trading on or off from Custom GPT",
 )
+@app.post(
+    "/gpt/auto-trading/control/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def control_auto_trading_endpoint(req: GptAutoTradeControlRequest):
     try:
-        return control_auto_trading_from_gpt(req)
-    except AutoTradingError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return _gpt_json(control_auto_trading_from_gpt(req))
+    except Exception as exc:
+        return _gpt_exception_response(exc, command=str(req.command))
 
 
 @app.get(
@@ -491,6 +523,11 @@ def control_auto_trading_endpoint(req: GptAutoTradeControlRequest):
     operation_id="getGptAutoTradingStatus",
     summary="Get auto-trading status from Custom GPT",
 )
+@app.get(
+    "/gpt/auto-trading/status/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 @app.post(
     "/gpt/auto-trading/status",
     response_model=GptAutoTradeControlResponse,
@@ -498,8 +535,18 @@ def control_auto_trading_endpoint(req: GptAutoTradeControlRequest):
     dependencies=[Depends(verify_api_key)],
     include_in_schema=False,
 )
+@app.post(
+    "/gpt/auto-trading/status/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def gpt_auto_trading_status_endpoint():
-    return control_auto_trading_from_gpt(GptAutoTradeControlRequest(command="status"))
+    try:
+        return _gpt_json(
+            control_auto_trading_from_gpt(GptAutoTradeControlRequest(command="status"))
+        )
+    except Exception as exc:
+        return _gpt_exception_response(exc, command="status")
 
 
 @app.post(
@@ -510,13 +557,21 @@ def gpt_auto_trading_status_endpoint():
     operation_id="startGptPaperAutoTrading",
     summary="Start paper auto-trading from Custom GPT",
 )
+@app.post(
+    "/gpt/auto-trading/start-paper/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def gpt_start_paper_auto_trading_endpoint(
     payload: dict[str, Any] | None = Body(default=None),
 ):
-    data = dict(payload or {})
-    data.update({"command": "start", "execution_mode": "paper"})
-    req = GptAutoTradeControlRequest(**data)
-    return control_auto_trading_from_gpt(req)
+    try:
+        data = dict(payload or {})
+        data.update({"command": "start", "execution_mode": "paper"})
+        req = GptAutoTradeControlRequest(**data)
+        return _gpt_json(control_auto_trading_from_gpt(req))
+    except Exception as exc:
+        return _gpt_exception_response(exc, command="start")
 
 
 @app.post(
@@ -664,16 +719,29 @@ def preflight_kis_paper_state(symbol: str = "005930"):
     operation_id="preflightGptKisPaperE2E",
     summary="Validate KIS paper connectivity from Custom GPT",
 )
+@app.post(
+    "/gpt/broker/kis/paper-preflight/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 @app.get(
     "/gpt/broker/kis/paper-preflight",
     dependencies=[Depends(verify_api_key)],
     include_in_schema=False,
 )
+@app.get(
+    "/gpt/broker/kis/paper-preflight/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def gpt_preflight_kis_paper_state(symbol: str = "005930"):
-    result = _drop_none_values(preflight_kis_paper_state(symbol=symbol))
-    result.setdefault("status", "success")
-    result.setdefault("message", "KIS paper connectivity preflight completed")
-    return result
+    try:
+        result = _drop_none_values(preflight_kis_paper_state(symbol=symbol))
+        result.setdefault("status", "success")
+        result.setdefault("message", "KIS paper connectivity preflight completed")
+        return _gpt_json(result)
+    except Exception as exc:
+        return _gpt_exception_response(exc)
 
 
 @app.get(
@@ -682,16 +750,26 @@ def gpt_preflight_kis_paper_state(symbol: str = "005930"):
     operation_id="probeGptKisAccount",
     summary="Probe KIS paper account access without placing an order",
 )
+@app.get(
+    "/gpt/broker/kis/account-probe/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def gpt_probe_kis_account_get(
     symbol: str = "005930",
     product_codes: str = "01,00,02",
     force_token_refresh: bool = False,
 ):
-    return _probe_kis_account(
-        symbol=symbol,
-        product_codes=_split_product_codes(product_codes),
-        force_token_refresh=force_token_refresh,
-    )
+    try:
+        return _gpt_json(
+            _probe_kis_account(
+                symbol=symbol,
+                product_codes=_split_product_codes(product_codes),
+                force_token_refresh=force_token_refresh,
+            )
+        )
+    except Exception as exc:
+        return _gpt_exception_response(exc)
 
 
 @app.post(
@@ -699,13 +777,23 @@ def gpt_probe_kis_account_get(
     dependencies=[Depends(verify_api_key)],
     include_in_schema=False,
 )
+@app.post(
+    "/gpt/broker/kis/account-probe/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def gpt_probe_kis_account_post(payload: dict[str, Any] | None = Body(default=None)):
-    data = payload or {}
-    return _probe_kis_account(
-        symbol=str(data.get("symbol") or "005930"),
-        product_codes=_split_product_codes(data.get("product_codes") or "01,00,02"),
-        force_token_refresh=bool(data.get("force_token_refresh", False)),
-    )
+    try:
+        data = payload or {}
+        return _gpt_json(
+            _probe_kis_account(
+                symbol=str(data.get("symbol") or "005930"),
+                product_codes=_split_product_codes(data.get("product_codes") or "01,00,02"),
+                force_token_refresh=bool(data.get("force_token_refresh", False)),
+            )
+        )
+    except Exception as exc:
+        return _gpt_exception_response(exc)
 
 
 def _probe_kis_account(
@@ -829,16 +917,31 @@ def get_kis_config_status():
     operation_id="getGptKisConfigStatus",
     summary="Inspect non-secret KIS runtime configuration from Custom GPT",
 )
+@app.get(
+    "/gpt/broker/kis/config-status/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 @app.post(
     "/gpt/broker/kis/config-status",
     dependencies=[Depends(verify_api_key)],
     include_in_schema=False,
 )
+@app.post(
+    "/gpt/broker/kis/config-status/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def get_gpt_kis_config_status():
-    return _gpt_success_payload(
-        "KIS runtime configuration inspected",
-        get_kis_config_status(),
-    )
+    try:
+        return _gpt_json(
+            _gpt_success_payload(
+                "KIS runtime configuration inspected",
+                get_kis_config_status(),
+            )
+        )
+    except Exception as exc:
+        return _gpt_exception_response(exc)
 
 
 @app.get(
@@ -870,7 +973,17 @@ def get_embedded_worker_status():
     summary="Get embedded worker status from Custom GPT",
 )
 @app.get(
+    "/gpt/workers/status/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+@app.get(
     "/gpt/worker/status",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+@app.get(
+    "/gpt/worker/status/",
     dependencies=[Depends(verify_api_key)],
     include_in_schema=False,
 )
@@ -880,17 +993,88 @@ def get_embedded_worker_status():
     include_in_schema=False,
 )
 @app.post(
+    "/gpt/workers/status/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+@app.post(
     "/gpt/worker/status",
     dependencies=[Depends(verify_api_key)],
     include_in_schema=False,
 )
+@app.post(
+    "/gpt/worker/status/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def get_gpt_embedded_worker_status():
-    from app.workers.manager import embedded_worker_status
+    try:
+        from app.workers.manager import embedded_worker_status
 
-    status = embedded_worker_status()
-    return _gpt_success_payload(
-        f"{status.get('count', 0)} embedded worker(s) reported",
-        status,
+        status = embedded_worker_status()
+        return _gpt_json(
+            _gpt_success_payload(
+                f"{status.get('count', 0)} embedded worker(s) reported",
+                status,
+            )
+        )
+    except Exception as exc:
+        return _gpt_exception_response(exc)
+
+
+@app.options("/gpt/{gpt_path:path}", include_in_schema=False)
+def gpt_options_fallback(gpt_path: str):
+    return Response(
+        status_code=204,
+        headers={
+            "Allow": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
+
+
+@app.options("/gpt", include_in_schema=False)
+def gpt_root_options_fallback():
+    return gpt_options_fallback("")
+
+
+@app.api_route(
+    "/gpt",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    include_in_schema=False,
+)
+def gpt_root_action_fallback():
+    return gpt_unknown_action_fallback("")
+
+
+@app.api_route(
+    "/gpt/{gpt_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    include_in_schema=False,
+)
+def gpt_unknown_action_fallback(gpt_path: str):
+    path = f"/gpt/{gpt_path}" if gpt_path else "/gpt"
+    return _gpt_json(
+        _gpt_error_payload(
+            error_type="not_found",
+            http_status=404,
+            message=f"Unknown GPT action path: {path}",
+            detail={
+                "path": path,
+                "known_paths": [
+                    "/gpt/auto-trading/control",
+                    "/gpt/auto-trading/status",
+                    "/gpt/auto-trading/start-paper",
+                    "/gpt/workers/status",
+                    "/gpt/broker/kis/config-status",
+                    "/gpt/broker/kis/paper-preflight",
+                    "/gpt/broker/kis/account-probe",
+                    "/gpt/health",
+                ],
+            },
+        )
     )
 
 

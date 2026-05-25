@@ -8,6 +8,7 @@ from app.trading import auto_trading, auto_trading_store
 from app.trading.edge_calibration import (
     calibrate_edge_model_if_due,
     record_fill_adjustment_from_fills,
+    refresh_edge_training_samples,
 )
 from app.trading.universe_scanner import (
     get_active_scanner_candidates,
@@ -23,9 +24,11 @@ def run_trade_orchestrator_once(
     """Compare current scanner top-10 candidates with real holdings and trade deltas."""
     worker_id = worker_id or f"trade-orchestrator-{uuid4().hex[:8]}"
     auto_trading_store.initialize_auto_trading_db()
+    recovered_sessions = auto_trading_store.recover_overdue_active_sessions()
     initialize_universe_db()
-    calibration_result = calibrate_edge_model_if_due()
-    fill_adjustment = record_fill_adjustment_from_fills()
+    label_refresh = _safe_step("edge_label_refresh", refresh_edge_training_samples)
+    calibration_result = _safe_step("edge_calibration", calibrate_edge_model_if_due)
+    fill_adjustment = _safe_step("fill_adjustment", record_fill_adjustment_from_fills)
 
     sessions = auto_trading_store.list_sessions(status="active", limit=session_limit)
     if not sessions:
@@ -33,6 +36,8 @@ def run_trade_orchestrator_once(
             "status": "idle",
             "worker_id": worker_id,
             "message": "No active auto-trading sessions",
+            "label_refresh": label_refresh,
+            "recovered_session_count": len(recovered_sessions),
             "edge_calibration": calibration_result,
             "fill_adjustment": fill_adjustment,
             "session_count": 0,
@@ -44,14 +49,36 @@ def run_trade_orchestrator_once(
         include_expired=True,
     )
     if not active_candidates:
+        results: list[dict[str, Any]] = []
+        for session in sessions:
+            session_id = session["session_id"]
+            result = {
+                "status": "blocked",
+                "message": "scanner_candidates is empty; no orchestrated exit or entry attempted",
+                "active_candidate_symbols": [],
+                "planned_exit_count": 0,
+                "planned_entry_count": 0,
+                "planned_exits": [],
+                "planned_entries": [],
+                "entry_gate": None,
+                "results": [],
+            }
+            _complete_orchestrator_session(
+                session_id=session_id,
+                result=result,
+                event_type="orchestrator_completed",
+            )
+            results.append({"session_id": session_id, **result})
         return {
-            "status": "idle",
+            "status": "blocked",
             "worker_id": worker_id,
             "message": "scanner_candidates is empty; no orchestrated exit or entry attempted",
+            "label_refresh": label_refresh,
+            "recovered_session_count": len(recovered_sessions),
             "edge_calibration": calibration_result,
             "fill_adjustment": fill_adjustment,
             "session_count": len(sessions),
-            "results": [],
+            "results": results,
         }
 
     results: list[dict[str, Any]] = []
@@ -65,13 +92,10 @@ def run_trade_orchestrator_once(
                 session_id=session_id,
                 execute_entries=settings.trade_orchestrator_execute_entries,
             )
-            auto_trading_store.record_session_event(
-                session_id,
+            _complete_orchestrator_session(
+                session_id=session_id,
+                result=result,
                 event_type="orchestrator_completed",
-                status=result["status"],
-                message=result["message"],
-                results=[result],
-                update_last_results=True,
             )
             results.append(
                 {
@@ -81,19 +105,26 @@ def run_trade_orchestrator_once(
             )
         except Exception as exc:
             message = f"Trade orchestrator failed: {exc}"
-            auto_trading_store.record_session_event(
-                session_id,
+            result = {
+                "status": "error",
+                "message": message,
+                "active_candidate_symbols": [],
+                "planned_exit_count": 0,
+                "planned_entry_count": 0,
+                "planned_exits": [],
+                "planned_entries": [],
+                "entry_gate": None,
+                "results": [],
+            }
+            _complete_orchestrator_session(
+                session_id=session_id,
+                result=result,
                 event_type="orchestrator_failed",
-                status="error",
-                message=message,
-                results=[],
-                update_last_results=False,
             )
             results.append(
                 {
                     "session_id": session_id,
-                    "status": "error",
-                    "message": message,
+                    **result,
                 }
             )
 
@@ -106,6 +137,8 @@ def run_trade_orchestrator_once(
     return {
         "status": status,
         "worker_id": worker_id,
+        "label_refresh": label_refresh,
+        "recovered_session_count": len(recovered_sessions),
         "edge_calibration": calibration_result,
         "fill_adjustment": fill_adjustment,
         "session_count": len(sessions),
@@ -113,3 +146,31 @@ def run_trade_orchestrator_once(
         "candidate_symbols": [item.get("symbol") for item in active_candidates],
         "results": results,
     }
+
+
+def _complete_orchestrator_session(
+    *,
+    session_id: str,
+    result: dict[str, Any],
+    event_type: str,
+) -> None:
+    auto_trading_store.complete_cycle(session_id, [result])
+    auto_trading_store.record_session_event(
+        session_id,
+        event_type=event_type,
+        status=str(result.get("status") or "unknown"),
+        message=str(result.get("message") or ""),
+        results=[result],
+        update_last_results=False,
+    )
+
+
+def _safe_step(name: str, fn) -> dict[str, Any]:
+    try:
+        return fn()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "step": name,
+            "message": str(exc),
+        }

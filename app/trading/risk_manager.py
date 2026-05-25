@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 import json
-from pathlib import Path
 import sqlite3
 from typing import Any
 
@@ -369,7 +368,7 @@ def _latest_atr_pct(req: PaperRunRequest) -> float | None:
         value = _to_float(req.expected_loss_bps)
         if value is not None and value > 0:
             return value / 10_000
-    path = Path(settings.universe_scanner_db_path)
+    path = settings.storage_path(settings.universe_scanner_db_path)
     if not path.exists():
         return None
     try:
@@ -437,7 +436,7 @@ def _max_portfolio_correlation(
 
 
 def _recent_snapshot_returns(symbol: str, limit: int = 80) -> list[float]:
-    path = Path(settings.universe_scanner_db_path)
+    path = settings.storage_path(settings.universe_scanner_db_path)
     if not path.exists():
         return []
     try:
@@ -712,7 +711,9 @@ def _abnormal_price(req: PaperRunRequest) -> dict[str, str] | None:
 
 
 def _emergency_stop_active() -> bool:
-    return bool(settings.emergency_stop) or Path(settings.emergency_stop_file).exists()
+    return bool(settings.emergency_stop) or settings.storage_path(
+        settings.emergency_stop_file
+    ).exists()
 
 
 def _performance_rejection(

@@ -14,6 +14,11 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 3)
     monkeypatch.setattr(
         universe_scanner.settings,
+        "universe_scanner_worker_hurdle_rate_bps",
+        0,
+    )
+    monkeypatch.setattr(
+        universe_scanner.settings,
         "universe_scanner_symbol_interval_seconds",
         0,
     )
@@ -41,6 +46,21 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
             "volume_ratio": 2.4,
             "turnover_value": 700_000_000_000,
             "intraday": {"minute_volume_ratio": 2.0},
+            "latest_technical_features": {
+                "close": 70000,
+                "return_5d": 0.04,
+                "return_20d": 0.08,
+                "return_60d": 0.18,
+                "high_breakout_20d": True,
+                "low_breakdown_20d": False,
+                "ma20_slope": 350,
+                "atr_14": 1000,
+                "atr_14_pct": 1000 / 70000,
+            },
+            "technical_features": [
+                {"close": 69000, "atr_14": 1000},
+                {"close": 70500, "atr_14": 1000},
+            ],
             "overheated": False,
             "source": "test",
         },
@@ -52,6 +72,17 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
             "volume_ratio": 1.6,
             "turnover_value": 540_000_000_000,
             "intraday": {"minute_volume_ratio": 1.1},
+            "latest_technical_features": {
+                "close": 180000,
+                "return_5d": 0.01,
+                "return_20d": 0.02,
+                "return_60d": 0.04,
+                "high_breakout_20d": False,
+                "low_breakdown_20d": False,
+                "ma20_slope": 100,
+                "atr_14": 5000,
+                "atr_14_pct": 5000 / 180000,
+            },
             "overheated": False,
             "source": "test",
         },
@@ -63,6 +94,17 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
             "volume_ratio": 0.4,
             "turnover_value": 35_000_000_000,
             "intraday": {},
+            "latest_technical_features": {
+                "close": 350000,
+                "return_5d": -0.04,
+                "return_20d": -0.09,
+                "return_60d": -0.12,
+                "high_breakout_20d": False,
+                "low_breakdown_20d": True,
+                "ma20_slope": -3000,
+                "atr_14": 20000,
+                "atr_14_pct": 20000 / 350000,
+            },
             "overheated": False,
             "source": "test",
         },
@@ -99,12 +141,130 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
     assert result["symbols"][0].symbol == "005930"
     assert result["symbols"][0].account_equity == 10_000_000
     assert result["symbols"][0].risk_per_trade == 0.005
-    assert result["symbols"][0].stop_loss == 70000 * 0.97
+    assert result["symbols"][0].stop_loss == 70000 - 1.8 * 1000
+    assert result["symbols"][0].take_profit == 70000 + 2.5 * (1.8 * 1000)
+    assert result["symbols"][0].trailing_stop == 70500 - 2.0 * 1000
     assert result["symbols"][0].strategy_type == "swing"
     assert result["symbols"][0].expected_gross_edge_bps is not None
     assert latest["scan_id"] == result["scan_id"]
     assert latest["candidates"][0]["symbol"] == "005930"
     assert latest["candidates"][0]["net_edge"] > result["worker_hurdle_rate"]
+
+
+def test_high_quality_swing_candidate_lifts_fill_adjusted_edge(monkeypatch):
+    monkeypatch.setattr(
+        universe_scanner,
+        "estimate_expected_edges",
+        lambda candidate, raw_score, model=None: {
+            "expected_return": 0.0,
+            "expected_risk": 280.0,
+            "edge_model": "calibrated_test",
+        },
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "get_latest_market_context",
+        lambda: {
+            "market_regime": "bull",
+            "risk_on_score": 72,
+            "selected_sector_relative_strength": {"score": 70},
+        },
+    )
+    candidate = {
+        "symbol": "005930",
+        "name": "Samsung Electronics",
+        "score": 88,
+        "decision": "buy_candidate",
+        "current_price": 70_000,
+        "change_rate": 2.4,
+        "volume": 12_000_000,
+        "volume_ratio": 2.6,
+        "turnover_value": 840_000_000_000,
+        "sector": "semiconductors",
+        "intraday": {"minute_volume_ratio": 1.6},
+        "latest_technical_features": {
+            "close": 70_000,
+            "return_5d": 0.04,
+            "return_20d": 0.11,
+            "return_60d": 0.18,
+            "high_breakout_20d": True,
+            "low_breakdown_20d": False,
+            "ma20_slope": 420,
+            "atr_14": 1_800,
+            "atr_14_pct": 1_800 / 70_000,
+        },
+        "technical_features": [
+            {"close": 69_500, "atr_14": 1_800},
+            {"close": 72_000, "atr_14": 1_800},
+        ],
+        "overheated": False,
+    }
+
+    scored = universe_scanner._with_expected_value_scores(
+        candidate,
+        expires_at="2026-05-25T10:00:00",
+        edge_model={"expected_return": {"bias": 0.0}, "expected_risk": {"bias": 280.0}},
+    )
+
+    assert scored["edge_quality_score"] >= 75
+    assert scored["edge_reward_risk"]["gross_return_floor_bps"] > 300
+    assert scored["net_edge"] >= 30
+    assert "atr_rr" in scored["edge_model"]
+
+
+def test_universe_scanner_uses_fast_price_fetch_and_caps_symbol_sleep(monkeypatch):
+    calls: list[tuple[str, bool]] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_symbol_interval_seconds", 60.0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_symbol_interval_cap_seconds", 0.01)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_intraday_enrichment_enabled", False)
+    monkeypatch.setattr(universe_scanner.time_module, "sleep", lambda seconds: sleeps.append(seconds))
+
+    def fake_fetch_price_data(symbol, *, include_intraday=True):
+        calls.append((symbol, include_intraday))
+        return {
+            "symbol": symbol,
+            "current_price": 10_000,
+            "latest_technical_features": {},
+        }
+
+    monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
+
+    snapshots = universe_scanner._collect_price_snapshots(
+        {"005930": "Samsung", "000660": "SK hynix"}
+    )
+
+    assert [item["symbol"] for item in snapshots] == ["005930", "000660"]
+    assert calls == [("005930", False), ("000660", False)]
+    assert sleeps == [0.01]
+
+
+def test_universe_scanner_skips_network_enrichment_when_disabled(monkeypatch):
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_news_enrichment_enabled", False)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_disclosure_enrichment_enabled", False)
+    monkeypatch.setattr(
+        universe_scanner,
+        "search_naver_news",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("news should be skipped")),
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "fetch_opendart_disclosures",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("disclosure should be skipped")),
+    )
+
+    enriched = universe_scanner._enrich_candidate(
+        {
+            "symbol": "005930",
+            "name": "Samsung",
+            "score": 80,
+            "decision": "buy_candidate",
+        }
+    )
+
+    assert enriched["news_count"] == 0
+    assert enriched["disclosure_count"] == 0
+    assert enriched["enrichment_errors"] == []
 
 
 def test_auto_trading_empty_symbols_runs_universe_scanner(monkeypatch):

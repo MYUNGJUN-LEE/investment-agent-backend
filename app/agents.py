@@ -15,9 +15,10 @@ from app.data_sources.news import fetch_news
 from app.data_sources.financials import fetch_financial_data
 from app.data_sources.kis import fetch_price_data
 from app.data_sources.market_context import fetch_market_context
+from app.trading.atr_exits import atr_exit_levels_from_price_data
 
 
-RISK_PROFILES = {
+DAYTRADE_RISK_PROFILES = {
     "low": {
         "entry_final_score": 78,
         "entry_risk_max": 45,
@@ -67,6 +68,51 @@ RISK_PROFILES = {
         "spread_pct_max": 0.8,
     },
 }
+
+
+SWING_RISK_PROFILES = {
+    "low": {
+        **DAYTRADE_RISK_PROFILES["low"],
+        "entry_final_score": 76,
+        "swing_entry_score_min": 68,
+        "swing_momentum_hits_min": 3,
+        "return_5d_min": 0.0,
+        "return_20d_min": 0.02,
+        "return_60d_min": 0.04,
+        "max_atr_14_pct": 0.075,
+        "min_risk_on_score": 45,
+        "sector_score_min": 50,
+        "block_bear_regime": True,
+    },
+    "medium": {
+        **DAYTRADE_RISK_PROFILES["medium"],
+        "entry_final_score": 73,
+        "swing_entry_score_min": 63,
+        "swing_momentum_hits_min": 2,
+        "return_5d_min": 0.0,
+        "return_20d_min": 0.0,
+        "return_60d_min": 0.02,
+        "max_atr_14_pct": 0.09,
+        "min_risk_on_score": 38,
+        "sector_score_min": 45,
+        "block_bear_regime": True,
+    },
+    "high": {
+        **DAYTRADE_RISK_PROFILES["high"],
+        "entry_final_score": 68,
+        "swing_entry_score_min": 58,
+        "swing_momentum_hits_min": 2,
+        "return_5d_min": -0.02,
+        "return_20d_min": -0.02,
+        "return_60d_min": 0.0,
+        "max_atr_14_pct": 0.11,
+        "min_risk_on_score": 30,
+        "sector_score_min": 40,
+        "block_bear_regime": False,
+    },
+}
+
+RISK_PROFILES = DAYTRADE_RISK_PROFILES
 
 
 def run_research_agent(req: PipelineRequest) -> dict[str, Any]:
@@ -171,7 +217,14 @@ def run_chart_flow_agent(
     financial_result: dict[str, Any],
 ) -> dict[str, Any]:
     price_data = fetch_price_data(req.symbol)
-    market_context = fetch_market_context(symbol=req.symbol, persist=True)
+    market_context = fetch_market_context(symbol=req.symbol, sector=req.sector, persist=True)
+    if req.strategy_type == "swing":
+        return _run_swing_chart_flow_agent(
+            req=req,
+            price_data=price_data,
+            market_context=market_context,
+        )
+
     score = score_chart_flow(price_data)
 
     data_needed = []
@@ -185,7 +238,7 @@ def run_chart_flow_agent(
     volume_ratio = price_data.get("volume_ratio")
     price_position = price_data.get("price_position") or {}
     intraday = price_data.get("intraday") or {}
-    profile = _risk_profile(req.risk_level)
+    profile = _risk_profile(req.risk_level, req.strategy_type)
     trend = price_data.get("trend")
     trend_ok = trend == "uptrend" or (
         profile["allow_sideways_entry"] and trend == "sideways"
@@ -229,6 +282,7 @@ def run_chart_flow_agent(
     market_view = _market_context_view(market_context)
     if market_view:
         flow_view = f"{flow_view}; {market_view}" if flow_view else market_view
+    stop_loss_candidates, take_profit_candidates = _atr_exit_candidates(price_data)
 
     return {
         "chart_flow_score": score,
@@ -242,16 +296,67 @@ def run_chart_flow_agent(
         "flow_view": flow_view,
         "entry_conditions": entry_conditions,
         "avoid_conditions": avoid_conditions,
-        "stop_loss_candidates": [
-            "VWAP 이탈",
-            "직전 저점 이탈",
-            "-2% 손실 도달",
-        ],
-        "take_profit_candidates": [
-            "+3~5% 구간 분할익절",
-            "거래량 둔화",
-            "대장주 반락",
-        ],
+        "stop_loss_candidates": stop_loss_candidates,
+        "take_profit_candidates": take_profit_candidates,
+        "data_needed": data_needed,
+        "price_data": price_data,
+        "market_context": market_context,
+    }
+
+
+def _run_swing_chart_flow_agent(
+    *,
+    req: PipelineRequest,
+    price_data: dict[str, Any],
+    market_context: dict[str, Any],
+) -> dict[str, Any]:
+    data_needed = []
+    if price_data.get("status") != "connected":
+        data_needed.append("KIS daily candles and current price")
+    elif price_data.get("optional_errors"):
+        data_needed.extend(price_data.get("optional_errors", []))
+    if market_context.get("status") not in {"connected", "partial"}:
+        data_needed.append("Daily market regime and sector relative-strength data")
+
+    profile = _risk_profile(req.risk_level, req.strategy_type)
+    technical = price_data.get("latest_technical_features") or {}
+    score = _score_swing_chart_flow(price_data, market_context)
+    market_context_ok = _swing_market_context_entry_ok(market_context, profile)
+    daily_ok = _swing_daily_ok(technical, profile)
+    entry_signal = (
+        price_data.get("status") == "connected"
+        and score >= profile["swing_entry_score_min"]
+        and daily_ok
+        and market_context_ok
+        and not bool(price_data.get("overheated"))
+    )
+    exit_signal = _swing_exit_signal(price_data, market_context)
+    stop_loss_candidates, take_profit_candidates = _atr_exit_candidates(price_data)
+
+    return {
+        "chart_flow_score": score,
+        "trend": price_data.get("trend") or "unknown",
+        "entry_signal": entry_signal,
+        "exit_signal": exit_signal,
+        "overheated": bool(price_data.get("overheated")),
+        "support_levels": price_data.get("support_levels", []),
+        "resistance_levels": price_data.get("resistance_levels", []),
+        "volume_view": _volume_view(price_data.get("volume_ratio")),
+        "flow_view": _swing_flow_view(technical, market_context),
+        "entry_conditions": _swing_entry_conditions(
+            technical,
+            price_data,
+            market_context,
+            profile,
+        ),
+        "avoid_conditions": _swing_avoid_conditions(
+            technical,
+            price_data,
+            market_context,
+            market_context_ok,
+        ),
+        "stop_loss_candidates": stop_loss_candidates,
+        "take_profit_candidates": take_profit_candidates,
         "data_needed": data_needed,
         "price_data": price_data,
         "market_context": market_context,
@@ -365,7 +470,7 @@ def run_final_check_agent(
         chart_flow_score=chart_flow_score,
         risk_score=risk_score,
     )
-    profile = _risk_profile(req.risk_level)
+    profile = _risk_profile(req.risk_level, req.strategy_type)
 
     if final_score >= profile["entry_final_score"] and risk_score <= profile["entry_risk_max"]:
         final_grade = "공격"
@@ -660,6 +765,289 @@ def _score_stability(metrics: dict[str, Any]) -> float | None:
     return clamp_score(80 - max(0, debt_ratio - 100) * 0.2)
 
 
+def _score_swing_chart_flow(
+    price_data: dict[str, Any],
+    market_context: dict[str, Any],
+) -> float:
+    if not price_data or price_data.get("status") != "connected":
+        return 50.0
+
+    score = 50.0
+    technical = price_data.get("latest_technical_features") or {}
+    price_position = price_data.get("price_position") or {}
+
+    return_5d = _as_float(technical.get("return_5d"))
+    return_20d = _as_float(technical.get("return_20d"))
+    return_60d = _as_float(technical.get("return_60d"))
+    score += _swing_return_points(return_5d, short_window=True)
+    score += _swing_return_points(return_20d)
+    score += _swing_return_points(return_60d)
+
+    if technical.get("high_breakout_20d"):
+        score += 12
+    if technical.get("low_breakdown_20d"):
+        score -= 14
+
+    ma20_slope = _as_float(technical.get("ma20_slope"))
+    if ma20_slope is not None:
+        score += 9 if ma20_slope > 0 else -9
+    if price_position.get("above_ma20"):
+        score += 6
+    ma60 = _as_float(technical.get("ma60"))
+    close = _as_float(technical.get("close")) or _as_float(price_data.get("current_price"))
+    if close is not None and ma60 is not None:
+        score += 6 if close >= ma60 else -6
+
+    atr_pct = _as_float(technical.get("atr_14_pct"))
+    if atr_pct is not None:
+        if 0.015 <= atr_pct <= 0.075:
+            score += 7
+        elif atr_pct > 0.11:
+            score -= 14
+        elif atr_pct < 0.008:
+            score -= 3
+
+    volume_ratio = _as_float(price_data.get("volume_ratio"))
+    if volume_ratio is not None:
+        if 1.1 <= volume_ratio <= 4:
+            score += 4
+        elif volume_ratio > 6:
+            score -= 5
+
+    score += _market_regime_points(market_context)
+    score += _sector_strength_points(market_context)
+    if price_data.get("overheated"):
+        score -= 8
+
+    return clamp_score(score)
+
+
+def _swing_daily_ok(technical: dict[str, Any], profile: dict[str, Any]) -> bool:
+    if technical.get("low_breakdown_20d"):
+        return False
+
+    hits = 0
+    for key, threshold in (
+        ("return_5d", profile["return_5d_min"]),
+        ("return_20d", profile["return_20d_min"]),
+        ("return_60d", profile["return_60d_min"]),
+    ):
+        value = _as_float(technical.get(key))
+        if value is not None and value >= threshold:
+            hits += 1
+    if technical.get("high_breakout_20d"):
+        hits += 1
+    if hits < profile["swing_momentum_hits_min"]:
+        return False
+
+    ma20_slope = _as_float(technical.get("ma20_slope"))
+    if ma20_slope is not None and ma20_slope <= 0:
+        return False
+
+    atr_pct = _as_float(technical.get("atr_14_pct"))
+    if atr_pct is not None and atr_pct > profile["max_atr_14_pct"]:
+        return False
+    return True
+
+
+def _swing_market_context_entry_ok(
+    market_context: dict[str, Any],
+    profile: dict[str, Any],
+) -> bool:
+    if market_context.get("status") not in {"connected", "partial"}:
+        return True
+
+    risk_on_score = _as_float(market_context.get("risk_on_score"))
+    if risk_on_score is not None and risk_on_score < profile["min_risk_on_score"]:
+        return False
+
+    if profile["block_bear_regime"] and market_context.get("market_regime") == "bear":
+        return False
+
+    selected_sector = market_context.get("selected_sector_relative_strength") or {}
+    sector_score = _as_float(selected_sector.get("score"))
+    if sector_score is not None and sector_score < profile["sector_score_min"]:
+        return False
+    return True
+
+
+def _swing_exit_signal(
+    price_data: dict[str, Any],
+    market_context: dict[str, Any],
+) -> bool:
+    if price_data.get("status") != "connected":
+        return False
+    technical = price_data.get("latest_technical_features") or {}
+    return_5d = _as_float(technical.get("return_5d"))
+    ma20_slope = _as_float(technical.get("ma20_slope"))
+    return bool(
+        technical.get("low_breakdown_20d")
+        or (return_5d is not None and return_5d <= -0.06)
+        or (
+            ma20_slope is not None
+            and ma20_slope < 0
+            and not (price_data.get("price_position") or {}).get("above_ma20")
+        )
+        or _market_context_exit_signal(market_context)
+    )
+
+
+def _swing_entry_conditions(
+    technical: dict[str, Any],
+    price_data: dict[str, Any],
+    market_context: dict[str, Any],
+    profile: dict[str, Any],
+) -> list[str]:
+    conditions = [
+        f"Swing score >= {profile['swing_entry_score_min']}",
+        "5/20/60d momentum profile passes",
+        "ATR14 risk band is acceptable",
+    ]
+    if technical.get("high_breakout_20d"):
+        conditions.append("20d high breakout")
+    if _gte(_as_float(technical.get("ma20_slope")), 0):
+        conditions.append("MA20 slope positive")
+    if (price_data.get("price_position") or {}).get("above_ma20"):
+        conditions.append("Close above MA20")
+    selected_sector = market_context.get("selected_sector_relative_strength") or {}
+    if _as_float(selected_sector.get("score")) is not None:
+        conditions.append(f"Sector relative strength score {selected_sector.get('score')}")
+    if market_context.get("status") in {"connected", "partial"}:
+        conditions.append(
+            f"Market regime {market_context.get('market_regime', 'unknown')}, "
+            f"risk-on score {market_context.get('risk_on_score')}"
+        )
+    return list(dict.fromkeys(conditions))
+
+
+def _swing_avoid_conditions(
+    technical: dict[str, Any],
+    price_data: dict[str, Any],
+    market_context: dict[str, Any],
+    market_context_ok: bool,
+) -> list[str]:
+    conditions = []
+    if technical.get("low_breakdown_20d"):
+        conditions.append("20d low breakdown")
+    if _lt(_as_float(technical.get("return_20d")), 0):
+        conditions.append("Negative 20d momentum")
+    if _lt(_as_float(technical.get("ma20_slope")), 0):
+        conditions.append("MA20 slope negative")
+    atr_pct = _as_float(technical.get("atr_14_pct"))
+    if atr_pct is not None and atr_pct > 0.11:
+        conditions.append("ATR14 volatility too high")
+    if price_data.get("overheated"):
+        conditions.append("Overheated move")
+    if not market_context_ok:
+        conditions.append(
+            f"Weak market/sector context: {market_context.get('market_regime', 'unknown')}"
+        )
+    return list(dict.fromkeys(conditions))
+
+
+def _swing_flow_view(
+    technical: dict[str, Any],
+    market_context: dict[str, Any],
+) -> str:
+    parts = []
+    for key, label in (
+        ("return_5d", "5d"),
+        ("return_20d", "20d"),
+        ("return_60d", "60d"),
+    ):
+        value = _as_float(technical.get(key))
+        if value is not None:
+            parts.append(f"{label} momentum {value * 100:.1f}%")
+    if technical.get("high_breakout_20d"):
+        parts.append("20d high breakout")
+    if _as_float(technical.get("atr_14_pct")) is not None:
+        parts.append(f"ATR14 {_as_float(technical.get('atr_14_pct')) * 100:.1f}%")
+    if market_context.get("status") in {"connected", "partial"}:
+        parts.append(
+            f"market {market_context.get('market_regime', 'unknown')} "
+            f"({market_context.get('risk_on_score')})"
+        )
+    return ", ".join(parts) if parts else "Swing daily profile data unavailable"
+
+
+def _atr_exit_candidates(price_data: dict[str, Any]) -> tuple[list[str], list[str]]:
+    entry = _as_float(price_data.get("current_price"))
+    if entry is None:
+        latest = price_data.get("latest_technical_features") or {}
+        entry = _as_float(latest.get("close"))
+    levels = atr_exit_levels_from_price_data(entry_price=entry, price_data=price_data)
+    atr14 = levels.get("atr_14")
+    if entry is None or atr14 is None:
+        return (
+            ["ATR14 unavailable; use a confirmed support break as the fallback stop"],
+            ["ATR14 unavailable; defer target until ATR14 is available"],
+        )
+
+    stop_candidates = [
+        f"ATR14 stop: {levels['stop_loss']} = entry - 1.8 * ATR14",
+    ]
+    if levels.get("trailing_stop") is not None:
+        stop_candidates.append(
+            f"Trailing stop after profit: {levels['trailing_stop']} = highest_close - 2.0 * ATR14"
+        )
+    else:
+        stop_candidates.append("Activate trailing stop after profit: highest_close - 2.0 * ATR14")
+    take_candidates = [
+        f"ATR R target: {levels['take_profit']} = entry + 2.5R",
+        "Scale out only if target zone is reached with weakening volume/momentum",
+    ]
+    return stop_candidates, take_candidates
+
+
+def _swing_return_points(value: float | None, *, short_window: bool = False) -> float:
+    if value is None:
+        return 0.0
+    if short_window:
+        if 0 <= value <= 0.12:
+            return 8
+        if value > 0.12:
+            return 3
+        return -8 if value < -0.04 else -3
+    if 0.03 <= value <= 0.30:
+        return 10
+    if 0 <= value < 0.03:
+        return 4
+    if value > 0.30:
+        return 4
+    return -10 if value < -0.08 else -5
+
+
+def _market_regime_points(market_context: dict[str, Any]) -> float:
+    if market_context.get("status") not in {"connected", "partial"}:
+        return 0.0
+    regime = market_context.get("market_regime")
+    score = 0.0
+    if regime in {"bull", "risk_on", "uptrend", "strong"}:
+        score += 8
+    elif regime in {"bear", "risk_off", "downtrend", "weak"}:
+        score -= 12
+    risk_on_score = _as_float(market_context.get("risk_on_score"))
+    if risk_on_score is not None:
+        score += (risk_on_score - 50) * 0.25
+    return score
+
+
+def _sector_strength_points(market_context: dict[str, Any]) -> float:
+    selected = market_context.get("selected_sector_relative_strength") or {}
+    sector_score = _as_float(selected.get("score"))
+    if sector_score is None:
+        return 0.0
+    if sector_score >= 65:
+        return 10
+    if sector_score >= 55:
+        return 5
+    if sector_score <= 35:
+        return -10
+    if sector_score <= 45:
+        return -5
+    return 0.0
+
+
 def _volume_view(volume_ratio: Any) -> str:
     if not isinstance(volume_ratio, (int, float)):
         return "거래량 비율 계산 불가"
@@ -672,5 +1060,15 @@ def _volume_view(volume_ratio: Any) -> str:
     return "평균 수준 거래량"
 
 
-def _risk_profile(risk_level: str) -> dict[str, Any]:
-    return RISK_PROFILES.get(risk_level, RISK_PROFILES["medium"])
+def _as_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _risk_profile(risk_level: str, strategy_type: str = "daytrade") -> dict[str, Any]:
+    profiles = SWING_RISK_PROFILES if strategy_type == "swing" else DAYTRADE_RISK_PROFILES
+    return profiles.get(risk_level, profiles["medium"])

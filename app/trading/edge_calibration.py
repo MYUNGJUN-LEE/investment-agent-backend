@@ -155,6 +155,50 @@ def calibrate_edge_model_if_due(
     )
 
 
+def refresh_edge_training_samples(
+    *,
+    universe_db_path: Path | str | None = None,
+    calibration_db_path: Path | str | None = None,
+    horizon_seconds: int | None = None,
+    candidate_limit: int | None = None,
+) -> dict[str, Any]:
+    """Persist realized labels for scanner predictions without refitting the model."""
+    if not settings.edge_calibration_enabled:
+        return {"status": "disabled", "message": "Edge calibration is disabled"}
+
+    universe_path = settings.storage_path(
+        universe_db_path or settings.universe_scanner_db_path
+    )
+    calibration_path = _db_path(calibration_db_path)
+    if not universe_path.exists():
+        return {
+            "status": "empty",
+            "message": "Universe scanner DB does not exist yet",
+            "examined_count": 0,
+            "inserted_count": 0,
+            "skipped_count": 0,
+            "stored_sample_count": _stored_sample_count(calibration_path),
+        }
+
+    refresh_result = _refresh_training_samples(
+        calibration_path=calibration_path,
+        universe_path=universe_path,
+        horizon_seconds=max(
+            60,
+            int(horizon_seconds or settings.edge_calibration_horizon_seconds or 86400),
+        ),
+        candidate_limit=max(
+            1,
+            int(candidate_limit or settings.edge_calibration_target_samples or 1000),
+        ),
+    )
+    return {
+        "status": "success",
+        **refresh_result,
+        "stored_sample_count": _stored_sample_count(calibration_path),
+    }
+
+
 def calibrate_edge_model(
     *,
     universe_db_path: Path | str | None = None,
@@ -164,7 +208,9 @@ def calibrate_edge_model(
 ) -> dict[str, Any]:
     """Fit tiny ridge models from scanner history without loading large frames."""
     calibration_path = _db_path(calibration_db_path)
-    universe_path = Path(universe_db_path or settings.universe_scanner_db_path)
+    universe_path = settings.storage_path(
+        universe_db_path or settings.universe_scanner_db_path
+    )
     initialize_edge_calibration_db(calibration_path)
     now = _now()
     _write_meta(calibration_path, "last_attempt_at", now)
@@ -515,13 +561,13 @@ def record_fill_adjustment_from_fills(
     fill_events: list[dict[str, float]] = []
     fill_events.extend(
         _paper_fill_quality_events(
-            Path(paper_db_path or paper_trading.DEFAULT_DB_PATH),
+            settings.storage_path(paper_db_path or paper_trading.DEFAULT_DB_PATH),
             limit=limit,
         )
     )
     fill_events.extend(
         _broker_fill_quality_events(
-            Path(broker_db_path or settings.broker_sync_db_path),
+            settings.storage_path(broker_db_path or settings.broker_sync_db_path),
             limit=limit,
         )
     )
@@ -1412,4 +1458,4 @@ def _now() -> str:
 
 
 def _db_path(db_path: Path | str | None = None) -> Path:
-    return Path(db_path or settings.edge_calibration_db_path)
+    return settings.storage_path(db_path or settings.edge_calibration_db_path)

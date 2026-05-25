@@ -107,6 +107,16 @@ def test_live_order_requires_decision_price(monkeypatch):
     assert response.status_code == 422
 
 
+def test_live_order_risk_request_preserves_strategy_type():
+    req = live_trading.LiveOrderRequest(
+        **_payload(strategy_type="swing", stop_loss=72000, take_profit=82000)
+    )
+
+    paper_req = live_trading._to_paper_risk_request(req)
+
+    assert paper_req.strategy_type == "swing"
+
+
 def test_live_order_must_pass_risk_manager(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "enable_live_trading", True)
     monkeypatch.setattr(settings, "kis_is_paper", False)

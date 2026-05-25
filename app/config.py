@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -10,8 +11,16 @@ class Settings(BaseSettings):
     backend_api_key: str | None = None
     action_schema_public_url: str | None = None
 
-    # Comma-separated browser origins allowed to call this API.
-    cors_allow_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    # Comma-separated browser/GPT origins allowed to call this API.
+    cors_allow_origins: str = (
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "https://chat.openai.com,https://chatgpt.com,https://www.chatgpt.com"
+    )
+
+    # Persistent storage. On Render, mount the disk and set either DATA_DIR or
+    # RENDER_DISK_MOUNT_PATH. If unset, common Render disk paths are detected.
+    data_dir: str | None = None
+    render_disk_mount_path: str | None = None
 
     # External APIs
     opendart_api_key: str | None = None
@@ -100,8 +109,6 @@ class Settings(BaseSettings):
     monitor_surge_change_pct: float = 5.0
     monitor_drop_change_pct: float = -5.0
     monitor_volume_spike_ratio: float = 3.0
-    monitor_default_stop_loss_pct: float = 3.0
-    monitor_default_take_profit_pct: float = 5.0
     monitor_news_display: int = 20
     broker_sync_interval_seconds: int = 60
     broker_sync_config_error_backoff_seconds: int = 900
@@ -115,7 +122,11 @@ class Settings(BaseSettings):
     universe_scanner_candidate_limit: int = 20
     universe_scanner_final_limit: int = 10
     universe_scanner_max_source_symbols: int = 15
-    universe_scanner_symbol_interval_seconds: float = 60.0
+    universe_scanner_symbol_interval_seconds: float = 0.0
+    universe_scanner_symbol_interval_cap_seconds: float = 2.0
+    universe_scanner_intraday_enrichment_enabled: bool = False
+    universe_scanner_news_enrichment_enabled: bool = False
+    universe_scanner_disclosure_enrichment_enabled: bool = False
     universe_scanner_min_scanned_symbols_for_trading: int = 15
     universe_scanner_candidate_ttl_seconds: int = 3600
     universe_scanner_worker_hurdle_rate_bps: float = 50.0
@@ -123,6 +134,39 @@ class Settings(BaseSettings):
     universe_scanner_default_slippage_bps: float = 10.0
     embedded_workers_enabled: bool = os.getenv("RENDER_SERVICE_TYPE") == "web"
     embedded_worker_broker_sync_enabled: bool = True
+
+    def storage_root(self) -> Path | None:
+        """Return the persistent storage root when one is configured/attached."""
+        for raw in (
+            self.data_dir,
+            self.render_disk_mount_path,
+            os.getenv("DATA_DIR"),
+            os.getenv("APP_DATA_DIR"),
+            os.getenv("RENDER_DISK_MOUNT_PATH"),
+            os.getenv("RENDER_PERSISTENT_DISK_PATH"),
+            os.getenv("PERSISTENT_DISK_PATH"),
+        ):
+            if raw:
+                return Path(raw).expanduser()
+
+        if (
+            os.getenv("RENDER")
+            or os.getenv("RENDER_SERVICE_ID")
+            or os.getenv("RENDER_SERVICE_TYPE")
+        ):
+            for raw in ("/var/data", "/data"):
+                candidate = Path(raw)
+                if candidate.exists():
+                    return candidate
+        return None
+
+    def storage_path(self, value: str | Path) -> Path:
+        """Resolve relative DB/cache paths onto persistent storage when present."""
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            return path
+        root = self.storage_root()
+        return root / path if root else path
 
     model_config = SettingsConfigDict(
         env_file=".env",

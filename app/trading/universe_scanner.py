@@ -13,11 +13,13 @@ from app.data_sources.kis import fetch_price_data
 from app.data_sources.opendart import fetch_opendart_disclosures
 from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.services.naver_news import search_naver_news
+from app.storage.market_data import get_latest_market_context
 from app.trading.edge_calibration import (
     edge_entry_gate,
     estimate_expected_edges,
     load_edge_model,
 )
+from app.trading.atr_exits import atr_exit_levels_from_price_data
 from app.trading import paper_trading
 
 
@@ -408,15 +410,12 @@ def _resolve_source_symbols(req: AutoTradeStartRequest) -> dict[str, str | None]
 
 def _collect_price_snapshots(source_symbols: dict[str, str | None]) -> list[dict[str, Any]]:
     snapshots: list[dict[str, Any]] = []
-    symbol_interval_seconds = max(
-        0.0,
-        float(settings.universe_scanner_symbol_interval_seconds or 0),
-    )
+    symbol_interval_seconds = _scanner_symbol_interval_seconds()
     for index, (symbol, name) in enumerate(source_symbols.items()):
         if index and symbol_interval_seconds:
             time_module.sleep(symbol_interval_seconds)
         try:
-            price_data = fetch_price_data(symbol)
+            price_data = _fetch_scanner_price_data(symbol)
         except Exception as exc:
             price_data = {
                 "status": "error",
@@ -429,6 +428,32 @@ def _collect_price_snapshots(source_symbols: dict[str, str | None]) -> list[dict
     return snapshots
 
 
+def _scanner_symbol_interval_seconds() -> float:
+    configured = max(
+        0.0,
+        float(settings.universe_scanner_symbol_interval_seconds or 0.0),
+    )
+    cap = max(
+        0.0,
+        float(settings.universe_scanner_symbol_interval_cap_seconds or 0.0),
+    )
+    if cap <= 0:
+        return configured
+    return min(configured, cap)
+
+
+def _fetch_scanner_price_data(symbol: str) -> dict[str, Any]:
+    try:
+        return fetch_price_data(
+            symbol,
+            include_intraday=bool(settings.universe_scanner_intraday_enrichment_enabled),
+        )
+    except TypeError as exc:
+        if "include_intraday" not in str(exc):
+            raise
+        return fetch_price_data(symbol)
+
+
 def _score_snapshot(item: dict[str, Any]) -> dict[str, Any]:
     price = _to_float(item.get("current_price"))
     fallback_price = _latest_close_from_daily(item)
@@ -437,11 +462,12 @@ def _score_snapshot(item: dict[str, Any]) -> dict[str, Any]:
     volume_ratio = _to_float(item.get("volume_ratio"))
     turnover_value = _to_float(item.get("turnover_value"))
     volume = _to_int(item.get("volume"))
+    technical = item.get("latest_technical_features") or {}
     score = 0.0
     reasons: list[str] = []
 
     if price and price > 0:
-        score += 15
+        score += 10
     elif fallback_price and fallback_price > 0 and not market_open:
         price = fallback_price
         item = {
@@ -450,7 +476,7 @@ def _score_snapshot(item: dict[str, Any]) -> dict[str, Any]:
             "price_source": "latest_close",
             "market_phase": "closed",
         }
-        score += 35
+        score += 25
         reasons.append("market closed; latest close used for watchlist only")
     else:
         phase = "market closed" if not market_open else "market open"
@@ -462,36 +488,74 @@ def _score_snapshot(item: dict[str, Any]) -> dict[str, Any]:
             "market_phase": "closed" if not market_open else "open",
         }
 
-    if change_rate is not None:
-        if -1.5 <= change_rate <= 7:
-            score += 25
-            reasons.append("healthy intraday change")
-        elif 7 < change_rate <= 12:
+    momentum_hits = 0
+    for key, label, weight in (
+        ("return_5d", "5d momentum", 12),
+        ("return_20d", "20d momentum", 16),
+        ("return_60d", "60d momentum", 14),
+    ):
+        value = _to_float(technical.get(key))
+        if value is None:
+            continue
+        if value >= 0:
+            momentum_hits += 1
+            score += min(weight, value * 100 * 1.2 + weight * 0.35)
+            reasons.append(label)
+        elif value < -0.06:
+            score -= weight * 0.7
+
+    if technical.get("high_breakout_20d"):
+        momentum_hits += 1
+        score += 16
+        reasons.append("20d high breakout")
+    if technical.get("low_breakdown_20d"):
+        score -= 24
+        reasons.append("20d low breakdown")
+
+    ma20_slope = _to_float(technical.get("ma20_slope"))
+    if ma20_slope is not None:
+        if ma20_slope > 0:
             score += 12
-            reasons.append("strong but extended move")
+            reasons.append("positive MA20 slope")
+        else:
+            score -= 12
+
+    atr_pct = _to_float(technical.get("atr_14_pct"))
+    if atr_pct is not None:
+        if 0.015 <= atr_pct <= 0.085:
+            score += 8
+            reasons.append("ATR risk band")
+        elif atr_pct > 0.11:
+            score -= 18
+            reasons.append("ATR volatility too high")
+
+    if momentum_hits == 0 and change_rate is not None:
+        if -1.5 <= change_rate <= 7:
+            score += 12
+            reasons.append("intraday change fallback")
         elif change_rate < -4:
-            score -= 20
+            score -= 16
             reasons.append("sharp drop")
 
     if volume_ratio is not None:
         if 1.5 <= volume_ratio <= 5:
-            score += 30
+            score += 12
             reasons.append("volume expansion")
         elif volume_ratio > 5:
-            score += 16
+            score += 4
             reasons.append("possible volume exhaustion")
 
     if turnover_value is not None and turnover_value > 0:
-        score += min(20, turnover_value / 50_000_000_000 * 20)
+        score += min(12, turnover_value / 50_000_000_000 * 12)
         reasons.append("turnover present")
     elif volume:
-        score += min(10, volume / 5_000_000 * 10)
+        score += min(8, volume / 5_000_000 * 8)
         reasons.append("volume present")
 
     intraday = item.get("intraday") or {}
     minute_volume_ratio = _to_float(intraday.get("minute_volume_ratio"))
     if minute_volume_ratio is not None and minute_volume_ratio >= 1.5:
-        score += min(15, minute_volume_ratio * 3)
+        score += min(5, minute_volume_ratio)
         reasons.append("minute volume expansion")
 
     if bool(item.get("overheated")):
@@ -521,26 +585,28 @@ def _enrich_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     score = float(candidate.get("score") or 0)
     enrichment_errors: list[str] = []
 
-    try:
-        news = search_naver_news(query=query, display=5, sort="date")
-        news_count = len(news.get("items") or [])
-        if news_count:
-            score += min(5, news_count)
-    except Exception as exc:
-        enrichment_errors.append(f"news: {exc}")
+    if settings.universe_scanner_news_enrichment_enabled:
+        try:
+            news = search_naver_news(query=query, display=5, sort="date")
+            news_count = len(news.get("items") or [])
+            if news_count:
+                score += min(5, news_count)
+        except Exception as exc:
+            enrichment_errors.append(f"news: {exc}")
 
-    try:
-        disclosures = fetch_opendart_disclosures(symbol=symbol, lookback_hours=24)
-        disclosure_count = len(disclosures)
-        for event in disclosures[:3]:
-            direction = event.get("impact_direction")
-            strength = _to_float(event.get("impact_strength")) or 0
-            if direction == "positive":
-                score += min(8, strength / 12)
-            elif direction == "negative":
-                score -= min(12, strength / 8)
-    except Exception as exc:
-        enrichment_errors.append(f"opendart: {exc}")
+    if settings.universe_scanner_disclosure_enrichment_enabled:
+        try:
+            disclosures = fetch_opendart_disclosures(symbol=symbol, lookback_hours=24)
+            disclosure_count = len(disclosures)
+            for event in disclosures[:3]:
+                direction = event.get("impact_direction")
+                strength = _to_float(event.get("impact_strength")) or 0
+                if direction == "positive":
+                    score += min(8, strength / 12)
+                elif direction == "negative":
+                    score -= min(12, strength / 8)
+        except Exception as exc:
+            enrichment_errors.append(f"opendart: {exc}")
 
     score = round(max(0.0, min(100.0, score)), 2)
     decision = "exclude"
@@ -620,19 +686,54 @@ def _with_expected_value_scores(
     edge_model: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     raw_score = float(candidate.get("score") or 0)
+    heuristic_return = _estimate_expected_return_bps(candidate, raw_score)
+    heuristic_risk = _estimate_expected_risk_penalty_bps(candidate, raw_score)
     calibrated = estimate_expected_edges(candidate, raw_score, model=edge_model)
+    edge_model_name = (calibrated or {}).get("edge_model", "heuristic_v1")
     expected_return = (
-        float(calibrated["expected_return"])
+        max(float(calibrated["expected_return"]), heuristic_return * 0.65)
         if calibrated
-        else _estimate_expected_return_bps(candidate, raw_score)
+        else heuristic_return
     )
     expected_risk = (
-        float(calibrated["expected_risk"])
+        min(float(calibrated["expected_risk"]), max(35.0, heuristic_risk * 1.10))
         if calibrated
-        else _estimate_expected_risk_penalty_bps(candidate, raw_score)
+        else heuristic_risk
+    )
+    if calibrated:
+        edge_model_name = f"{edge_model_name}+heuristic_floor"
+    quality = _swing_edge_quality(candidate, raw_score)
+    reward_risk = _atr_reward_risk_estimate(candidate, raw_score, quality["score"])
+    if reward_risk and quality["score"] >= 58:
+        expected_return = max(
+            expected_return,
+            float(reward_risk["gross_return_floor_bps"]),
+        )
+        expected_risk = min(
+            expected_risk,
+            float(reward_risk["loss_risk_floor_bps"])
+            + float(quality["risk_buffer_bps"]),
+        )
+        edge_model_name = f"{edge_model_name}+atr_rr"
+    expected_return = min(
+        500.0,
+        expected_return + float(quality["return_uplift_bps"]),
+    )
+    expected_risk = max(
+        25.0,
+        min(
+            500.0,
+            expected_risk
+            - float(quality["risk_discount_bps"])
+            + float(quality["risk_penalty_bps"]),
+        ),
     )
     trading_cost = _estimate_round_trip_trading_cost_bps()
-    slippage_cost = _estimate_slippage_cost_bps(candidate)
+    slippage_cost = max(
+        4.0,
+        _estimate_slippage_cost_bps(candidate)
+        - float(quality["slippage_discount_bps"]),
+    )
     net_edge = expected_return - expected_risk - trading_cost - slippage_cost
     expected_return_score = _score_bps(expected_return, cap_bps=350)
     net_edge_score = _score_bps(net_edge, cap_bps=250)
@@ -653,7 +754,10 @@ def _with_expected_value_scores(
         "net_edge": round(net_edge, 4),
         "composite_score": round(max(0.0, min(100.0, composite_score)), 4),
         "expires_at": expires_at,
-        "edge_model": (calibrated or {}).get("edge_model", "heuristic_v1"),
+        "edge_model": edge_model_name,
+        "edge_quality_score": quality["score"],
+        "edge_quality_reasons": quality["reasons"],
+        "edge_reward_risk": reward_risk,
     }
 
 
@@ -693,16 +797,32 @@ def _estimate_expected_return_bps(candidate: dict[str, Any], raw_score: float) -
     minute_volume_ratio = _to_float((candidate.get("intraday") or {}).get("minute_volume_ratio")) or 0.0
     news_count = _to_int(candidate.get("news_count")) or 0
     disclosure_count = _to_int(candidate.get("disclosure_count")) or 0
+    technical = candidate.get("latest_technical_features") or {}
+    return_5d = _to_float(technical.get("return_5d")) or 0.0
+    return_20d = _to_float(technical.get("return_20d")) or 0.0
+    return_60d = _to_float(technical.get("return_60d")) or 0.0
 
     score_component = raw_score * 1.8
-    momentum_component = max(-40.0, min(80.0, change_rate * 8.0))
-    volume_component = min(70.0, max(0.0, volume_ratio - 1.0) * 18.0)
-    minute_component = min(30.0, max(0.0, minute_volume_ratio - 1.0) * 12.0)
+    daily_momentum_component = max(
+        -80.0,
+        min(
+            140.0,
+            return_5d * 250.0
+            + return_20d * 180.0
+            + return_60d * 110.0,
+        ),
+    )
+    breakout_component = 35.0 if technical.get("high_breakout_20d") else 0.0
+    momentum_component = max(-25.0, min(45.0, change_rate * 4.0))
+    volume_component = min(35.0, max(0.0, volume_ratio - 1.0) * 10.0)
+    minute_component = min(10.0, max(0.0, minute_volume_ratio - 1.0) * 4.0)
     news_component = min(25.0, news_count * 5.0)
     disclosure_component = min(24.0, disclosure_count * 8.0)
     expected = (
         35.0
         + score_component
+        + daily_momentum_component
+        + breakout_component
         + momentum_component
         + volume_component
         + minute_component
@@ -720,7 +840,14 @@ def _estimate_expected_risk_penalty_bps(
 ) -> float:
     change_rate = _to_float(candidate.get("change_rate")) or 0.0
     volume_ratio = _to_float(candidate.get("volume_ratio")) or 0.0
-    risk = 55.0 + float(settings.monitor_default_stop_loss_pct or 3.0) * 18.0
+    price = _to_float(candidate.get("current_price"))
+    levels = atr_exit_levels_from_price_data(entry_price=price, price_data=candidate)
+    risk_per_share = _to_float(levels.get("risk_per_share"))
+    risk = (
+        max(55.0, min(420.0, (risk_per_share / price) * 10_000))
+        if price and risk_per_share
+        else 140.0
+    )
     if raw_score < 55:
         risk += (55.0 - raw_score) * 2.0
     if change_rate > 7:
@@ -756,6 +883,216 @@ def _estimate_slippage_cost_bps(candidate: dict[str, Any]) -> float:
     return base
 
 
+def _swing_edge_quality(candidate: dict[str, Any], raw_score: float) -> dict[str, Any]:
+    technical = candidate.get("latest_technical_features") or {}
+    change_rate = _to_float(candidate.get("change_rate")) or 0.0
+    volume_ratio = _to_float(candidate.get("volume_ratio"))
+    turnover = _to_float(candidate.get("turnover_value"))
+    atr_pct = _to_float(technical.get("atr_14_pct"))
+    reasons: list[str] = []
+    score = max(0.0, min(25.0, raw_score * 0.25))
+
+    return_5d = _to_float(technical.get("return_5d"))
+    return_20d = _to_float(technical.get("return_20d"))
+    return_60d = _to_float(technical.get("return_60d"))
+    positive_momentum = 0
+    for value, threshold, points, label in (
+        (return_5d, 0.02, 10.0, "5d momentum"),
+        (return_20d, 0.05, 14.0, "20d momentum"),
+        (return_60d, 0.08, 12.0, "60d momentum"),
+    ):
+        if value is None:
+            continue
+        if value >= threshold:
+            score += points
+            positive_momentum += 1
+            reasons.append(label)
+        elif value < -threshold:
+            score -= points * 0.8
+    if positive_momentum >= 3:
+        score += 10.0
+        reasons.append("stacked momentum")
+
+    if technical.get("high_breakout_20d"):
+        score += 14.0
+        reasons.append("20d high breakout")
+    if technical.get("low_breakdown_20d"):
+        score -= 28.0
+
+    ma20_slope = _to_float(technical.get("ma20_slope"))
+    if ma20_slope is not None:
+        if ma20_slope > 0:
+            score += 8.0
+            reasons.append("positive MA slope")
+        else:
+            score -= 10.0
+
+    if atr_pct is not None:
+        if 0.015 <= atr_pct <= 0.055:
+            score += 12.0
+            reasons.append("ATR sweet spot")
+        elif 0.055 < atr_pct <= 0.085:
+            score += 5.0
+            reasons.append("tradable ATR")
+        elif atr_pct > 0.095:
+            score -= 22.0
+        elif atr_pct < 0.008:
+            score -= 6.0
+
+    if 0.0 <= change_rate <= 5.0:
+        score += 6.0
+    elif change_rate > 8.0:
+        score -= 14.0
+    elif change_rate < -3.0:
+        score -= 16.0
+
+    if volume_ratio is not None:
+        if 1.3 <= volume_ratio <= 4.0:
+            score += 8.0
+            reasons.append("healthy volume expansion")
+        elif volume_ratio > 5.5:
+            score -= 10.0
+        elif volume_ratio < 0.8:
+            score -= 8.0
+
+    if turnover is not None:
+        if turnover >= 100_000_000_000:
+            score += 10.0
+            reasons.append("strong liquidity")
+        elif turnover >= 50_000_000_000:
+            score += 6.0
+            reasons.append("liquid")
+        elif turnover < 20_000_000_000:
+            score -= 12.0
+
+    if bool(candidate.get("overheated")):
+        score -= 25.0
+
+    score += _market_context_quality_points(candidate, reasons)
+    score = round(max(0.0, min(100.0, score)), 4)
+    return {
+        "score": score,
+        "reasons": reasons[:8],
+        "return_uplift_bps": round(max(0.0, min(150.0, (score - 55.0) * 3.0)), 4),
+        "risk_discount_bps": round(max(0.0, min(80.0, (score - 60.0) * 1.5)), 4),
+        "risk_penalty_bps": round(max(0.0, min(100.0, (45.0 - score) * 2.0)), 4),
+        "risk_buffer_bps": round(max(15.0, min(95.0, 95.0 - score * 0.7)), 4),
+        "slippage_discount_bps": round(max(0.0, min(8.0, (score - 60.0) * 0.25)), 4),
+    }
+
+
+def _market_context_quality_points(
+    candidate: dict[str, Any],
+    reasons: list[str],
+) -> float:
+    context = _candidate_market_context(candidate)
+    if not context:
+        return 0.0
+    points = 0.0
+    regime = str(context.get("market_regime") or "unknown").lower()
+    if regime in {"bull", "risk_on", "uptrend", "strong"}:
+        points += 10.0
+        reasons.append("supportive market regime")
+    elif regime in {"bear", "risk_off", "downtrend", "stress"}:
+        points -= 20.0
+
+    risk_on_score = _to_float(context.get("risk_on_score"))
+    if risk_on_score is not None:
+        if risk_on_score >= 65:
+            points += 10.0
+            reasons.append("risk-on market")
+        elif risk_on_score >= 55:
+            points += 6.0
+        elif risk_on_score < 35:
+            points -= 15.0
+
+    sector_score = _sector_strength_score(candidate, context)
+    if sector_score is not None:
+        if sector_score >= 65:
+            points += 10.0
+            reasons.append("sector relative strength")
+        elif sector_score >= 55:
+            points += 6.0
+        elif sector_score <= 40:
+            points -= 12.0
+    return points
+
+
+def _candidate_market_context(candidate: dict[str, Any]) -> dict[str, Any]:
+    context = candidate.get("market_context") or candidate.get("market_context_snapshot")
+    if isinstance(context, dict) and context:
+        return context
+    try:
+        return get_latest_market_context() or {}
+    except Exception:
+        return {}
+
+
+def _sector_strength_score(
+    candidate: dict[str, Any],
+    context: dict[str, Any],
+) -> float | None:
+    selected = context.get("selected_sector_relative_strength") or {}
+    value = _to_float(selected.get("score"))
+    if value is not None:
+        return value
+    sector = candidate.get("sector")
+    if not sector:
+        return None
+    relative_strength = context.get("sector_relative_strength") or {}
+    if not isinstance(relative_strength, dict):
+        return None
+    sector_rows = relative_strength.get("sectors") or []
+    for row in sector_rows:
+        if row.get("sector") == sector:
+            return _to_float(row.get("score"))
+    return None
+
+
+def _atr_reward_risk_estimate(
+    candidate: dict[str, Any],
+    raw_score: float,
+    quality_score: float,
+) -> dict[str, float] | None:
+    price = _to_float(candidate.get("current_price"))
+    if not price or price <= 0:
+        return None
+    levels = atr_exit_levels_from_price_data(entry_price=price, price_data=candidate)
+    risk_per_share = _to_float(levels.get("risk_per_share"))
+    target = _to_float(levels.get("take_profit"))
+    if not risk_per_share or risk_per_share <= 0 or not target or target <= price:
+        return None
+    risk_bps = risk_per_share / price * 10_000
+    target_bps = (target - price) / price * 10_000
+    win_probability = _expected_win_probability(candidate, raw_score, quality_score)
+    gross_return_floor = win_probability * target_bps
+    loss_risk_floor = (1.0 - win_probability) * risk_bps
+    return {
+        "win_probability": round(win_probability, 4),
+        "target_bps": round(target_bps, 4),
+        "risk_bps": round(risk_bps, 4),
+        "gross_return_floor_bps": round(max(0.0, min(500.0, gross_return_floor)), 4),
+        "loss_risk_floor_bps": round(max(25.0, min(500.0, loss_risk_floor)), 4),
+    }
+
+
+def _expected_win_probability(
+    candidate: dict[str, Any],
+    raw_score: float,
+    quality_score: float,
+) -> float:
+    technical = candidate.get("latest_technical_features") or {}
+    probability = 0.38 + max(0.0, min(1.0, raw_score / 100.0)) * 0.10
+    probability += max(0.0, min(1.0, quality_score / 100.0)) * 0.14
+    if technical.get("high_breakout_20d"):
+        probability += 0.035
+    if technical.get("low_breakdown_20d"):
+        probability -= 0.06
+    if bool(candidate.get("overheated")):
+        probability -= 0.055
+    return max(0.32, min(0.62, probability))
+
+
 def _score_bps(value: float, *, cap_bps: float) -> float:
     if cap_bps <= 0:
         return 0.0
@@ -770,12 +1107,29 @@ def _to_symbol_config(
     req: AutoTradeStartRequest,
     candidate: dict[str, Any],
 ) -> AutoTradeSymbolConfig:
-    price = _to_float(candidate.get("current_price"))
-    stop_loss = price * (1 - settings.monitor_default_stop_loss_pct / 100) if price else None
-    take_profit = price * (1 + settings.monitor_default_take_profit_pct / 100) if price else None
+    candidate_payload = _candidate_payload(candidate)
+    price = _to_float(candidate_payload.get("current_price"))
+    levels = atr_exit_levels_from_price_data(
+        entry_price=price,
+        price_data=candidate_payload,
+    )
+    stop_loss = levels["stop_loss"]
+    take_profit = levels["take_profit"]
+    trailing_stop = levels["trailing_stop"]
+    risk_per_share = _to_float(levels.get("risk_per_share"))
+    expected_loss_bps = (
+        risk_per_share / price * 10_000
+        if price and risk_per_share
+        else _to_float(candidate.get("expected_risk"))
+    )
+    expected_win_bps = (
+        (take_profit - price) / price * 10_000
+        if price and take_profit
+        else _to_float(candidate.get("expected_return"))
+    )
     return AutoTradeSymbolConfig(
-        symbol=str(candidate["symbol"]),
-        name=candidate.get("name"),
+        symbol=str(candidate_payload["symbol"]),
+        name=candidate_payload.get("name"),
         market="KR",
         strategy_type="swing",
         lookback_hours=24 * 10,
@@ -786,6 +1140,7 @@ def _to_symbol_config(
         order_price=price,
         stop_loss=stop_loss,
         take_profit=take_profit,
+        trailing_stop=trailing_stop,
         signal_score=_to_float(candidate.get("composite_score") or candidate.get("score")),
         account_equity=_first_symbol_attr(
             req,
@@ -803,8 +1158,8 @@ def _to_symbol_config(
             fallback=req.cash_available,
         ),
         expected_gross_edge_bps=_to_float(candidate.get("expected_return")),
-        expected_win_bps=_to_float(candidate.get("expected_return")),
-        expected_loss_bps=_to_float(candidate.get("expected_risk")),
+        expected_win_bps=expected_win_bps,
+        expected_loss_bps=expected_loss_bps,
         spread_bps=max(0.0, float(settings.universe_scanner_default_spread_bps or 0.0)),
         slippage_bps=max(
             0.0,
@@ -812,6 +1167,11 @@ def _to_symbol_config(
         ),
         expected_holding_days=5.0,
     )
+
+
+def _candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    raw = _parse_json(candidate.get("raw_json"), {})
+    return {**raw, **candidate} if isinstance(raw, dict) else candidate
 
 
 def _first_symbol_attr(
@@ -852,6 +1212,10 @@ def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
                 "turnover_value": item.get("turnover_value"),
                 "news_count": item.get("news_count", 0),
                 "disclosure_count": item.get("disclosure_count", 0),
+                "edge_model": item.get("edge_model"),
+                "edge_quality_score": item.get("edge_quality_score"),
+                "edge_quality_reasons": item.get("edge_quality_reasons"),
+                "edge_reward_risk": item.get("edge_reward_risk"),
                 "claimed_by_worker": item.get("claimed_by_worker"),
                 "expires_at": item.get("expires_at"),
             }
@@ -1148,7 +1512,7 @@ def _worker_hurdle_rate_bps(execution_mode: str = "paper") -> float:
 
 
 def _paper_average_realized_return_bps(limit: int = 20) -> float | None:
-    path = Path(paper_trading.DEFAULT_DB_PATH)
+    path = settings.storage_path(paper_trading.DEFAULT_DB_PATH)
     if not path.exists():
         return None
     try:
@@ -1179,4 +1543,4 @@ def _paper_average_realized_return_bps(limit: int = 20) -> float | None:
 
 
 def _db_path(db_path: Path | str | None = None) -> Path:
-    return Path(db_path or settings.universe_scanner_db_path)
+    return settings.storage_path(db_path or settings.universe_scanner_db_path)

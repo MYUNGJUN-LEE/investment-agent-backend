@@ -6,6 +6,7 @@ import json
 import sqlite3
 from typing import Any
 
+from app.config import settings
 
 DEFAULT_MARKET_DB_PATH = Path("data/market_data.sqlite3")
 
@@ -104,7 +105,7 @@ CREATE TABLE IF NOT EXISTS market_context_snapshots (
 
 
 def initialize_market_db(db_path: Path | str | None = None) -> None:
-    path = Path(db_path) if db_path else DEFAULT_MARKET_DB_PATH
+    path = settings.storage_path(db_path or DEFAULT_MARKET_DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
@@ -313,7 +314,7 @@ def record_market_context_snapshot(
 def get_latest_market_context(
     db_path: Path | str | None = None,
 ) -> dict[str, Any] | None:
-    path = Path(db_path) if db_path else DEFAULT_MARKET_DB_PATH
+    path = settings.storage_path(db_path or DEFAULT_MARKET_DB_PATH)
     if not path.exists():
         return None
 
@@ -334,7 +335,7 @@ def get_latest_market_context(
 
 
 def _prepare_db(db_path: Path | str | None) -> Path:
-    path = Path(db_path) if db_path else DEFAULT_MARKET_DB_PATH
+    path = settings.storage_path(db_path or DEFAULT_MARKET_DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)

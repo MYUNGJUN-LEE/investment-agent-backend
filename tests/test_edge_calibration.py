@@ -60,6 +60,41 @@ def test_edge_calibration_fits_coefficients_from_scanner_history(tmp_path, monke
     assert estimate["edge_model"] == "calibrated_ridge_v1"
 
 
+def test_refresh_edge_training_samples_stores_prediction_labels(tmp_path, monkeypatch):
+    universe_db = tmp_path / "universe.sqlite3"
+    calibration_db = tmp_path / "edge.sqlite3"
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_horizon_seconds", 3600)
+
+    universe_scanner.initialize_universe_db(universe_db)
+    with sqlite3.connect(universe_db) as conn:
+        _insert_candidate(
+            conn,
+            scan_id="scan-a",
+            scan_time="2026-05-24T09:00:00",
+            symbol="005930",
+            raw_score=80,
+            current_price=100,
+        )
+        _insert_price(
+            conn,
+            scan_id="future-a",
+            created_at="2026-05-24T10:00:00",
+            symbol="005930",
+            price=108,
+        )
+
+    result = edge_calibration.refresh_edge_training_samples(
+        universe_db_path=universe_db,
+        calibration_db_path=calibration_db,
+        horizon_seconds=3600,
+        candidate_limit=10,
+    )
+
+    assert result["status"] == "success"
+    assert result["inserted_count"] == 1
+    assert result["stored_sample_count"] == 1
+
+
 def test_edge_calibration_if_due_skips_when_recent(tmp_path, monkeypatch):
     universe_db = tmp_path / "universe.sqlite3"
     calibration_db = tmp_path / "edge.sqlite3"

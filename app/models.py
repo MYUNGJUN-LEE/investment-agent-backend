@@ -22,6 +22,7 @@ class PipelineRequest(BaseModel):
     name: str | None = Field(None, description="Company name")
     market: Market = "KR"
     strategy_type: StrategyType = "daytrade"
+    sector: str | None = Field(None, description="Optional sector for relative-strength context")
     lookback_hours: int = Field(24, ge=1, le=24 * 30)
     risk_level: RiskLevel = "medium"
 
@@ -59,6 +60,7 @@ class PipelineResponse(BaseModel):
     name: str | None
     market: Market
     strategy_type: StrategyType
+    sector: str | None = None
 
     final_grade: FinalGrade
     entry_signal: bool
@@ -106,6 +108,7 @@ class PaperRunRequest(BaseModel):
     position_size: float | None = Field(None, ge=0)
     stop_loss: float | None = Field(None, gt=0)
     take_profit: float | None = Field(None, gt=0)
+    trailing_stop: float | None = Field(None, gt=0)
     market_regime: str | None = None
     model_version: str = "rule_based_v1"
     sector: str | None = None
@@ -164,6 +167,7 @@ class PaperRunResponse(BaseModel):
 class LiveOrderRequest(BaseModel):
     symbol: str = Field(..., description="Stock ticker code, e.g. 005930")
     market: Market = "KR"
+    strategy_type: StrategyType = "daytrade"
     risk_level: RiskLevel = "medium"
     side: LiveOrderSide
     order_type: LiveOrderType = Field(
@@ -193,6 +197,7 @@ class LiveOrderRequest(BaseModel):
     position_size: float | None = Field(None, ge=0)
     stop_loss: float | None = Field(None, gt=0)
     take_profit: float | None = Field(None, gt=0)
+    trailing_stop: float | None = Field(None, gt=0)
     market_regime: str | None = None
     model_version: str = "rule_based_v1"
     sector: str | None = None
@@ -254,6 +259,7 @@ class OrderPreviewRequest(BaseModel):
     position_size: float | None = Field(None, ge=0)
     stop_loss: float | None = Field(None, gt=0)
     take_profit: float | None = Field(None, gt=0)
+    trailing_stop: float | None = Field(None, gt=0)
     market_regime: str | None = None
     model_version: str = "rule_based_v1"
     sector: str | None = None
@@ -332,6 +338,7 @@ class AutoTradeSymbolConfig(BaseModel):
     position_size: float | None = Field(None, ge=0)
     stop_loss: float | None = Field(None, gt=0)
     take_profit: float | None = Field(None, gt=0)
+    trailing_stop: float | None = Field(None, gt=0)
     market_regime: str | None = None
     model_version: str = "rule_based_v1"
     sector: str | None = None

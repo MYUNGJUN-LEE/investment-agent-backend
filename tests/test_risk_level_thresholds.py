@@ -134,3 +134,84 @@ def test_chart_flow_uses_less_conservative_intraday_profile_for_high_risk(monkey
 
     assert low_result["entry_signal"] is False
     assert high_result["entry_signal"] is True
+
+
+def test_swing_chart_flow_uses_daily_profile_over_intraday_orderbook(monkeypatch):
+    price_data = {
+        "status": "connected",
+        "symbol": "005930",
+        "current_price": 70000,
+        "change_rate": -0.8,
+        "volume_ratio": 1.4,
+        "trend": "sideways",
+        "overheated": False,
+        "support_levels": [],
+        "resistance_levels": [],
+        "price_position": {
+            "above_ma5": False,
+            "above_ma20": True,
+        },
+        "latest_technical_features": {
+            "close": 70000,
+            "return_5d": 0.03,
+            "return_20d": 0.07,
+            "return_60d": 0.16,
+            "high_breakout_20d": True,
+            "low_breakdown_20d": False,
+            "ma20_slope": 300,
+            "ma60": 64000,
+            "atr_14": 1200,
+            "atr_14_pct": 1200 / 70000,
+        },
+        "technical_features": [
+            {"close": 69000, "atr_14": 1200},
+            {"close": 71000, "atr_14": 1200},
+        ],
+        "intraday": {
+            "intraday_score": 45,
+            "execution_strength": 65,
+            "orderbook_imbalance": -0.4,
+            "spread_pct": 1.1,
+            "above_minute_vwap": False,
+            "minute_momentum_pct": -1.2,
+        },
+        "optional_errors": [],
+    }
+    market_context = {
+        "status": "connected",
+        "market_regime": "bull",
+        "risk_on_score": 67,
+        "selected_sector_relative_strength": {
+            "sector": "semiconductor",
+            "score": 72,
+        },
+    }
+    monkeypatch.setattr("app.agents.fetch_price_data", lambda symbol: dict(price_data))
+    monkeypatch.setattr(
+        "app.agents.fetch_market_context",
+        lambda **kwargs: dict(market_context),
+    )
+
+    research_result = {"research_score": 70}
+    financial_result = {"financial_score": 70, "data_needed": []}
+    daytrade_req = PipelineRequest(
+        symbol="005930",
+        market="KR",
+        strategy_type="daytrade",
+        risk_level="medium",
+        sector="semiconductor",
+    )
+    swing_req = PipelineRequest(
+        symbol="005930",
+        market="KR",
+        strategy_type="swing",
+        risk_level="medium",
+        sector="semiconductor",
+    )
+
+    daytrade_result = run_chart_flow_agent(daytrade_req, research_result, financial_result)
+    swing_result = run_chart_flow_agent(swing_req, research_result, financial_result)
+
+    assert daytrade_result["entry_signal"] is False
+    assert swing_result["entry_signal"] is True
+    assert "entry - 1.8 * ATR14" in swing_result["stop_loss_candidates"][0]

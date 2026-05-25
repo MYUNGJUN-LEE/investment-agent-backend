@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from datetime import datetime
 from fastapi.testclient import TestClient
 
 from app.config import settings
@@ -13,6 +14,7 @@ from app.trading import auto_trading
 from app.trading import auto_trading_store
 from app.trading import paper_trading
 from app.trading import trade_orchestrator
+from app.trading import universe_scanner
 
 
 client = TestClient(app)
@@ -97,6 +99,42 @@ def test_auto_trading_run_once_confirms_pending_paper_preview(monkeypatch):
     assert confirm_calls[0].preview_id == 7
 
 
+def test_auto_trading_defaults_missing_symbol_strategy_type(monkeypatch):
+    preview_calls = []
+
+    def fake_create_order_preview(req):
+        preview_calls.append(req)
+        return {
+            "status": "blocked",
+            "preview_id": 7,
+            "preview_token": None,
+            "symbol": req.symbol,
+            "signal_type": "entry",
+            "side": "BUY",
+            "price": req.price,
+            "quantity": req.quantity,
+            "amount": 0,
+            "recommended_quantity": None,
+            "message": "captured",
+            "strategy_decision": {},
+            "risk_decision": None,
+            "cost_edge_decision": None,
+        }
+
+    monkeypatch.setattr(auto_trading, "create_order_preview", fake_create_order_preview)
+    payload = _auto_trade_payload()
+    payload["symbols"][0].pop("strategy_type")
+
+    response = client.post(
+        "/auto-trading/run-once",
+        headers=_auth_headers(),
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    assert preview_calls[0].strategy_type == "daytrade"
+
+
 def test_auto_trading_applies_request_sizing_defaults(monkeypatch):
     preview_calls = []
 
@@ -120,6 +158,20 @@ def test_auto_trading_applies_request_sizing_defaults(monkeypatch):
         }
 
     monkeypatch.setattr(auto_trading, "create_order_preview", fake_create_order_preview)
+    monkeypatch.setattr(
+        auto_trading,
+        "fetch_price_data",
+        lambda symbol: {
+            "status": "connected",
+            "current_price": 10000,
+            "latest_technical_features": {
+                "close": 10000,
+                "atr_14": 100,
+                "atr_14_pct": 0.01,
+            },
+            "technical_features": [{"close": 10000, "atr_14": 100}],
+        },
+    )
 
     payload = _auto_trade_payload(
         account_equity=20_000_000,
@@ -139,7 +191,8 @@ def test_auto_trading_applies_request_sizing_defaults(monkeypatch):
     assert preview_calls[0].account_equity == 20_000_000
     assert preview_calls[0].risk_per_trade == 0.004
     assert preview_calls[0].cash_available == 500_000
-    assert preview_calls[0].stop_loss == 9700
+    assert preview_calls[0].stop_loss == 9820
+    assert preview_calls[0].take_profit == 10450
 
 
 def test_auto_trading_blocks_before_preview_when_cash_is_insufficient(monkeypatch):
@@ -299,6 +352,79 @@ def test_trade_orchestrator_executes_exit_for_removed_holding(
     assert result["status"] == "executed"
     assert ("005930", "exit", 3) in run_calls
     assert any(event["event_type"] == "orchestrator_completed" for event in events)
+
+
+def test_orchestrator_completes_blocked_gate_cycle(tmp_path, monkeypatch):
+    auto_db = tmp_path / "auto.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(auto_db))
+    monkeypatch.setattr(trade_orchestrator, "refresh_edge_training_samples", lambda: {"status": "success"})
+    monkeypatch.setattr(trade_orchestrator, "calibrate_edge_model_if_due", lambda: {"status": "not_due"})
+    monkeypatch.setattr(trade_orchestrator, "record_fill_adjustment_from_fills", lambda: {"status": "empty"})
+    monkeypatch.setattr(
+        trade_orchestrator,
+        "get_active_scanner_candidates",
+        lambda limit, include_expired: [
+            {
+                "symbol": "005930",
+                "rank": 1,
+                "status": "READY",
+                "current_price": 70000,
+                "net_edge": 120,
+                "composite_score": 80,
+                "expires_at": "2999-01-01T00:00:00",
+            }
+        ],
+    )
+    monkeypatch.setattr(auto_trading, "_open_positions", lambda mode: {})
+    monkeypatch.setattr(
+        auto_trading,
+        "edge_entry_gate",
+        lambda candidates=None: {
+            "status": "blocked",
+            "approved": False,
+            "message": "test gate blocked",
+        },
+    )
+    session = auto_trading_store.create_session(
+        AutoTradeStartRequest(run_immediately=True, interval_seconds=60)
+    )
+
+    result = trade_orchestrator.run_trade_orchestrator_once(worker_id="orch-test")
+    updated = auto_trading_store.get_session(session["session_id"], db_path=auto_db)
+    events = auto_trading_store.list_events(session["session_id"], db_path=auto_db)
+
+    assert result["status"] == "blocked"
+    assert result["results"][0]["status"] == "blocked"
+    assert updated["cycle_count"] == 1
+    assert datetime.fromisoformat(updated["next_run_at"]) > datetime.fromisoformat(session["next_run_at"])
+    assert [event["event_type"] for event in events[:2]] == [
+        "orchestrator_completed",
+        "cycle_completed",
+    ]
+
+
+def test_orchestrator_completes_cycle_when_candidates_are_empty(tmp_path, monkeypatch):
+    auto_db = tmp_path / "auto.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(auto_db))
+    monkeypatch.setattr(trade_orchestrator, "refresh_edge_training_samples", lambda: {"status": "success"})
+    monkeypatch.setattr(trade_orchestrator, "calibrate_edge_model_if_due", lambda: {"status": "not_due"})
+    monkeypatch.setattr(trade_orchestrator, "record_fill_adjustment_from_fills", lambda: {"status": "empty"})
+    monkeypatch.setattr(
+        trade_orchestrator,
+        "get_active_scanner_candidates",
+        lambda limit, include_expired: [],
+    )
+    session = auto_trading_store.create_session(
+        AutoTradeStartRequest(run_immediately=True, interval_seconds=60)
+    )
+
+    result = trade_orchestrator.run_trade_orchestrator_once(worker_id="orch-test")
+    updated = auto_trading_store.get_session(session["session_id"], db_path=auto_db)
+
+    assert result["status"] == "blocked"
+    assert result["results"][0]["message"].startswith("scanner_candidates is empty")
+    assert updated["cycle_count"] == 1
+    assert datetime.fromisoformat(updated["next_run_at"]) > datetime.fromisoformat(session["next_run_at"])
 
 
 def test_orchestrated_entries_follow_net_edge_priority(monkeypatch):
@@ -613,6 +739,114 @@ def test_gpt_status_and_start_paper_compatibility_routes(tmp_path, monkeypatch):
     assert "detail" not in start_response.json()
 
 
+def test_gpt_auto_trading_routes_do_not_redirect_on_trailing_slash(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
+
+    control_response = client.post(
+        "/gpt/auto-trading/control/",
+        headers=_auth_headers(),
+        json={"command": "stop"},
+        follow_redirects=False,
+    )
+    status_get_response = client.get(
+        "/gpt/auto-trading/status/",
+        headers=_auth_headers(),
+        follow_redirects=False,
+    )
+    status_post_response = client.post(
+        "/gpt/auto-trading/status/",
+        headers=_auth_headers(),
+        follow_redirects=False,
+    )
+    start_response = client.post(
+        "/gpt/auto-trading/start-paper/",
+        headers=_auth_headers(),
+        json={},
+        follow_redirects=False,
+    )
+
+    for response in (
+        control_response,
+        status_get_response,
+        status_post_response,
+        start_response,
+    ):
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+
+    assert control_response.json()["command"] == "stop"
+    assert status_get_response.json()["command"] == "status"
+    assert status_post_response.json()["command"] == "status"
+    assert start_response.json()["command"] == "start"
+
+
+def test_gpt_routes_convert_options_and_unknown_paths_to_2xx_json():
+    options_response = client.options(
+        "/gpt/auto-trading/control/",
+        follow_redirects=False,
+    )
+    root_options_response = client.options(
+        "/gpt",
+        follow_redirects=False,
+    )
+    root_response = client.get(
+        "/gpt",
+        follow_redirects=False,
+    )
+    unknown_response = client.post(
+        "/gpt/unknown-action",
+        json={},
+        follow_redirects=False,
+    )
+
+    assert options_response.status_code == 204
+    assert root_options_response.status_code == 204
+    assert root_response.status_code == 200
+    assert root_response.headers["content-type"].startswith("application/json")
+    assert root_response.json()["status"] == "error"
+    assert root_response.json()["http_status"] == 404
+    assert root_response.json()["detail"]["path"] == "/gpt"
+    assert unknown_response.status_code == 200
+    assert unknown_response.headers["content-type"].startswith("application/json")
+    assert unknown_response.json()["status"] == "error"
+    assert unknown_response.json()["http_status"] == 404
+
+
+def test_gpt_cors_preflight_allows_chatgpt_origins():
+    for origin in (
+        "https://chat.openai.com",
+        "https://chatgpt.com",
+        "https://www.chatgpt.com",
+    ):
+        response = client.options(
+            "/gpt/auto-trading/control",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,x-api-key",
+            },
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == origin
+        assert "x-api-key" in response.headers["access-control-allow-headers"].lower()
+
+
+def test_gpt_trailing_slash_missing_api_key_still_returns_200_json(monkeypatch):
+    monkeypatch.setattr(settings, "backend_api_key", "secret-key")
+
+    response = client.get(
+        "/gpt/auto-trading/status/",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["status"] == "error"
+    assert response.json()["http_status"] == 401
+
+
 def test_gpt_control_returns_json_diagnostic_for_missing_api_key(monkeypatch):
     monkeypatch.setattr(settings, "backend_api_key", "secret-key")
 
@@ -774,6 +1008,101 @@ def test_auto_trading_worker_processes_persisted_session(tmp_path, monkeypatch):
     assert session["cycle_count"] == 1
     assert session["status"] == "stopped"
     assert session["last_results"] == [{"symbol": "005930", "status": "mocked"}]
+
+
+def test_auto_trading_worker_completes_fast_universe_scan_cycle(tmp_path, monkeypatch):
+    auto_db = tmp_path / "auto.sqlite3"
+    universe_db = tmp_path / "universe.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(auto_db))
+    monkeypatch.setattr(settings, "universe_scanner_db_path", str(universe_db))
+    monkeypatch.setattr(settings, "universe_scanner_max_source_symbols", 2)
+    monkeypatch.setattr(settings, "universe_scanner_min_scanned_symbols_for_trading", 0)
+    monkeypatch.setattr(settings, "universe_scanner_symbol_interval_seconds", 0.0)
+    monkeypatch.setattr(settings, "universe_scanner_symbol_interval_cap_seconds", 0.0)
+    monkeypatch.setattr(settings, "universe_scanner_intraday_enrichment_enabled", False)
+    monkeypatch.setattr(settings, "universe_scanner_news_enrichment_enabled", False)
+    monkeypatch.setattr(settings, "universe_scanner_disclosure_enrichment_enabled", False)
+    monkeypatch.setattr(
+        auto_trading,
+        "edge_entry_gate",
+        lambda candidates=None: {"approved": True, "status": "approved"},
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "edge_entry_gate",
+        lambda candidates=None: {"approved": True, "status": "approved"},
+    )
+
+    calls: list[tuple[str, bool]] = []
+
+    def fake_fetch_price_data(symbol, *, include_intraday=True):
+        calls.append((symbol, include_intraday))
+        return {
+            "symbol": symbol,
+            "current_price": None,
+            "change_rate": None,
+            "volume": None,
+            "volume_ratio": None,
+            "latest_technical_features": {},
+        }
+
+    monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
+
+    session = auto_trading_store.create_session(
+        AutoTradeStartRequest(
+            symbols=[],
+            auto_discover_symbols=True,
+            run_immediately=True,
+            interval_seconds=60,
+            max_cycles=1,
+        ),
+        db_path=auto_db,
+    )
+
+    processed = auto_trading.process_due_sessions(worker_id="test-worker")
+    updated = auto_trading_store.get_session(session["session_id"], db_path=auto_db)
+
+    assert processed[0]["session_id"] == session["session_id"]
+    assert updated["cycle_count"] == 1
+    assert updated["status"] == "stopped"
+    assert updated["locked_by"] is None
+    assert updated["next_run_at"] is None
+    assert calls
+    assert all(include_intraday is False for _, include_intraday in calls)
+
+
+def test_auto_trading_worker_recovers_overdue_locked_session(tmp_path, monkeypatch):
+    auto_db = tmp_path / "auto.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(auto_db))
+    monkeypatch.setattr(
+        auto_trading,
+        "_run_cycle",
+        lambda req, session_id=None: [{"symbol": "005930", "status": "mocked"}],
+    )
+    session = auto_trading_store.create_session(
+        AutoTradeStartRequest(run_immediately=True, interval_seconds=60)
+    )
+    with sqlite3.connect(auto_db) as conn:
+        conn.execute(
+            """
+            UPDATE auto_trading_sessions
+            SET next_run_at = '2000-01-01T00:00:00',
+                locked_by = 'dead-worker',
+                locked_until = '2999-01-01T00:00:00'
+            WHERE session_id = ?
+            """,
+            (session["session_id"],),
+        )
+
+    processed = auto_trading.process_due_sessions(worker_id="test-worker")
+    updated = auto_trading_store.get_session(session["session_id"], db_path=auto_db)
+    events = auto_trading_store.list_events(session["session_id"], db_path=auto_db)
+
+    assert processed[0]["session_id"] == session["session_id"]
+    assert updated["cycle_count"] == 1
+    assert updated["locked_by"] is None
+    assert updated["locked_until"] is None
+    assert any(event["event_type"] == "schedule_recovered" for event in events)
 
 
 def test_requested_exit_forces_sell_strategy_decision():

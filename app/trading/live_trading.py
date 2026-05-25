@@ -26,7 +26,7 @@ def execute_live_order(
     """Execute a live KIS limit order after explicit safety checks."""
     _validate_live_trading_gate(req)
 
-    resolved_db_path = Path(db_path) if db_path else paper_trading.DEFAULT_DB_PATH
+    resolved_db_path = settings.storage_path(db_path or paper_trading.DEFAULT_DB_PATH)
     resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(resolved_db_path) as conn:
@@ -156,7 +156,7 @@ def _to_paper_risk_request(req: LiveOrderRequest) -> PaperRunRequest:
     return PaperRunRequest(
         symbol=req.symbol,
         market=req.market,
-        strategy_type="daytrade",
+        strategy_type=req.strategy_type,
         risk_level=req.risk_level,
         signal_type="entry" if req.side == "buy" else "exit",
         price=req.price,
@@ -171,6 +171,7 @@ def _to_paper_risk_request(req: LiveOrderRequest) -> PaperRunRequest:
         position_size=req.position_size,
         stop_loss=req.stop_loss,
         take_profit=req.take_profit,
+        trailing_stop=req.trailing_stop,
         market_regime=req.market_regime or latest_context.get("market_regime"),
         model_version=req.model_version,
         sector=req.sector,

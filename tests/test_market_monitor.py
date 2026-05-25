@@ -42,6 +42,12 @@ def test_kis_market_watch_records_surge_volume_and_stop_alerts(tmp_path, monkeyp
             "current_price": 100,
             "change_rate": 6.2,
             "volume_ratio": 3.5,
+            "latest_technical_features": {
+                "close": 100,
+                "atr_14": 5,
+                "atr_14_pct": 0.05,
+            },
+            "technical_features": [{"close": 100, "atr_14": 5}],
         }
 
     monkeypatch.setattr(market_monitor, "fetch_price_data", fake_fetch_price_data)
@@ -57,6 +63,149 @@ def test_kis_market_watch_records_surge_volume_and_stop_alerts(tmp_path, monkeyp
     with sqlite3.connect(db_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM monitor_alerts").fetchone()[0]
     assert count == 3
+
+
+def test_kis_market_watch_updates_atr_trailing_stop_state(tmp_path, monkeypatch):
+    db_path = tmp_path / "monitor.sqlite3"
+    monkeypatch.setattr(settings, "market_monitor_db_path", str(db_path))
+    monkeypatch.setattr(settings, "alert_db_path", str(tmp_path / "alerts.sqlite3"))
+    monkeypatch.setattr(
+        market_monitor,
+        "_resolve_watchlist",
+        lambda: {"005930": {"symbol": "005930", "name": "Samsung Electronics"}},
+    )
+    monkeypatch.setattr(
+        market_monitor,
+        "_load_broker_positions",
+        lambda: {
+            "005930": {
+                "symbol": "005930",
+                "quantity": 1,
+                "avg_price": 100,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        market_monitor,
+        "fetch_price_data",
+        lambda symbol: {
+            "status": "connected",
+            "symbol": symbol,
+            "current_price": 115,
+            "change_rate": 0.5,
+            "volume_ratio": 1.0,
+            "latest_technical_features": {
+                "close": 115,
+                "atr_14": 4,
+            },
+            "technical_features": [{"close": 108, "atr_14": 4}, {"close": 115}],
+        },
+    )
+
+    result = market_monitor.run_kis_market_watch(db_path=db_path)
+
+    assert result["alert_count"] == 1
+    assert result["alerts"][0]["alert_type"] == "trailing_stop_updated"
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT highest_close, trailing_stop, effective_stop
+            FROM monitor_trailing_stops
+            WHERE symbol = '005930'
+            """
+        ).fetchone()
+    assert row == (115, 107, 107)
+
+
+def test_kis_market_watch_submits_live_exit_when_trailing_stop_hits(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "monitor.sqlite3"
+    orders = []
+    events = []
+    monkeypatch.setattr(settings, "market_monitor_db_path", str(db_path))
+    monkeypatch.setattr(settings, "alert_db_path", str(tmp_path / "alerts.sqlite3"))
+    monkeypatch.setattr(settings, "enable_live_trading", True)
+    monkeypatch.setattr(settings, "kis_is_paper", False)
+    monkeypatch.setattr(settings, "live_trading_confirm_token", "confirm-live")
+    monkeypatch.setattr(
+        market_monitor,
+        "_resolve_watchlist",
+        lambda: {
+            "005930": {
+                "symbol": "005930",
+                "name": "Samsung Electronics",
+                "market": "KR",
+                "strategy_type": "swing",
+                "risk_level": "medium",
+                "execution_mode": "live",
+                "session_id": "session-1",
+                "live_confirm_token": "confirm-live",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        market_monitor,
+        "_load_broker_positions",
+        lambda: {
+            "005930": {
+                "symbol": "005930",
+                "quantity": 3,
+                "avg_price": 100,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        market_monitor,
+        "fetch_price_data",
+        lambda symbol: {
+            "status": "connected",
+            "symbol": symbol,
+            "current_price": 106,
+            "change_rate": -1.0,
+            "volume_ratio": 1.0,
+            "latest_technical_features": {
+                "close": 106,
+                "atr_14": 4,
+            },
+            "technical_features": [{"close": 120, "atr_14": 4}, {"close": 106}],
+        },
+    )
+
+    def fake_execute_live_order(req):
+        orders.append(req)
+        return {"status": "submitted", "symbol": req.symbol, "side": req.side}
+
+    def fake_record_session_event(session_id, **kwargs):
+        events.append({"session_id": session_id, **kwargs})
+        return {}
+
+    monkeypatch.setattr(market_monitor, "execute_live_order", fake_execute_live_order)
+    monkeypatch.setattr(
+        market_monitor.auto_trading_store,
+        "record_session_event",
+        fake_record_session_event,
+    )
+
+    result = market_monitor.run_kis_market_watch(db_path=db_path)
+
+    assert {alert["alert_type"] for alert in result["alerts"]} == {
+        "trailing_stop_updated",
+        "trailing_stop_hit",
+    }
+    assert len(orders) == 1
+    order = orders[0]
+    assert order.symbol == "005930"
+    assert order.side == "sell"
+    assert order.quantity == 3
+    assert order.price == 106
+    assert order.strategy_type == "swing"
+    assert order.trailing_stop == 112
+    assert order.confirm_token == "confirm-live"
+    assert events[0]["event_type"] == "trailing_stop_exit"
+    hit_alert = next(alert for alert in result["alerts"] if alert["alert_type"] == "trailing_stop_hit")
+    assert hit_alert["raw"]["auto_exit"]["status"] == "submitted"
 
 
 def test_naver_news_watch_dedupes_news_across_queries(tmp_path, monkeypatch):

@@ -236,7 +236,7 @@ def reconcile_after_broker_sync(
     broker_db_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Reconcile a symbol state from the latest broker sync database."""
-    broker_path = Path(broker_db_path or settings.broker_sync_db_path)
+    broker_path = settings.storage_path(broker_db_path or settings.broker_sync_db_path)
     if not broker_path.exists():
         return get_position_state(symbol, db_path=state_db_path) or {
             "symbol": symbol,
@@ -371,7 +371,7 @@ def reconcile_all_after_broker_sync(
     broker_db_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Reconcile every known order-state symbol from the latest broker snapshot."""
-    broker_path = Path(broker_db_path or settings.broker_sync_db_path)
+    broker_path = settings.storage_path(broker_db_path or settings.broker_sync_db_path)
     state_path = _db_path(state_db_path)
     symbols: set[str] = set()
 
@@ -741,7 +741,7 @@ def _quantity_for_state(state: str) -> int:
 
 
 def _db_path(db_path: Path | str | None = None) -> Path:
-    return Path(db_path or settings.order_state_db_path)
+    return settings.storage_path(db_path or settings.order_state_db_path)
 
 
 def _parse_json(value: str | None, default: Any) -> Any:

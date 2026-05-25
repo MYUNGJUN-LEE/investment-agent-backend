@@ -9,7 +9,11 @@ from app.features.technical import build_technical_features, latest_technical_fe
 from app.storage.market_data import record_price_snapshot
 
 
-def fetch_price_data(symbol: str) -> dict[str, Any]:
+def fetch_price_data(
+    symbol: str,
+    *,
+    include_intraday: bool = True,
+) -> dict[str, Any]:
     """
     Fetch KIS market data and derive trading indicators.
 
@@ -59,42 +63,54 @@ def fetch_price_data(symbol: str) -> dict[str, Any]:
         }
 
     optional_errors: list[str] = []
-    minute_data = _optional_api_call(
-        "minute_prices",
-        lambda: client.get_minute_prices(symbol=symbol),
-        optional_errors,
-    )
-    orderbook_data = _optional_api_call(
-        "orderbook",
-        lambda: client.get_orderbook(symbol=symbol),
-        optional_errors,
-    )
-    execution_data = _optional_api_call(
-        "executions",
-        lambda: client.get_executions(symbol=symbol),
-        optional_errors,
-    )
-    investor_data = _optional_api_call(
-        "investor_flow",
-        lambda: client.get_investor_flow(symbol=symbol),
-        optional_errors,
-    )
-    investor_daily_data = _optional_api_call(
-        "investor_daily",
-        lambda: client.get_investor_daily(
-            symbol=symbol,
-            start_date=(datetime.now() - timedelta(days=14)).strftime("%Y%m%d"),
-        ),
-        optional_errors,
-    )
+    minute_data: dict[str, Any] = {}
+    orderbook_data: dict[str, Any] = {}
+    execution_data: dict[str, Any] = {}
+    investor_data: dict[str, Any] = {}
+    investor_daily_data: dict[str, Any] = {}
+    if include_intraday:
+        minute_data = _optional_api_call(
+            "minute_prices",
+            lambda: client.get_minute_prices(symbol=symbol),
+            optional_errors,
+        )
+        orderbook_data = _optional_api_call(
+            "orderbook",
+            lambda: client.get_orderbook(symbol=symbol),
+            optional_errors,
+        )
+        execution_data = _optional_api_call(
+            "executions",
+            lambda: client.get_executions(symbol=symbol),
+            optional_errors,
+        )
+        investor_data = _optional_api_call(
+            "investor_flow",
+            lambda: client.get_investor_flow(symbol=symbol),
+            optional_errors,
+        )
+        investor_daily_data = _optional_api_call(
+            "investor_daily",
+            lambda: client.get_investor_daily(
+                symbol=symbol,
+                start_date=(datetime.now() - timedelta(days=14)).strftime("%Y%m%d"),
+            ),
+            optional_errors,
+        )
 
     output = data.get("output") or {}
     daily_candles = _parse_daily_candles(daily_data)
-    minute_candles = _parse_minute_candles(minute_data)
     technical_features = build_technical_features(daily_candles)
-    orderbook = _parse_orderbook(orderbook_data)
-    executions = _parse_executions(execution_data)
-    investor_flow = _parse_investor_flow(investor_data, investor_daily_data)
+    if include_intraday:
+        minute_candles = _parse_minute_candles(minute_data)
+        orderbook = _parse_orderbook(orderbook_data)
+        executions = _parse_executions(execution_data)
+        investor_flow = _parse_investor_flow(investor_data, investor_daily_data)
+    else:
+        minute_candles = []
+        orderbook = {}
+        executions = {}
+        investor_flow = {}
 
     current_price = _to_float(output.get("stck_prpr"))
     change_rate = _to_float(output.get("prdy_ctrt"))
@@ -107,12 +123,16 @@ def fetch_price_data(symbol: str) -> dict[str, Any]:
         turnover_value=turnover_value,
         daily_candles=daily_candles,
     )
-    intraday = _calculate_intraday_indicators(
-        current_price=current_price,
-        minute_candles=minute_candles,
-        orderbook=orderbook,
-        executions=executions,
-        investor_flow=investor_flow,
+    intraday = (
+        _calculate_intraday_indicators(
+            current_price=current_price,
+            minute_candles=minute_candles,
+            orderbook=orderbook,
+            executions=executions,
+            investor_flow=investor_flow,
+        )
+        if include_intraday
+        else {}
     )
 
     result = {
@@ -143,6 +163,7 @@ def fetch_price_data(symbol: str) -> dict[str, Any]:
         "investor_flow": investor_flow,
         "intraday": intraday,
         "optional_errors": optional_errors,
+        "intraday_enriched": include_intraday,
         "source": "KIS Open API",
         "raw": output,
     }

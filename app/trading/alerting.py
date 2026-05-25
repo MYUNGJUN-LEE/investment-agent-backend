@@ -141,7 +141,7 @@ def _severity_allowed(severity: str) -> bool:
 
 
 def _db_path(db_path: Path | str | None = None) -> Path:
-    return Path(db_path or settings.alert_db_path)
+    return settings.storage_path(db_path or settings.alert_db_path)
 
 
 def _json(data: Any) -> str:

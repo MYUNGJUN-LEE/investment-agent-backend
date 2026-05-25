@@ -77,7 +77,7 @@ class KisClient:
         self._token_cache_path = (
             Path(token_cache_path)
             if token_cache_path is not None
-            else Path(settings.kis_token_cache_path)
+            else settings.storage_path(settings.kis_token_cache_path)
         )
         self._token_cache_path_explicit = token_cache_path is not None
 
