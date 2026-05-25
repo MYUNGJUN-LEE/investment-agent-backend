@@ -421,6 +421,25 @@ def test_token_cache_key_is_isolated_by_secret_and_account():
     assert first._token_cache_key() != second._token_cache_key()
 
 
+def test_runtime_diagnostics_include_safe_key_fingerprints():
+    client = KisClient(
+        app_key="same-app-key",
+        app_secret="first-secret",
+        account_no="12345678",
+        account_product_code="01",
+        is_paper=True,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+    )
+
+    diagnostics = client.runtime_diagnostics()
+
+    assert diagnostics["app_key_fingerprint"]
+    assert diagnostics["app_secret_fingerprint"]
+    assert diagnostics["token_cache_key_fingerprint"] == client._token_cache_key()[:12]
+    assert diagnostics["app_key_fingerprint"] != "same-app-key"
+    assert diagnostics["app_secret_fingerprint"] != "first-secret"
+
+
 def test_get_balance_rejects_invalid_account_format_before_http_call():
     calls: list[httpx.Request] = []
 

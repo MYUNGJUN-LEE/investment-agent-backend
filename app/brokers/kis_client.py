@@ -727,8 +727,10 @@ class KisClient:
             "is_paper": self.is_paper,
             "app_key_configured": bool(self.app_key),
             "app_key_length": len(self.app_key or ""),
+            "app_key_fingerprint": _fingerprint(self.app_key),
             "app_secret_configured": bool(self.app_secret),
             "app_secret_length": len(self.app_secret or ""),
+            "app_secret_fingerprint": _fingerprint(self.app_secret),
             "account_no_configured": bool(self.account_no),
             "account_no_length": len(self.account_no or ""),
             "account_no_last4": (self.account_no or "")[-4:],
@@ -745,6 +747,7 @@ class KisClient:
             ),
             "token_cache_path": str(self._token_cache_path),
             "token_cache_enabled": self._shared_token_cache_enabled(),
+            "token_cache_key_fingerprint": self._token_cache_key()[:12],
             "request_min_interval_seconds": settings.kis_request_min_interval_seconds,
             "cached_token_available": bool(self._load_shared_access_token()),
             "token_issue_cooldown_until": (
@@ -785,6 +788,12 @@ def _digits(value: Any) -> str:
     if value is None:
         return ""
     return re.sub(r"\D", "", str(value).strip())
+
+
+def _fingerprint(value: Any) -> str:
+    if not value:
+        return ""
+    return sha256(str(value).encode("utf-8")).hexdigest()[:12]
 
 
 def _safe_response_json(response: httpx.Response) -> dict[str, Any] | list[Any] | None:
