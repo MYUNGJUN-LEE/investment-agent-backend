@@ -417,6 +417,7 @@ def _set_action_schema_server_url(content: str, public_url: str) -> str:
 def _health_payload():
     return {
         "status": "ok",
+        "message": "Backend health check passed",
         "service": settings.app_name,
         "auth_enabled": bool(settings.backend_api_key),
     }

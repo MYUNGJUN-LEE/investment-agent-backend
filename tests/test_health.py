@@ -8,6 +8,7 @@ def test_health():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.json()["message"] == "Backend health check passed"
 
 
 def test_health_allows_head_and_options():
@@ -41,17 +42,21 @@ def test_action_schema_is_served_for_custom_gpt():
     assert response.headers["content-type"].startswith("text/yaml")
     assert response.headers["cache-control"] == "no-store"
     assert "openapi: 3.1.0" in response.text
+    assert "version: 1.0.3" in response.text
+    assert "\n  /gpt/health:\n    post:\n      operationId: healthCheck" in response.text
     assert "operationId: healthCheck" in response.text
     assert "\n  /health:" not in response.text
     assert "\n      operationId: gptBackendHealthCheck\n" not in response.text
-    assert "gptBackendHealthCheckPost" in response.text
+    assert "gptBackendHealthCheckPost" not in response.text
     assert "/gpt/workers/status" in response.text
     assert "/gpt/broker/kis/account-probe" in response.text
     assert "/gpt/auto-trading/status" in response.text
     assert "/gpt/auto-trading/start-paper" in response.text
     assert "nullable:" not in response.text
+    assert "anyOf:" not in response.text
     assert 'type: "null"' not in response.text
-    assert "GptStartPaperRequest" in response.text
+    assert "GptStartPaperRequest" not in response.text
+    assert "StartPaperRequest" in response.text
     assert '$ref: "#/components/schemas/GenericJsonResponse"' in response.text
     assert "  - url: https://api.autoinvestmentkorea.online" in response.text
 
