@@ -672,6 +672,24 @@ def stop_auto_trading_session(session_id: str):
 
 
 @app.post(
+    "/auto-trading/stop",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+def stop_all_auto_trading_sessions_compat():
+    active = list_auto_trading_sessions(status="active", limit=500)["sessions"]
+    stopped = [stop_auto_trading(session["session_id"]) for session in active]
+    return {
+        "status": "success",
+        "command": "stop",
+        "message": f"Stopped {len(stopped)} active auto-trading session(s)",
+        "active_sessions": [],
+        "recent_sessions": list_auto_trading_sessions(limit=10)["sessions"],
+        "stopped_sessions": stopped,
+    }
+
+
+@app.post(
     "/auto-trading/restart/{session_id}",
     response_model=AutoTradeRestartResponse,
     dependencies=[Depends(verify_api_key)],

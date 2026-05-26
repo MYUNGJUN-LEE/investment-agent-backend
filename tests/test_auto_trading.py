@@ -739,6 +739,30 @@ def test_gpt_status_and_start_paper_compatibility_routes(tmp_path, monkeypatch):
     assert "detail" not in start_response.json()
 
 
+def test_legacy_auto_trading_stop_without_session_id_stops_active_sessions(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
+    session = auto_trading_store.create_session(
+        AutoTradeStartRequest(run_immediately=True, interval_seconds=60)
+    )
+
+    response = client.post(
+        "/auto-trading/stop",
+        headers=_auth_headers(),
+        follow_redirects=False,
+    )
+    updated = auto_trading_store.get_session(session["session_id"], db_path=tmp_path / "auto.sqlite3")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["status"] == "success"
+    assert response.json()["command"] == "stop"
+    assert response.json()["stopped_sessions"][0]["session_id"] == session["session_id"]
+    assert updated["status"] == "stopped"
+
+
 def test_gpt_auto_trading_routes_do_not_redirect_on_trailing_slash(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
 
