@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Investment Auto Trading GPT Control API
-  version: 1.0.0
+  version: 1.0.1
   description: Minimal Custom GPT action schema for checking and controlling the auto-trading backend.
 servers:
   - url: https://api.autoinvestmentkorea.online
