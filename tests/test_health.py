@@ -39,8 +39,11 @@ def test_action_schema_is_served_for_custom_gpt():
     response = client.get("/action-schema.yaml")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/yaml")
+    assert response.headers["cache-control"] == "no-store"
     assert "openapi: 3.1.0" in response.text
-    assert "gptBackendHealthCheck" in response.text
+    assert "operationId: healthCheck" in response.text
+    assert "\n  /health:" not in response.text
+    assert "\n      operationId: gptBackendHealthCheck\n" not in response.text
     assert "gptBackendHealthCheckPost" in response.text
     assert "/gpt/workers/status" in response.text
     assert "/gpt/broker/kis/account-probe" in response.text
@@ -50,7 +53,7 @@ def test_action_schema_is_served_for_custom_gpt():
     assert 'type: "null"' not in response.text
     assert "GptStartPaperRequest" in response.text
     assert '$ref: "#/components/schemas/GenericJsonResponse"' in response.text
-    assert "  - url: http://testserver" in response.text
+    assert "  - url: https://api.autoinvestmentkorea.online" in response.text
 
 
 def test_action_schema_uses_forwarded_public_host(monkeypatch):

@@ -389,6 +389,7 @@ def custom_gpt_action_schema(request: Request):
     return PlainTextResponse(
         content=content,
         media_type="text/yaml",
+        headers={"Cache-Control": "no-store"},
     )
 
 

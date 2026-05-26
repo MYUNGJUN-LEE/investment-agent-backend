@@ -9,7 +9,7 @@ class Settings(BaseSettings):
 
     # If this is set, requests must include X-API-Key with the same value.
     backend_api_key: str | None = None
-    action_schema_public_url: str | None = None
+    action_schema_public_url: str | None = "https://api.autoinvestmentkorea.online"
 
     # Comma-separated browser/GPT origins allowed to call this API.
     cors_allow_origins: str = (

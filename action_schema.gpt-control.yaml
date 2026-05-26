@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Investment Auto Trading GPT Control API
-  version: 1.0.1
+  version: 1.0.2
   description: Minimal Custom GPT action schema for checking and controlling the auto-trading backend.
 servers:
   - url: https://api.autoinvestmentkorea.online
@@ -261,23 +261,10 @@ security:
   - ApiKeyAuth: []
 
 paths:
-  /health:
-    get:
-      operationId: healthCheck
-      summary: Check backend health.
-      security: []
-      responses:
-        "200":
-          description: Backend health status.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/HealthResponse"
-
   /gpt/health:
     get:
-      operationId: gptBackendHealthCheck
-      summary: Check backend health using a GPT-specific path.
+      operationId: healthCheck
+      summary: Check backend health using the GPT-compatible path.
       security: []
       responses:
         "200":
@@ -285,7 +272,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HealthResponse"
+                $ref: "#/components/schemas/GenericJsonResponse"
     post:
       operationId: gptBackendHealthCheckPost
       summary: Check backend health using a GPT-specific POST path.
@@ -296,7 +283,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HealthResponse"
+                $ref: "#/components/schemas/GenericJsonResponse"
 
   /gpt/workers/status:
     get:
