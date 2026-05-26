@@ -162,7 +162,14 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 def _is_gpt_action_path(request: Request) -> bool:
     path = request.url.path.rstrip("/")
-    return path == "/gpt" or path.startswith("/gpt/")
+    if path == "/gpt" or path.startswith("/gpt/"):
+        return True
+    return path in {
+        "/auto-trading",
+        "/auto-trading/sessions",
+        "/auto-trading/status",
+        "/auto-trading/stop",
+    }
 
 
 def _gpt_error_payload(
@@ -631,11 +638,31 @@ def run_edge_calibration():
     operation_id="listAutoTradingSessions",
     summary="List persistent auto-trading sessions",
 )
+@app.get(
+    "/auto-trading/sessions/",
+    response_model=AutoTradeSessionsResponse,
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
 def list_auto_trading_sessions_endpoint(
     status: str | None = None,
     limit: int = 50,
 ):
     return list_auto_trading_sessions(status=status, limit=limit)
+
+
+@app.get(
+    "/auto-trading/status",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+@app.get(
+    "/auto-trading/status/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+def get_auto_trading_status_compat():
+    return control_auto_trading_from_gpt(GptAutoTradeControlRequest(command="status"))
 
 
 @app.get(

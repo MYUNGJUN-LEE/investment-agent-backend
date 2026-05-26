@@ -763,6 +763,38 @@ def test_legacy_auto_trading_stop_without_session_id_stops_active_sessions(
     assert updated["status"] == "stopped"
 
 
+def test_legacy_auto_trading_action_paths_return_2xx_json_for_gpt_clients(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
+    monkeypatch.setattr(settings, "backend_api_key", "secret-key")
+    auto_trading_store.create_session(
+        AutoTradeStartRequest(run_immediately=True, interval_seconds=60)
+    )
+
+    missing_auth_responses = [
+        client.post("/auto-trading/stop", follow_redirects=False),
+        client.get("/auto-trading/status", follow_redirects=False),
+        client.get("/auto-trading/sessions/", follow_redirects=False),
+    ]
+    authed_status_response = client.get(
+        "/auto-trading/status",
+        headers={"X-API-Key": "secret-key"},
+        follow_redirects=False,
+    )
+
+    for response in missing_auth_responses:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.json()["status"] == "error"
+        assert response.json()["http_status"] == 401
+
+    assert authed_status_response.status_code == 200
+    assert authed_status_response.headers["content-type"].startswith("application/json")
+    assert authed_status_response.json()["command"] == "status"
+
+
 def test_gpt_auto_trading_routes_do_not_redirect_on_trailing_slash(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
 
