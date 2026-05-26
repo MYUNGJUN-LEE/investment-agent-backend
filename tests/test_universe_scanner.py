@@ -2,9 +2,25 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.trading import auto_trading
+from app.trading.atr_exits import atr_exit_levels_from_price_data
 from app.trading import universe_scanner
+
+
+@pytest.fixture(autouse=True)
+def stable_market_context(monkeypatch):
+    monkeypatch.setattr(
+        universe_scanner,
+        "get_latest_market_context",
+        lambda: {
+            "market_regime": "bull",
+            "risk_on_score": 70,
+            "selected_sector_relative_strength": {"score": 65},
+        },
+    )
 
 
 def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monkeypatch):
@@ -38,13 +54,15 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
     )
 
     price_rows = {
-        "005930": {
-            "symbol": "005930",
+        "035900": {
+            "symbol": "035900",
             "current_price": 70000,
             "change_rate": 2.1,
             "volume": 10_000_000,
             "volume_ratio": 2.4,
             "turnover_value": 700_000_000_000,
+            "market_cap": 1_200_000_000_000,
+            "market_segment": "KOSDAQ",
             "intraday": {"minute_volume_ratio": 2.0},
             "latest_technical_features": {
                 "close": 70000,
@@ -64,13 +82,15 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
             "overheated": False,
             "source": "test",
         },
-        "000660": {
-            "symbol": "000660",
+        "041510": {
+            "symbol": "041510",
             "current_price": 180000,
             "change_rate": 8.5,
             "volume": 3_000_000,
             "volume_ratio": 1.6,
             "turnover_value": 540_000_000_000,
+            "market_cap": 900_000_000_000,
+            "market_segment": "KOSDAQ",
             "intraday": {"minute_volume_ratio": 1.1},
             "latest_technical_features": {
                 "close": 180000,
@@ -86,13 +106,15 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
             "overheated": False,
             "source": "test",
         },
-        "373220": {
-            "symbol": "373220",
+        "145020": {
+            "symbol": "145020",
             "current_price": 350000,
             "change_rate": -6.0,
             "volume": 100_000,
             "volume_ratio": 0.4,
             "turnover_value": 35_000_000_000,
+            "market_cap": 1_500_000_000_000,
+            "market_segment": "KOSDAQ",
             "intraday": {},
             "latest_technical_features": {
                 "close": 350000,
@@ -128,26 +150,33 @@ def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monk
 
     req = AutoTradeStartRequest(
         auto_discover_symbols=True,
+        universe_seed_symbols=["035900", "041510", "145020"],
         universe_candidate_limit=2,
         universe_final_limit=1,
     )
 
     result = universe_scanner.scan_universe_for_auto_trade(req, db_path=db_path)
     latest = universe_scanner.get_latest_universe_scan(db_path=db_path)
+    expected_levels = atr_exit_levels_from_price_data(
+        entry_price=70000,
+        price_data=price_rows["035900"],
+    )
 
     assert result["status"] == "success"
     assert result["candidate_count"] == 2
     assert result["final_count"] == 1
-    assert result["symbols"][0].symbol == "005930"
+    assert result["symbols"][0].symbol == "035900"
     assert result["symbols"][0].account_equity == 10_000_000
     assert result["symbols"][0].risk_per_trade == 0.005
-    assert result["symbols"][0].stop_loss == 70000 - 1.8 * 1000
-    assert result["symbols"][0].take_profit == 70000 + 2.5 * (1.8 * 1000)
-    assert result["symbols"][0].trailing_stop == 70500 - 2.0 * 1000
+    assert result["symbols"][0].stop_loss == expected_levels["stop_loss"]
+    assert result["symbols"][0].take_profit == expected_levels["take_profit"]
+    assert result["symbols"][0].expected_loss_bps == 300
+    assert result["symbols"][0].expected_win_bps == 500
+    assert result["symbols"][0].trailing_stop == expected_levels["trailing_stop"]
     assert result["symbols"][0].strategy_type == "swing"
     assert result["symbols"][0].expected_gross_edge_bps is not None
     assert latest["scan_id"] == result["scan_id"]
-    assert latest["candidates"][0]["symbol"] == "005930"
+    assert latest["candidates"][0]["symbol"] == "035900"
     assert latest["candidates"][0]["net_edge"] > result["worker_hurdle_rate"]
 
 
@@ -210,6 +239,142 @@ def test_high_quality_swing_candidate_lifts_fill_adjusted_edge(monkeypatch):
     assert scored["edge_reward_risk"]["gross_return_floor_bps"] > 300
     assert scored["net_edge"] >= 30
     assert "atr_rr" in scored["edge_model"]
+
+
+def test_universe_filters_block_illiquid_macro_and_inverse_alignment(monkeypatch):
+    base = {
+        "symbol": "005930",
+        "current_price": 10_000,
+        "change_rate": 2.0,
+        "volume": 1_000_000,
+        "volume_ratio": 2.0,
+        "turnover_value": 30_000_000_000,
+        "market_context": {"market_regime": "bull", "risk_on_score": 70},
+        "latest_technical_features": {
+            "close": 10_000,
+            "return_5d": 0.03,
+            "return_20d": 0.06,
+            "return_60d": 0.12,
+            "high_breakout_20d": True,
+            "low_breakdown_20d": False,
+            "ma5": 10_200,
+            "ma20": 10_400,
+            "ma60": 10_600,
+            "ma20_slope": -20,
+            "atr_14_pct": 0.03,
+        },
+    }
+
+    inverse = universe_scanner._score_snapshot(dict(base))
+    assert inverse["decision"] == "exclude"
+    assert "inverse_alignment" in inverse["reason"]
+
+    illiquid = universe_scanner._score_snapshot(
+        {
+            **base,
+            "volume": 50_000,
+            "turnover_value": 1_000_000_000,
+            "latest_technical_features": {
+                **base["latest_technical_features"],
+                "ma5": 10_000,
+                "ma20": 9_800,
+                "ma60": 9_500,
+                "ma20_slope": 20,
+            },
+        }
+    )
+    assert illiquid["decision"] == "exclude"
+    assert "liquidity" in illiquid["reason"]
+
+    macro = universe_scanner._score_snapshot(
+        {
+            **base,
+            "market_context": {"market_regime": "bear", "risk_on_score": 20},
+            "latest_technical_features": {
+                **base["latest_technical_features"],
+                "ma5": 10_000,
+                "ma20": 9_800,
+                "ma60": 9_500,
+                "ma20_slope": 20,
+            },
+        }
+    )
+    assert macro["decision"] == "exclude"
+    assert "macro_trend" in macro["reason"]
+
+
+def test_universe_scanner_adds_weighted_momentum_score():
+    scored = universe_scanner._score_snapshot(
+        {
+            "symbol": "005930",
+            "current_price": 10_000,
+            "change_rate": 3.0,
+            "volume": 2_000_000,
+            "volume_ratio": 3.0,
+            "turnover_value": 60_000_000_000,
+            "relative_strength_score": 78,
+            "market_context": {"market_regime": "bull", "risk_on_score": 70},
+            "latest_technical_features": {
+                "close": 10_000,
+                "return_5d": 0.04,
+                "return_20d": 0.09,
+                "return_60d": 0.16,
+                "high_breakout_20d": True,
+                "low_breakdown_20d": False,
+                "ma5": 10_000,
+                "ma20": 9_800,
+                "ma60": 9_500,
+                "ma20_slope": 30,
+                "atr_14_pct": 0.035,
+            },
+        }
+    )
+
+    assert scored["decision"] == "buy_candidate"
+    assert scored["momentum_score"] > 75
+    assert scored["momentum_components"]["weights"] == {
+        "relative_strength": 0.45,
+        "volume_ratio": 0.25,
+        "volatility_breakout": 0.30,
+    }
+
+
+def test_large_cap_requires_five_percent_expected_return_for_top10(monkeypatch):
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_scanner_large_cap_min_3d_return_bps",
+        500,
+    )
+    candidate = {
+        "symbol": "005930",
+        "decision": "buy_candidate",
+        "current_price": 70000,
+        "expected_return": 420,
+        "net_edge": 120,
+        "edge_reward_risk": {
+            "expected_value_after_cost_bps": 40,
+            "reward_risk_ratio": 1.8,
+        },
+    }
+
+    blocked_status, blocked_reason = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=0,
+        entry_gate={"approved": True},
+    )
+    allowed_status, _ = universe_scanner._execution_status_for_candidate(
+        {**candidate, "expected_return": 520},
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=0,
+        entry_gate={"approved": True},
+    )
+
+    assert blocked_status == "ARCHIVED"
+    assert "large-cap requires" in blocked_reason
+    assert allowed_status == "READY"
 
 
 def test_universe_scanner_uses_fast_price_fetch_and_caps_symbol_sleep(monkeypatch):

@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
+from app.trading.atr_exits import atr_exit_levels
 from app.trading import market_monitor
 
 
@@ -104,8 +105,11 @@ def test_kis_market_watch_updates_atr_trailing_stop_state(tmp_path, monkeypatch)
 
     result = market_monitor.run_kis_market_watch(db_path=db_path)
 
-    assert result["alert_count"] == 1
-    assert result["alerts"][0]["alert_type"] == "trailing_stop_updated"
+    assert result["alert_count"] == 2
+    assert {alert["alert_type"] for alert in result["alerts"]} == {
+        "trailing_stop_updated",
+        "take_profit_hit",
+    }
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
             """
@@ -114,7 +118,8 @@ def test_kis_market_watch_updates_atr_trailing_stop_state(tmp_path, monkeypatch)
             WHERE symbol = '005930'
             """
         ).fetchone()
-    assert row == (115, 107, 107)
+    levels = atr_exit_levels(entry_price=100, atr14=4, highest_close=115)
+    assert row == (115, levels["trailing_stop"], levels["trailing_stop"])
 
 
 def test_kis_market_watch_submits_live_exit_when_trailing_stop_hits(
@@ -201,11 +206,61 @@ def test_kis_market_watch_submits_live_exit_when_trailing_stop_hits(
     assert order.quantity == 3
     assert order.price == 106
     assert order.strategy_type == "swing"
-    assert order.trailing_stop == 112
+    levels = atr_exit_levels(entry_price=100, atr14=4, highest_close=120)
+    assert order.trailing_stop == levels["trailing_stop"]
     assert order.confirm_token == "confirm-live"
     assert events[0]["event_type"] == "trailing_stop_exit"
     hit_alert = next(alert for alert in result["alerts"] if alert["alert_type"] == "trailing_stop_hit")
     assert hit_alert["raw"]["auto_exit"]["status"] == "submitted"
+
+
+def test_kis_market_watch_emits_time_stop_exit_after_five_trading_days(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "monitor.sqlite3"
+    monkeypatch.setattr(settings, "market_monitor_db_path", str(db_path))
+    monkeypatch.setattr(settings, "alert_db_path", str(tmp_path / "alerts.sqlite3"))
+    monkeypatch.setattr(settings, "position_time_stop_trading_days", 5)
+    monkeypatch.setattr(
+        market_monitor,
+        "_resolve_watchlist",
+        lambda: {"005930": {"symbol": "005930", "name": "Samsung Electronics"}},
+    )
+    monkeypatch.setattr(
+        market_monitor,
+        "_load_broker_positions",
+        lambda: {
+            "005930": {
+                "symbol": "005930",
+                "quantity": 2,
+                "avg_price": 100,
+                "opened_at": "2020-01-01T09:00:00",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        market_monitor,
+        "fetch_price_data",
+        lambda symbol: {
+            "status": "connected",
+            "symbol": symbol,
+            "current_price": 101,
+            "change_rate": 0.2,
+            "volume_ratio": 1.0,
+            "latest_technical_features": {
+                "close": 101,
+                "atr_14": 2,
+            },
+            "technical_features": [{"close": 100, "atr_14": 2}, {"close": 101}],
+        },
+    )
+
+    result = market_monitor.run_kis_market_watch(db_path=db_path)
+
+    assert "time_stop_exit" in {alert["alert_type"] for alert in result["alerts"]}
+    time_stop = next(alert for alert in result["alerts"] if alert["alert_type"] == "time_stop_exit")
+    assert time_stop["raw"]["auto_exit"] is None
 
 
 def test_naver_news_watch_dedupes_news_across_queries(tmp_path, monkeypatch):

@@ -976,25 +976,30 @@ def _atr_exit_candidates(price_data: dict[str, Any]) -> tuple[list[str], list[st
         latest = price_data.get("latest_technical_features") or {}
         entry = _as_float(latest.get("close"))
     levels = atr_exit_levels_from_price_data(entry_price=entry, price_data=price_data)
-    atr14 = levels.get("atr_14")
-    if entry is None or atr14 is None:
+    if entry is None:
         return (
-            ["ATR14 unavailable; use a confirmed support break as the fallback stop"],
-            ["ATR14 unavailable; defer target until ATR14 is available"],
+            ["Mechanical stop: unavailable until entry price is confirmed"],
+            ["Mechanical target: unavailable until entry price is confirmed"],
         )
 
     stop_candidates = [
-        f"ATR14 stop: {levels['stop_loss']} = entry - 1.8 * ATR14",
+        (
+            f"Mechanical stop: {levels['stop_loss']} "
+            f"= fee-adjusted net -{levels['net_stop_loss_bps'] / 100:.1f}%"
+        ),
     ]
     if levels.get("trailing_stop") is not None:
         stop_candidates.append(
-            f"Trailing stop after profit: {levels['trailing_stop']} = highest_close - 2.0 * ATR14"
+            f"Trailing stop after profit: {levels['trailing_stop']}"
         )
     else:
-        stop_candidates.append("Activate trailing stop after profit: highest_close - 2.0 * ATR14")
+        stop_candidates.append("Activate trailing stop after profit")
     take_candidates = [
-        f"ATR R target: {levels['take_profit']} = entry + 2.5R",
-        "Scale out only if target zone is reached with weakening volume/momentum",
+        (
+            f"Mechanical target: {levels['take_profit']} "
+            f"= fee-adjusted net +{levels['net_take_profit_bps'] / 100:.1f}%"
+        ),
+        f"Target reward/risk: {levels['reward_risk_ratio']}",
     ]
     return stop_candidates, take_candidates
 

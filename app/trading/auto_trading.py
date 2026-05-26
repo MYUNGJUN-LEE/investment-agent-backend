@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 import sqlite3
 import time
 from typing import Any
@@ -301,7 +301,7 @@ def _run_cycle(
         )
         symbols = scan["symbols"]
         symbols.extend(
-            _expired_candidate_exit_symbols(
+            _managed_position_exit_symbols(
                 req=req,
                 active_candidate_symbols=set(scan.get("active_candidate_symbols") or []),
             )
@@ -469,7 +469,12 @@ def _orchestrated_result_payload(
             for item in plan["exit_symbols"]
         ],
         "planned_entries": [
-            {"symbol": item.symbol, "signal_score": item.signal_score}
+            {
+                "symbol": item.symbol,
+                "signal_score": item.signal_score,
+                "position_size": item.position_size,
+                "cash_available": item.cash_available,
+            }
             for item in plan["entry_symbols"]
         ],
         "entry_gate": plan["entry_gate"],
@@ -489,7 +494,7 @@ def build_orchestrated_symbol_plan(
         if candidate.get("symbol")
     }
     positions = _open_positions(req.execution_mode)
-    exit_symbols = _expired_candidate_exit_symbols(
+    exit_symbols = _managed_position_exit_symbols(
         req=req,
         active_candidate_symbols=active_candidate_symbols,
     )
@@ -719,6 +724,22 @@ def _confirm_live_exits_before_entries(
     }
 
 
+def _managed_position_exit_symbols(
+    *,
+    req: AutoTradeStartRequest,
+    active_candidate_symbols: set[str],
+) -> list[AutoTradeSymbolConfig]:
+    by_symbol: dict[str, AutoTradeSymbolConfig] = {}
+    for item in _expired_candidate_exit_symbols(
+        req=req,
+        active_candidate_symbols=active_candidate_symbols,
+    ):
+        by_symbol[item.symbol] = item
+    for item in _time_stop_exit_symbols(req=req):
+        by_symbol[item.symbol] = item
+    return list(by_symbol.values())
+
+
 def _expired_candidate_exit_symbols(
     *,
     req: AutoTradeStartRequest,
@@ -747,6 +768,46 @@ def _expired_candidate_exit_symbols(
                 quantity=quantity,
                 signal_score=0,
                 expected_holding_days=5.0,
+            )
+        )
+    return exit_symbols
+
+
+def _time_stop_exit_symbols(
+    *,
+    req: AutoTradeStartRequest,
+) -> list[AutoTradeSymbolConfig]:
+    max_days = max(0, int(settings.position_time_stop_trading_days or 0))
+    if max_days <= 0:
+        return []
+    positions = _open_positions(req.execution_mode)
+    exit_symbols: list[AutoTradeSymbolConfig] = []
+    now = datetime.now()
+    for symbol, position in positions.items():
+        quantity = int(position.get("quantity") or 0)
+        if quantity <= 0:
+            continue
+        opened_at = _position_opened_at(position)
+        if opened_at is None:
+            continue
+        elapsed = _trading_days_elapsed(opened_at, now)
+        if elapsed < max_days:
+            continue
+        price = _to_float(position.get("current_price"))
+        exit_symbols.append(
+            AutoTradeSymbolConfig(
+                symbol=symbol,
+                name=position.get("name"),
+                market="KR",
+                strategy_type="swing",
+                risk_level="medium",
+                requested_action="exit",
+                price=price,
+                decision_price=price,
+                order_price=price,
+                quantity=quantity,
+                signal_score=0,
+                expected_holding_days=float(max_days),
             )
         )
     return exit_symbols
@@ -906,8 +967,46 @@ def _allocate_cash_to_symbols(
             }
             continue
 
+        circuit_breaker = _strategy_circuit_breaker_for_symbol(symbol_cfg, account)
+        if circuit_breaker.get("action") == "pause":
+            blocked_by_index[index] = {
+                "symbol": symbol_cfg.symbol,
+                "status": "blocked",
+                "message": str(
+                    circuit_breaker.get("message")
+                    or "Strategy circuit breaker paused entries"
+                ),
+                "strategy_circuit_breaker": circuit_breaker,
+            }
+            continue
+        target_weight = _target_position_weight(symbol_cfg) * float(
+            circuit_breaker.get("position_scale") or 1.0
+        )
+        target_weight = max(0.0, target_weight)
+        max_allocation = min(remaining_cash, account_equity * target_weight)
+        if max_allocation <= 0:
+            blocked_by_index[index] = _insufficient_cash_result(
+                symbol_cfg=symbol_cfg,
+                available_cash=remaining_cash,
+                account=account,
+                reason="position sizing allocation is zero",
+            )
+            continue
+
         requested_quantity = symbol_cfg.quantity
         if requested_quantity is not None:
+            requested_quantity = min(
+                int(requested_quantity),
+                int(max_allocation / price),
+            )
+            if requested_quantity <= 0:
+                blocked_by_index[index] = _insufficient_cash_result(
+                    symbol_cfg=symbol_cfg,
+                    available_cash=remaining_cash,
+                    account=account,
+                    reason="position cap is below the minimum executable quantity",
+                )
+                continue
             required_cash = price * int(requested_quantity)
             if required_cash > remaining_cash:
                 blocked_by_index[index] = _insufficient_cash_result(
@@ -918,6 +1017,7 @@ def _allocate_cash_to_symbols(
                 )
                 continue
             allocation = required_cash
+            symbol_cfg = symbol_cfg.model_copy(update={"quantity": requested_quantity})
         else:
             if symbol_cfg.stop_loss is None:
                 blocked_by_index[index] = _insufficient_cash_result(
@@ -932,7 +1032,7 @@ def _allocate_cash_to_symbols(
                 stop_loss=float(symbol_cfg.stop_loss),
                 account_equity=account_equity,
                 risk_per_trade=float(symbol_cfg.risk_per_trade or 0.005),
-                cash_available=remaining_cash,
+                cash_available=max_allocation,
             )
             recommended_quantity = int(recommendation["recommended_quantity"])
             if recommended_quantity <= 0:
@@ -945,6 +1045,7 @@ def _allocate_cash_to_symbols(
                 )
                 continue
             allocation = recommended_quantity * price
+            symbol_cfg = symbol_cfg.model_copy(update={"quantity": recommended_quantity})
 
         remaining_cash = max(0.0, remaining_cash - allocation)
         if opens_new_position:
@@ -954,6 +1055,9 @@ def _allocate_cash_to_symbols(
             update={
                 "account_equity": account_equity,
                 "cash_available": allocation,
+                "position_size": round(allocation / account_equity, 6)
+                if account_equity
+                else None,
             }
         )
 
@@ -993,6 +1097,45 @@ def _insufficient_cash_result(
         },
         "recommendation": recommendation,
     }
+
+
+def _target_position_weight(symbol_cfg: AutoTradeSymbolConfig) -> float:
+    base = max(0.0, float(settings.trade_orchestrator_base_position_weight or 0.10))
+    min_weight = max(0.0, float(settings.trade_orchestrator_min_position_weight or 0.0))
+    max_weight = max(min_weight, float(settings.trade_orchestrator_max_position_weight or base))
+    edge_cap = max(1.0, float(settings.trade_orchestrator_edge_weight_cap_bps or 300.0))
+    edge = _to_float(symbol_cfg.expected_gross_edge_bps)
+    if edge is None:
+        edge = _to_float(symbol_cfg.signal_score)
+        edge = (edge or 50.0) / 100.0 * edge_cap
+    edge_ratio = max(0.0, min(1.0, float(edge) / edge_cap))
+    weighted = base * (0.75 + edge_ratio * 0.75)
+    return round(max(min_weight, min(max_weight, weighted)), 6)
+
+
+def _strategy_circuit_breaker_for_symbol(
+    symbol_cfg: AutoTradeSymbolConfig,
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    path = settings.storage_path(paper_trading.DEFAULT_DB_PATH)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            paper_trading.initialize_db(conn)
+            return risk_manager.strategy_circuit_breaker(
+                conn=conn,
+                market=symbol_cfg.market,
+                strategy_type=symbol_cfg.strategy_type,
+            )
+    except Exception as exc:
+        return {
+            "enabled": bool(settings.strategy_circuit_breaker_enabled),
+            "action": "none",
+            "position_scale": 1.0,
+            "message": f"Strategy circuit breaker unavailable: {exc}",
+            "mode": account.get("mode"),
+        }
 
 
 def _run_symbol(
@@ -1273,9 +1416,11 @@ def _open_paper_positions() -> dict[str, dict[str, Any]]:
     try:
         with sqlite3.connect(path) as conn:
             conn.row_factory = sqlite3.Row
+            paper_trading.initialize_db(conn)
             rows = conn.execute(
                 """
-                SELECT symbol, name, quantity, avg_price AS current_price
+                SELECT symbol, name, quantity, avg_price AS current_price,
+                       opened_at, updated_at
                 FROM positions
                 WHERE quantity > 0
                 """
@@ -1292,9 +1437,11 @@ def _open_live_positions() -> dict[str, dict[str, Any]]:
     try:
         with sqlite3.connect(path) as conn:
             conn.row_factory = sqlite3.Row
+            conn.executescript(broker_sync.SCHEMA_SQL)
+            broker_sync._ensure_column(conn, "broker_positions", "opened_at", "TEXT")
             rows = conn.execute(
                 """
-                SELECT symbol, name, quantity, current_price
+                SELECT symbol, name, quantity, current_price, opened_at, synced_at
                 FROM broker_positions
                 WHERE broker = 'KIS'
                   AND quantity > 0
@@ -1317,6 +1464,30 @@ def _to_float(value: Any) -> float | None:
 def _to_int(value: Any) -> int | None:
     number = _to_float(value)
     return int(number) if number is not None else None
+
+
+def _position_opened_at(position: dict[str, Any]) -> datetime | None:
+    for key in ("opened_at", "updated_at", "synced_at"):
+        raw = position.get(key)
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(str(raw))
+        except ValueError:
+            continue
+    return None
+
+
+def _trading_days_elapsed(start: datetime, end: datetime) -> int:
+    if end.date() <= start.date():
+        return 0
+    days = 0
+    current = start.date()
+    while current < end.date():
+        current = current + timedelta(days=1)
+        if current.weekday() < 5:
+            days += 1
+    return days
 
 
 def _now() -> str:

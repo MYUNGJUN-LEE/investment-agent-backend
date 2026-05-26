@@ -962,6 +962,7 @@ def _top10_performance_from_store(
             FROM edge_training_samples
             WHERE rank IS NOT NULL
               AND rank <= 10
+              AND COALESCE(status, '') != 'ARCHIVED'
             ORDER BY observed_at DESC, id DESC
             LIMIT ?
             """,
@@ -979,14 +980,33 @@ def _top10_performance_from_store(
             "top_count": 10,
             "avg_return_bps": None,
             "win_rate": None,
+            "loss_rate": None,
+            "avg_win_bps": None,
+            "avg_loss_bps": None,
+            "reward_risk_ratio": None,
+            "expectancy_bps": None,
         }
     wins = sum(1 for value in returns if value > 0)
+    losses = sum(1 for value in returns if value < 0)
+    win_values = [value for value in returns if value > 0]
+    loss_values = [abs(value) for value in returns if value < 0]
+    win_rate = wins / len(returns)
+    loss_rate = losses / len(returns)
+    avg_win = sum(win_values) / len(win_values) if win_values else 0.0
+    avg_loss = sum(loss_values) / len(loss_values) if loss_values else 0.0
+    expectancy = win_rate * avg_win - loss_rate * avg_loss
     return {
         "status": "ready",
         "sample_count": len(returns),
         "top_count": 10,
         "avg_return_bps": round(sum(returns) / len(returns), 4),
-        "win_rate": round(wins / len(returns), 6),
+        "win_rate": round(win_rate, 6),
+        "loss_rate": round(loss_rate, 6),
+        "avg_win_bps": round(avg_win, 4),
+        "avg_loss_bps": round(avg_loss, 4),
+        "reward_risk_ratio": round(avg_win / avg_loss, 4) if avg_loss else None,
+        "expectancy_bps": round(expectancy, 4),
+        "expectancy_formula": "E = (win_rate * avg_win_bps) - (loss_rate * avg_loss_bps)",
     }
 
 
@@ -1178,8 +1198,9 @@ def _default_gate(
             "min_oos_samples": settings.edge_calibration_gate_min_oos_samples,
             "max_mae_return_bps": settings.edge_calibration_gate_max_mae_return_bps,
             "max_mae_risk_bps": settings.edge_calibration_gate_max_mae_risk_bps,
-            "min_top10_avg_return_bps": settings.edge_calibration_gate_min_top10_avg_return_bps,
-            "min_top10_win_rate": settings.edge_calibration_gate_min_top10_win_rate,
+            "min_top10_avg_return_bps": _effective_min_top10_avg_return_bps(),
+            "target_top10_win_rate": settings.edge_calibration_gate_min_top10_win_rate,
+            "min_top10_expectancy_bps": settings.edge_calibration_gate_min_top10_expectancy_bps,
             "min_fill_adjusted_edge_bps": settings.edge_calibration_gate_min_fill_adjusted_edge_bps,
         },
     }
@@ -1200,8 +1221,22 @@ def _gate_from_metrics(
     min_oos = int(settings.edge_calibration_gate_min_oos_samples or 200)
     max_return_mae = float(settings.edge_calibration_gate_max_mae_return_bps or 180.0)
     max_risk_mae = float(settings.edge_calibration_gate_max_mae_risk_bps or 180.0)
-    min_top10_return = float(settings.edge_calibration_gate_min_top10_avg_return_bps or 20.0)
-    min_top10_win_rate = float(settings.edge_calibration_gate_min_top10_win_rate or 0.52)
+    configured_min_top10_return = float(
+        settings.edge_calibration_gate_min_top10_avg_return_bps
+        if settings.edge_calibration_gate_min_top10_avg_return_bps is not None
+        else 10.0
+    )
+    min_top10_return = _effective_min_top10_avg_return_bps()
+    target_top10_win_rate = float(
+        settings.edge_calibration_gate_min_top10_win_rate
+        if settings.edge_calibration_gate_min_top10_win_rate is not None
+        else 0.50
+    )
+    min_top10_expectancy = float(
+        settings.edge_calibration_gate_min_top10_expectancy_bps
+        if settings.edge_calibration_gate_min_top10_expectancy_bps is not None
+        else 0.0
+    )
     min_fill_adjusted_edge = float(
         settings.edge_calibration_gate_min_fill_adjusted_edge_bps or 30.0
     )
@@ -1218,11 +1253,13 @@ def _gate_from_metrics(
         failures.append(f"mae_risk_bps {mae_risk_bps} > {max_risk_mae}")
 
     top10_avg_return = _to_float(top10_performance.get("avg_return_bps"))
-    top10_win_rate = _to_float(top10_performance.get("win_rate"))
+    top10_expectancy = _to_float(top10_performance.get("expectancy_bps"))
     if top10_avg_return is None or top10_avg_return < min_top10_return:
         failures.append(f"top10_avg_return_bps {top10_avg_return} < {min_top10_return}")
-    if top10_win_rate is None or top10_win_rate < min_top10_win_rate:
-        failures.append(f"top10_win_rate {top10_win_rate} < {min_top10_win_rate}")
+    if top10_expectancy is None or top10_expectancy <= min_top10_expectancy:
+        failures.append(
+            f"top10_expectancy_bps {top10_expectancy} <= {min_top10_expectancy}"
+        )
 
     if candidates:
         candidate_edges = [
@@ -1264,10 +1301,21 @@ def _gate_from_metrics(
             "max_mae_return_bps": max_return_mae,
             "max_mae_risk_bps": max_risk_mae,
             "min_top10_avg_return_bps": min_top10_return,
-            "min_top10_win_rate": min_top10_win_rate,
+            "configured_min_top10_avg_return_bps": configured_min_top10_return,
+            "target_top10_win_rate": target_top10_win_rate,
+            "min_top10_expectancy_bps": min_top10_expectancy,
             "min_fill_adjusted_edge_bps": min_fill_adjusted_edge,
         },
     }
+
+
+def _effective_min_top10_avg_return_bps() -> float:
+    configured = float(
+        settings.edge_calibration_gate_min_top10_avg_return_bps
+        if settings.edge_calibration_gate_min_top10_avg_return_bps is not None
+        else 10.0
+    )
+    return min(configured, 10.0)
 
 
 def _paper_fill_quality_events(path: Path, *, limit: int) -> list[dict[str, float]]:

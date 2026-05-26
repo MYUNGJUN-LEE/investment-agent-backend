@@ -442,6 +442,7 @@ def _position_risk_alerts(
     effective_stop = _to_float(trail_state.get("effective_stop"))
 
     alerts: list[dict[str, Any]] = []
+    exit_triggered = False
     if trail_state.get("trailing_stop_updated") and trailing_stop is not None:
         alerts.append(
             _alert(
@@ -494,7 +495,8 @@ def _position_risk_alerts(
                 },
             )
         )
-    if take_profit and current_price >= take_profit:
+        exit_triggered = True
+    if not exit_triggered and take_profit and current_price >= take_profit:
         auto_exit = _execute_live_exit_if_needed(
             symbol=symbol,
             config=config,
@@ -521,6 +523,36 @@ def _position_risk_alerts(
                 },
             )
         )
+        exit_triggered = True
+    if not exit_triggered and _time_stop_due(position, trail_state):
+        auto_exit = _execute_live_exit_if_needed(
+            symbol=symbol,
+            config=config,
+            price_data=price_data,
+            position=position,
+            trail_state=trail_state,
+            trigger="time_stop",
+        )
+        alerts.append(
+            _alert(
+                symbol=symbol,
+                alert_type="time_stop_exit",
+                severity="high",
+                message=(
+                    f"{symbol} time stop reached: "
+                    f"{settings.position_time_stop_trading_days} trading days elapsed"
+                ),
+                current_price=current_price,
+                change_rate=_to_float(price_data.get("change_rate")),
+                volume_ratio=_to_float(price_data.get("volume_ratio")),
+                raw={
+                    "price_data": price_data,
+                    "position": position,
+                    "trailing_state": trail_state,
+                    "auto_exit": auto_exit,
+                },
+            )
+        )
     return alerts
 
 
@@ -535,6 +567,15 @@ def _update_trailing_stop_state(
     entry_price = _to_float(position.get("avg_price"))
     current_price = _to_float(price_data.get("current_price"))
     previous = _load_trailing_stop_state(symbol=symbol, db_path=db_path)
+    previous_raw = previous.get("raw") or {}
+    entry_observed_at = (
+        previous_raw.get("entry_observed_at")
+        or previous.get("opened_at")
+        or position.get("opened_at")
+        or position.get("updated_at")
+        or position.get("synced_at")
+        or _now()
+    )
     previous_trailing = _to_float(previous.get("trailing_stop"))
     previous_highest = _to_float(previous.get("highest_close"))
     observed_highest = highest_close_from_price_data(price_data)
@@ -588,10 +629,52 @@ def _update_trailing_stop_state(
         "effective_stop": effective_stop,
         "trailing_stop_updated": trailing_stop_updated,
         "previous_trailing_stop": previous_trailing,
+        "entry_observed_at": entry_observed_at,
         "last_action": "trailing_stop_updated" if trailing_stop_updated else "checked",
     }
     _save_trailing_stop_state(state=state, db_path=db_path)
     return state
+
+
+def _time_stop_due(
+    position: dict[str, Any],
+    trail_state: dict[str, Any],
+) -> bool:
+    max_days = max(0, int(settings.position_time_stop_trading_days or 0))
+    if max_days <= 0:
+        return False
+    opened_at = _first_datetime(
+        trail_state.get("entry_observed_at"),
+        position.get("opened_at"),
+        position.get("updated_at"),
+        position.get("synced_at"),
+    )
+    if opened_at is None:
+        return False
+    return _trading_days_elapsed(opened_at, datetime.now()) >= max_days
+
+
+def _first_datetime(*values: Any) -> datetime | None:
+    for value in values:
+        if not value:
+            continue
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            continue
+    return None
+
+
+def _trading_days_elapsed(start: datetime, end: datetime) -> int:
+    if end.date() <= start.date():
+        return 0
+    days = 0
+    current = start.date()
+    while current < end.date():
+        current = current + timedelta(days=1)
+        if current.weekday() < 5:
+            days += 1
+    return days
 
 
 def _execute_live_exit_if_needed(
@@ -675,9 +758,10 @@ def _execute_live_exit_if_needed(
 
     session_id = config.get("session_id")
     if session_id:
+        event_type = "time_stop_exit" if trigger == "time_stop" else "trailing_stop_exit"
         auto_trading_store.record_session_event(
             str(session_id),
-            event_type="trailing_stop_exit",
+            event_type=event_type,
             status=status,
             message=message,
             results=[event_result],
@@ -694,9 +778,11 @@ def _load_broker_positions() -> dict[str, dict[str, Any]]:
         with sqlite3.connect(path) as conn:
             conn.row_factory = sqlite3.Row
             conn.executescript(broker_sync.SCHEMA_SQL)
+            broker_sync._ensure_column(conn, "broker_positions", "opened_at", "TEXT")
             rows = conn.execute(
                 """
-                SELECT symbol, name, quantity, avg_price, current_price, pnl, synced_at
+                SELECT symbol, name, quantity, avg_price, current_price, pnl,
+                       opened_at, synced_at
                 FROM broker_positions
                 WHERE quantity > 0
                 """

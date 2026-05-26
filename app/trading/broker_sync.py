@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS broker_positions (
     current_price REAL,
     eval_amount REAL,
     pnl REAL,
+    opened_at TEXT,
     synced_at TEXT NOT NULL,
     raw_json TEXT NOT NULL,
     PRIMARY KEY (broker, account_no, symbol)
@@ -106,6 +107,7 @@ def record_kis_sync(
 
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_column(conn, "broker_positions", "opened_at", "TEXT")
         conn.execute(
             """
             INSERT INTO broker_balance_snapshots (
@@ -125,9 +127,9 @@ def record_kis_sync(
             """
             INSERT INTO broker_positions (
                 broker, account_no, symbol, name, quantity, avg_price,
-                current_price, eval_amount, pnl, synced_at, raw_json
+                current_price, eval_amount, pnl, opened_at, synced_at, raw_json
             )
-            VALUES ('KIS', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ('KIS', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(broker, account_no, symbol) DO UPDATE SET
                 name = excluded.name,
                 quantity = excluded.quantity,
@@ -135,6 +137,7 @@ def record_kis_sync(
                 current_price = excluded.current_price,
                 eval_amount = excluded.eval_amount,
                 pnl = excluded.pnl,
+                opened_at = COALESCE(broker_positions.opened_at, excluded.opened_at),
                 synced_at = excluded.synced_at,
                 raw_json = excluded.raw_json
             """,
@@ -148,6 +151,7 @@ def record_kis_sync(
                     position.get("current_price"),
                     position.get("eval_amount"),
                     position.get("pnl"),
+                    now,
                     now,
                     _json(position.get("raw", position)),
                 )
@@ -420,6 +424,20 @@ def _to_float(value: Any) -> float | None:
 def _to_int(value: Any) -> int | None:
     number = _to_float(value)
     return int(number) if number is not None else None
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    columns = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _db_path(db_path: Path | str | None = None) -> Path:

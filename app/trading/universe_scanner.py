@@ -24,46 +24,67 @@ from app.trading import paper_trading
 
 
 DEFAULT_UNIVERSE = {
-    "005930": "Samsung Electronics",
-    "000660": "SK hynix",
-    "373220": "LG Energy Solution",
-    "207940": "Samsung Biologics",
-    "005380": "Hyundai Motor",
-    "000270": "Kia",
-    "068270": "Celltrion",
-    "105560": "KB Financial",
-    "055550": "Shinhan Financial",
-    "035420": "NAVER",
-    "035720": "Kakao",
-    "012330": "Hyundai Mobis",
-    "005490": "POSCO Holdings",
-    "028260": "Samsung C&T",
-    "051910": "LG Chem",
-    "006400": "Samsung SDI",
-    "032830": "Samsung Life",
-    "086790": "Hana Financial",
-    "015760": "KEPCO",
-    "034020": "Doosan Enerbility",
-    "009540": "HD Korea Shipbuilding",
-    "010140": "Samsung Heavy Industries",
-    "267260": "HD Hyundai Electric",
-    "042660": "Hanwha Ocean",
-    "012450": "Hanwha Aerospace",
-    "329180": "HD Hyundai Heavy Industries",
-    "064350": "Hyundai Rotem",
-    "000810": "Samsung Fire",
-    "003550": "LG",
-    "066570": "LG Electronics",
-    "096770": "SK Innovation",
-    "247540": "ECOPRO BM",
-    "086520": "ECOPRO",
-    "196170": "Alteogen",
-    "091990": "Celltrion Healthcare",
-    "352820": "HYBE",
-    "259960": "KRAFTON",
-    "034730": "SK",
-    "017670": "SK Telecom",
-    "033780": "KT&G",
+    "035900": "JYP Entertainment",
+    "041510": "SM Entertainment",
+    "145020": "Hugel",
+    "214450": "PharmaResearch",
+    "357780": "Soulbrain",
+    "058470": "Leeno Industrial",
+    "095340": "ISC",
+    "222800": "SimmTech",
+    "078600": "Daejoo Electronic Materials",
+    "319660": "PSK",
+    "240810": "Wonik IPS",
+    "067310": "Hana Micron",
+    "101490": "S&S Tech",
+    "084370": "Eugene Technology",
+    "090460": "BH",
+    "108320": "LX Semicon",
+    "112040": "Wemade",
+    "086900": "Medytox",
+    "215200": "MECARO",
+    "036930": "JUSUNG Engineering",
+    "272290": "INNOX Advanced Materials",
+    "121600": "Advanced Nano Products",
+    "108860": "Selvas AI",
+    "053800": "AhnLab",
+    "025900": "Dongwha Enterprise",
+    "215000": "Gold Circuit Electronics",
+    "095610": "TES",
+    "091700": "Partners Value Investments",
+    "290650": "L&C Bio",
+    "032190": "Daihan Scientific",
+    "089030": "Techwing",
+    "166090": "Hana Materials",
+    "036540": "SFA Engineering",
+    "053030": "BioSmart",
+    "060250": "NHN KCP",
+    "131970": "Doosan Tesna",
+    "039030": "EO Technics",
+    "064760": "Tokai Carbon Korea",
+    "348370": "ENCHEM",
+    "383310": "Ecopro HN",
+}
+
+DEFAULT_UNIVERSE_MARKETS = {symbol: "KOSDAQ" for symbol in DEFAULT_UNIVERSE}
+DEFAULT_UNIVERSE_PROFILE = {symbol: "midcap_kosdaq_quality" for symbol in DEFAULT_UNIVERSE}
+LARGE_CAP_SYMBOLS = {
+    "005930",
+    "000660",
+    "373220",
+    "207940",
+    "005380",
+    "000270",
+    "068270",
+    "105560",
+    "055550",
+    "035420",
+    "035720",
+    "012330",
+    "005490",
+    "028260",
+    "051910",
+    "006400",
 }
 
 
@@ -90,6 +111,9 @@ CREATE TABLE IF NOT EXISTS universe_price_snapshots (
     volume INTEGER,
     volume_ratio REAL,
     turnover_value REAL,
+    market_cap REAL,
+    market_segment TEXT,
+    universe_profile TEXT,
     trend TEXT,
     source TEXT,
     raw_json TEXT NOT NULL
@@ -110,6 +134,9 @@ CREATE TABLE IF NOT EXISTS universe_candidates (
     volume INTEGER,
     volume_ratio REAL,
     turnover_value REAL,
+    market_cap REAL,
+    market_segment TEXT,
+    universe_profile TEXT,
     news_count INTEGER DEFAULT 0,
     disclosure_count INTEGER DEFAULT 0,
     raw_json TEXT NOT NULL
@@ -137,6 +164,9 @@ CREATE TABLE IF NOT EXISTS scanner_candidates (
     volume INTEGER,
     volume_ratio REAL,
     turnover_value REAL,
+    market_cap REAL,
+    market_segment TEXT,
+    universe_profile TEXT,
     news_count INTEGER DEFAULT 0,
     disclosure_count INTEGER DEFAULT 0,
     claimed_by_worker TEXT,
@@ -170,6 +200,9 @@ CREATE TABLE IF NOT EXISTS scanner_candidate_history (
     volume INTEGER,
     volume_ratio REAL,
     turnover_value REAL,
+    market_cap REAL,
+    market_segment TEXT,
+    universe_profile TEXT,
     news_count INTEGER DEFAULT 0,
     disclosure_count INTEGER DEFAULT 0,
     claimed_by_worker TEXT,
@@ -290,6 +323,7 @@ def get_latest_universe_scan(db_path: Path | str | None = None) -> dict[str, Any
                    net_edge, composite_score, status, claimed_by_worker,
                    expires_at, decision, reason, current_price, change_rate,
                    volume, volume_ratio, turnover_value, news_count,
+                   market_cap, market_segment, universe_profile,
                    disclosure_count
             FROM scanner_candidates
             WHERE scan_id = ?
@@ -386,6 +420,33 @@ def initialize_universe_db(db_path: Path | str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_universe_schema_migrations(conn)
+
+
+def _ensure_universe_schema_migrations(conn: sqlite3.Connection) -> None:
+    for table in (
+        "universe_price_snapshots",
+        "universe_candidates",
+        "scanner_candidates",
+        "scanner_candidate_history",
+    ):
+        _ensure_column(conn, table, "market_cap", "REAL")
+        _ensure_column(conn, table, "market_segment", "TEXT")
+        _ensure_column(conn, table, "universe_profile", "TEXT")
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    columns = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _resolve_source_symbols(req: AutoTradeStartRequest) -> dict[str, str | None]:
@@ -424,8 +485,19 @@ def _collect_price_snapshots(source_symbols: dict[str, str | None]) -> list[dict
             }
         price_data["symbol"] = _normalize_symbol(price_data.get("symbol") or symbol)
         price_data["name"] = name or DEFAULT_UNIVERSE.get(symbol)
+        price_data = _with_static_universe_metadata(price_data)
         snapshots.append(price_data)
     return snapshots
+
+
+def _with_static_universe_metadata(price_data: dict[str, Any]) -> dict[str, Any]:
+    symbol = _normalize_symbol(price_data.get("symbol"))
+    updates: dict[str, Any] = {}
+    if symbol in DEFAULT_UNIVERSE_MARKETS and not price_data.get("market_segment"):
+        updates["market_segment"] = DEFAULT_UNIVERSE_MARKETS[symbol]
+    if symbol in DEFAULT_UNIVERSE_PROFILE and not price_data.get("universe_profile"):
+        updates["universe_profile"] = DEFAULT_UNIVERSE_PROFILE[symbol]
+    return {**price_data, **updates} if updates else price_data
 
 
 def _scanner_symbol_interval_seconds() -> float:
@@ -487,6 +559,25 @@ def _score_snapshot(item: dict[str, Any]) -> dict[str, Any]:
             "reason": f"no price ({phase})",
             "market_phase": "closed" if not market_open else "open",
         }
+
+    filter_result = _universe_filter_result(item)
+    if not filter_result["passed"]:
+        return {
+            **item,
+            "score": 0.0,
+            "decision": "exclude",
+            "reason": "; ".join(filter_result["failed_filters"]),
+            "market_cap": _market_cap_krw(item),
+            "market_segment": _market_segment(item),
+            "universe_filters": filter_result["filters"],
+            "failed_universe_filters": filter_result["failed_filters"],
+        }
+
+    momentum_profile = _momentum_scoring_components(item)
+    momentum_score = float(momentum_profile["score"])
+    score += (momentum_score - 50.0) * 0.35
+    if momentum_score >= 65:
+        reasons.append("composite momentum")
 
     momentum_hits = 0
     for key, label, weight in (
@@ -574,7 +665,254 @@ def _score_snapshot(item: dict[str, Any]) -> dict[str, Any]:
         "score": round(max(0.0, min(100.0, score)), 2),
         "decision": decision,
         "reason": ", ".join(reasons) or "insufficient signal",
+        "market_cap": _market_cap_krw(item),
+        "market_segment": _market_segment(item),
+        "momentum_score": momentum_profile["score"],
+        "momentum_components": momentum_profile["components"],
+        "universe_filters": filter_result["filters"],
+        "failed_universe_filters": filter_result["failed_filters"],
     }
+
+
+def _universe_filter_result(candidate: dict[str, Any]) -> dict[str, Any]:
+    filters = {
+        "market_cap_focus": _market_cap_focus_filter(candidate),
+        "liquidity": _liquidity_filter(candidate),
+        "macro_trend": _macro_trend_filter(candidate),
+        "inverse_alignment": _inverse_alignment_filter(candidate),
+    }
+    failed = [
+        f"{name}: {detail['reason']}"
+        for name, detail in filters.items()
+        if not detail["passed"]
+    ]
+    return {
+        "passed": not failed,
+        "filters": filters,
+        "failed_filters": failed,
+    }
+
+
+def _market_cap_focus_filter(candidate: dict[str, Any]) -> dict[str, Any]:
+    symbol = _normalize_symbol(candidate.get("symbol"))
+    market_cap = _market_cap_krw(candidate)
+    market_segment = _market_segment(candidate)
+    min_cap = max(0.0, float(settings.universe_scanner_min_market_cap or 0.0))
+    max_cap = max(min_cap, float(settings.universe_scanner_max_market_cap or min_cap))
+    if market_cap is None:
+        return {
+            "passed": True,
+            "status": "unknown",
+            "reason": "market cap unavailable; later ranking keeps large-cap symbols conditional",
+            "market_segment": market_segment,
+            "universe_profile": candidate.get("universe_profile"),
+        }
+    if min_cap <= market_cap <= max_cap:
+        return {
+            "passed": True,
+            "status": "passed",
+            "reason": "mid-cap market-cap band",
+            "market_cap": market_cap,
+            "min_market_cap": min_cap,
+            "max_market_cap": max_cap,
+            "market_segment": market_segment,
+        }
+    if market_segment == "KOSDAQ" and market_cap >= min_cap:
+        return {
+            "passed": True,
+            "status": "passed",
+            "reason": "KOSDAQ quality universe",
+            "market_cap": market_cap,
+            "min_market_cap": min_cap,
+            "max_market_cap": max_cap,
+            "market_segment": market_segment,
+        }
+    if _is_large_cap_symbol(symbol) or market_cap > max_cap:
+        return {
+            "passed": True,
+            "status": "conditional_large_cap",
+            "reason": "large-cap candidate requires >=5% expected 3-day return",
+            "market_cap": market_cap,
+            "min_market_cap": min_cap,
+            "max_market_cap": max_cap,
+            "market_segment": market_segment,
+        }
+    return {
+        "passed": False,
+        "status": "failed",
+        "reason": f"market_cap {market_cap:.0f} is below {min_cap:.0f}",
+        "market_cap": market_cap,
+        "min_market_cap": min_cap,
+        "max_market_cap": max_cap,
+        "market_segment": market_segment,
+    }
+
+
+def _liquidity_filter(candidate: dict[str, Any]) -> dict[str, Any]:
+    if candidate.get("price_source") == "latest_close":
+        return {"passed": True, "status": "skipped", "reason": "latest close only"}
+    turnover = _to_float(candidate.get("turnover_value"))
+    volume = _to_int(candidate.get("volume"))
+    min_turnover = max(0.0, float(settings.universe_scanner_min_turnover_value or 0.0))
+    min_volume = max(0, int(settings.universe_scanner_min_volume or 0))
+    if turnover is None and volume is None:
+        return {"passed": True, "status": "unknown", "reason": "liquidity data unavailable"}
+    passed = bool(
+        (turnover is not None and turnover >= min_turnover)
+        or (volume is not None and volume >= min_volume)
+    )
+    return {
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "reason": (
+            "liquidity ok"
+            if passed
+            else f"turnover<{min_turnover:.0f} and volume<{min_volume}"
+        ),
+        "turnover_value": turnover,
+        "volume": volume,
+        "min_turnover_value": min_turnover,
+        "min_volume": min_volume,
+    }
+
+
+def _macro_trend_filter(candidate: dict[str, Any]) -> dict[str, Any]:
+    context = _candidate_market_context(candidate)
+    if not context:
+        return {"passed": True, "status": "unknown", "reason": "market context unavailable"}
+    min_risk_on = float(settings.universe_scanner_macro_min_risk_on_score or 0.0)
+    regime = str(context.get("market_regime") or "unknown").lower()
+    risk_on_score = _to_float(context.get("risk_on_score"))
+    bearish_regime = regime in {"bear", "risk_off", "downtrend", "stress"}
+    weak_risk = risk_on_score is not None and risk_on_score < min_risk_on
+    passed = not (bearish_regime or weak_risk)
+    reason = "macro trend ok"
+    if bearish_regime:
+        reason = f"bearish market regime {regime}"
+    elif weak_risk:
+        reason = f"risk_on_score {risk_on_score} < {min_risk_on}"
+    return {
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "reason": reason,
+        "market_regime": regime,
+        "risk_on_score": risk_on_score,
+        "min_risk_on_score": min_risk_on,
+    }
+
+
+def _inverse_alignment_filter(candidate: dict[str, Any]) -> dict[str, Any]:
+    technical = candidate.get("latest_technical_features") or {}
+    close = _to_float(technical.get("close")) or _to_float(candidate.get("current_price"))
+    ma5 = _to_float(technical.get("ma5"))
+    ma20 = _to_float(technical.get("ma20"))
+    ma60 = _to_float(technical.get("ma60"))
+    ma20_slope = _to_float(technical.get("ma20_slope"))
+    if close is None or ma5 is None or ma20 is None or ma60 is None:
+        return {"passed": True, "status": "unknown", "reason": "MA stack unavailable"}
+    inverse_stack = close <= ma5 <= ma20 <= ma60
+    bearish_stack = ma5 <= ma20 <= ma60 and (ma20_slope is None or ma20_slope <= 0)
+    trend = str(candidate.get("trend") or "").lower()
+    trend_down = trend == "downtrend" and close <= ma20
+    passed = not (inverse_stack or bearish_stack or trend_down)
+    return {
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "reason": "MA stack ok" if passed else "bearish inverse MA alignment",
+        "close": close,
+        "ma5": ma5,
+        "ma20": ma20,
+        "ma60": ma60,
+        "ma20_slope": ma20_slope,
+        "trend": trend or None,
+    }
+
+
+def _momentum_scoring_components(candidate: dict[str, Any]) -> dict[str, Any]:
+    context = _candidate_market_context(candidate)
+    relative_strength = _relative_strength_score(candidate, context)
+    volume_ratio = _volume_explosion_score(candidate)
+    volatility_breakout = _volatility_breakout_score(candidate)
+    score = (
+        relative_strength * 0.45
+        + volume_ratio * 0.25
+        + volatility_breakout * 0.30
+    )
+    return {
+        "score": round(max(0.0, min(100.0, score)), 4),
+        "components": {
+            "relative_strength": round(relative_strength, 4),
+            "volume_ratio": round(volume_ratio, 4),
+            "volatility_breakout": round(volatility_breakout, 4),
+            "weights": {
+                "relative_strength": 0.45,
+                "volume_ratio": 0.25,
+                "volatility_breakout": 0.30,
+            },
+        },
+    }
+
+
+def _relative_strength_score(
+    candidate: dict[str, Any],
+    context: dict[str, Any],
+) -> float:
+    for key in ("relative_strength_score", "relative_strength"):
+        value = _to_float(candidate.get(key))
+        if value is None:
+            continue
+        if -1.0 <= value <= 1.0:
+            return max(0.0, min(100.0, 50.0 + value * 100.0))
+        return max(0.0, min(100.0, value))
+
+    sector_score = _sector_strength_score(candidate, context) if context else None
+    if sector_score is not None:
+        return max(0.0, min(100.0, sector_score))
+
+    technical = candidate.get("latest_technical_features") or {}
+    values = [
+        (_to_float(technical.get("return_5d")), 300.0),
+        (_to_float(technical.get("return_20d")), 220.0),
+        (_to_float(technical.get("return_60d")), 140.0),
+    ]
+    scored = [50.0 + value * weight for value, weight in values if value is not None]
+    if not scored:
+        return 50.0
+    return max(0.0, min(100.0, sum(scored) / len(scored)))
+
+
+def _volume_explosion_score(candidate: dict[str, Any]) -> float:
+    technical = candidate.get("latest_technical_features") or {}
+    volume_ratio = _to_float(candidate.get("volume_ratio"))
+    if volume_ratio is None:
+        volume_ratio = _to_float(technical.get("volume_ratio_20d"))
+    if volume_ratio is None:
+        return 50.0
+    if volume_ratio < 0.8:
+        return max(0.0, 35.0 + volume_ratio * 10.0)
+    if volume_ratio <= 5.0:
+        return max(0.0, min(95.0, 50.0 + (volume_ratio - 1.0) * 18.0))
+    return max(55.0, 95.0 - (volume_ratio - 5.0) * 8.0)
+
+
+def _volatility_breakout_score(candidate: dict[str, Any]) -> float:
+    technical = candidate.get("latest_technical_features") or {}
+    score = 45.0
+    atr_pct = _to_float(technical.get("atr_14_pct"))
+    change_rate = _to_float(candidate.get("change_rate")) or 0.0
+    volume_ratio = _to_float(candidate.get("volume_ratio")) or 0.0
+    if technical.get("high_breakout_20d"):
+        score += 35.0
+    if technical.get("low_breakdown_20d"):
+        score -= 30.0
+    if atr_pct is not None:
+        if 0.015 <= atr_pct <= 0.085:
+            score += 15.0
+        elif atr_pct > 0.11:
+            score -= 18.0
+    if change_rate > 0 and volume_ratio >= 1.5:
+        score += min(12.0, change_rate * 1.5)
+    return max(0.0, min(100.0, score))
 
 
 def _enrich_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -650,6 +988,7 @@ def _rank_execution_candidates(
     ranked = sorted(
         scored,
         key=lambda item: (
+            _execution_priority(item),
             float(item.get("composite_score") or 0),
             float(item.get("net_edge") or 0),
             float(item.get("raw_score") or 0),
@@ -679,6 +1018,11 @@ def _rank_execution_candidates(
     return prepared
 
 
+def _execution_priority(candidate: dict[str, Any]) -> int:
+    gate = candidate.get("large_cap_top10_gate") or _large_cap_top10_gate(candidate)
+    return 1 if gate.get("passed", True) else 0
+
+
 def _with_expected_value_scores(
     candidate: dict[str, Any],
     *,
@@ -704,7 +1048,11 @@ def _with_expected_value_scores(
         edge_model_name = f"{edge_model_name}+heuristic_floor"
     quality = _swing_edge_quality(candidate, raw_score)
     reward_risk = _atr_reward_risk_estimate(candidate, raw_score, quality["score"])
-    if reward_risk and quality["score"] >= 58:
+    if (
+        reward_risk
+        and quality["score"] >= 58
+        and float(reward_risk["expected_value_after_cost_bps"]) > 0
+    ):
         expected_return = max(
             expected_return,
             float(reward_risk["gross_return_floor_bps"]),
@@ -744,6 +1092,12 @@ def _with_expected_value_scores(
         + net_edge_score * 0.35
         - expected_risk_score * 0.10
     )
+    large_cap_gate = _large_cap_top10_gate(
+        {
+            **candidate,
+            "expected_return": expected_return,
+        }
+    )
     return {
         **candidate,
         "raw_score": round(raw_score, 4),
@@ -758,6 +1112,7 @@ def _with_expected_value_scores(
         "edge_quality_score": quality["score"],
         "edge_quality_reasons": quality["reasons"],
         "edge_reward_risk": reward_risk,
+        "large_cap_top10_gate": large_cap_gate,
     }
 
 
@@ -770,6 +1125,15 @@ def _execution_status_for_candidate(
     entry_gate: dict[str, Any],
 ) -> tuple[str, str]:
     reasons = [str(candidate.get("reason") or "")]
+    large_cap_gate = candidate.get("large_cap_top10_gate") or _large_cap_top10_gate(candidate)
+    if not large_cap_gate.get("passed", True):
+        reasons.append(str(large_cap_gate.get("reason") or "large-cap top10 gate blocked"))
+        reasons.append(
+            "expected_return "
+            f"{_to_float(large_cap_gate.get('expected_return_bps')) or 0.0:.2f}bps "
+            f"< required {_to_float(large_cap_gate.get('required_3d_return_bps')) or 0.0:.2f}bps"
+        )
+        return "ARCHIVED", _join_reasons(reasons)
     if rank > execution_limit:
         reasons.append("archived below execution top 10")
         return "ARCHIVED", _join_reasons(reasons)
@@ -778,6 +1142,15 @@ def _execution_status_for_candidate(
         return "EXCLUDED", _join_reasons(reasons)
     if candidate.get("decision") != "buy_candidate":
         reasons.append("not a buy candidate")
+        return "SKIPPED", _join_reasons(reasons)
+    reward_risk = candidate.get("edge_reward_risk") or {}
+    expected_value = _to_float(reward_risk.get("expected_value_after_cost_bps"))
+    if expected_value is not None and expected_value <= 0:
+        reasons.append(f"expected value {expected_value:.2f}bps is not positive")
+        return "SKIPPED", _join_reasons(reasons)
+    reward_risk_ratio = _to_float(reward_risk.get("reward_risk_ratio"))
+    if reward_risk_ratio is not None and reward_risk_ratio < 1.5:
+        reasons.append(f"reward/risk {reward_risk_ratio:.2f} is below 1.5")
         return "SKIPPED", _join_reasons(reasons)
     net_edge = float(candidate.get("net_edge") or 0)
     if net_edge <= hurdle_rate:
@@ -843,8 +1216,11 @@ def _estimate_expected_risk_penalty_bps(
     price = _to_float(candidate.get("current_price"))
     levels = atr_exit_levels_from_price_data(entry_price=price, price_data=candidate)
     risk_per_share = _to_float(levels.get("risk_per_share"))
+    net_stop_loss_bps = _to_float(levels.get("net_stop_loss_bps"))
     risk = (
-        max(55.0, min(420.0, (risk_per_share / price) * 10_000))
+        max(55.0, min(420.0, net_stop_loss_bps))
+        if net_stop_loss_bps is not None
+        else max(55.0, min(420.0, (risk_per_share / price) * 10_000))
         if price and risk_per_share
         else 140.0
     )
@@ -1028,6 +1404,96 @@ def _candidate_market_context(candidate: dict[str, Any]) -> dict[str, Any]:
         return {}
 
 
+def _market_segment(candidate: dict[str, Any]) -> str | None:
+    raw = (
+        candidate.get("market_segment")
+        or candidate.get("market_type")
+        or candidate.get("market")
+        or (candidate.get("raw") or {}).get("mrkt_ctg")
+    )
+    if not raw:
+        raw_payload = _parse_json(candidate.get("raw_json"), {})
+        raw = (
+            raw_payload.get("market_segment")
+            or raw_payload.get("market_type")
+            or raw_payload.get("market")
+            or (raw_payload.get("raw") or {}).get("mrkt_ctg")
+        )
+    if not raw:
+        return None
+    value = str(raw).strip().upper()
+    if "KOSDAQ" in value or value == "KQ":
+        return "KOSDAQ"
+    if "KOSPI" in value or "KRX" in value or value == "KS":
+        return "KOSPI"
+    return value
+
+
+def _market_cap_krw(candidate: dict[str, Any]) -> float | None:
+    for key in ("market_cap_krw", "market_cap", "market_capitalization"):
+        value = _to_float(candidate.get(key))
+        if value is not None and value > 0:
+            return value
+    raw_payload = _parse_json(candidate.get("raw_json"), {})
+    nested_raw = candidate.get("raw") or raw_payload.get("raw") or {}
+    for source in (raw_payload, nested_raw):
+        if not isinstance(source, dict):
+            continue
+        for key in ("market_cap_krw", "market_cap", "market_capitalization"):
+            value = _to_float(source.get(key))
+            if value is not None and value > 0:
+                return value
+        hts_value = _to_float(source.get("hts_avls"))
+        if hts_value is not None and hts_value > 0:
+            return hts_value * 100_000_000
+        listed_shares = _to_float(
+            source.get("lstn_stcn")
+            or source.get("listed_shares")
+            or source.get("lstn_shrn")
+        )
+        price = _to_float(candidate.get("current_price") or raw_payload.get("current_price"))
+        if listed_shares is not None and listed_shares > 0 and price:
+            return listed_shares * price
+    return None
+
+
+def _is_large_cap_symbol(symbol: str | None) -> bool:
+    return _normalize_symbol(symbol) in LARGE_CAP_SYMBOLS
+
+
+def _large_cap_top10_gate(candidate: dict[str, Any]) -> dict[str, Any]:
+    symbol = _normalize_symbol(candidate.get("symbol"))
+    market_cap = _market_cap_krw(candidate)
+    max_cap = max(0.0, float(settings.universe_scanner_max_market_cap or 0.0))
+    large_cap = _is_large_cap_symbol(symbol) or (
+        market_cap is not None
+        and market_cap > max_cap
+        and _market_segment(candidate) != "KOSDAQ"
+    )
+    threshold = max(
+        0.0,
+        float(settings.universe_scanner_large_cap_min_3d_return_bps or 500.0),
+    )
+    expected_return = _to_float(candidate.get("expected_return"))
+    passed = not large_cap or (
+        expected_return is not None and expected_return >= threshold
+    )
+    return {
+        "large_cap": large_cap,
+        "passed": passed,
+        "expected_return_bps": expected_return,
+        "required_3d_return_bps": threshold if large_cap else None,
+        "market_cap": market_cap,
+        "reason": (
+            "large-cap 3-day expected return gate passed"
+            if large_cap and passed
+            else "large-cap requires >=5% expected 3-day return"
+            if large_cap
+            else "not a large-cap conditional candidate"
+        ),
+    }
+
+
 def _sector_strength_score(
     candidate: dict[str, Any],
     context: dict[str, Any],
@@ -1065,14 +1531,28 @@ def _atr_reward_risk_estimate(
     risk_bps = risk_per_share / price * 10_000
     target_bps = (target - price) / price * 10_000
     win_probability = _expected_win_probability(candidate, raw_score, quality_score)
+    loss_probability = 1.0 - win_probability
+    trading_cost = _estimate_round_trip_trading_cost_bps()
+    slippage_cost = _estimate_slippage_cost_bps(candidate)
+    total_cost = trading_cost + slippage_cost
     gross_return_floor = win_probability * target_bps
-    loss_risk_floor = (1.0 - win_probability) * risk_bps
+    loss_risk_floor = loss_probability * risk_bps
+    expected_value_before_cost = gross_return_floor - loss_risk_floor
+    expected_value_after_cost = expected_value_before_cost - total_cost
     return {
         "win_probability": round(win_probability, 4),
+        "loss_probability": round(loss_probability, 4),
         "target_bps": round(target_bps, 4),
         "risk_bps": round(risk_bps, 4),
+        "net_target_bps": round(max(0.0, target_bps - total_cost), 4),
+        "net_risk_bps": round(risk_bps + total_cost, 4),
+        "reward_risk_ratio": round(target_bps / risk_bps, 4) if risk_bps else 0.0,
         "gross_return_floor_bps": round(max(0.0, min(500.0, gross_return_floor)), 4),
         "loss_risk_floor_bps": round(max(25.0, min(500.0, loss_risk_floor)), 4),
+        "expected_value_bps": round(expected_value_before_cost, 4),
+        "expected_value_after_cost_bps": round(expected_value_after_cost, 4),
+        "trading_cost_bps": round(trading_cost, 4),
+        "slippage_cost_bps": round(slippage_cost, 4),
     }
 
 
@@ -1118,14 +1598,14 @@ def _to_symbol_config(
     trailing_stop = levels["trailing_stop"]
     risk_per_share = _to_float(levels.get("risk_per_share"))
     expected_loss_bps = (
-        risk_per_share / price * 10_000
-        if price and risk_per_share
-        else _to_float(candidate.get("expected_risk"))
+        _to_float(levels.get("net_stop_loss_bps"))
+        or (risk_per_share / price * 10_000 if price and risk_per_share else None)
+        or _to_float(candidate.get("expected_risk"))
     )
     expected_win_bps = (
-        (take_profit - price) / price * 10_000
-        if price and take_profit
-        else _to_float(candidate.get("expected_return"))
+        _to_float(levels.get("net_take_profit_bps"))
+        or ((take_profit - price) / price * 10_000 if price and take_profit else None)
+        or _to_float(candidate.get("expected_return"))
     )
     return AutoTradeSymbolConfig(
         symbol=str(candidate_payload["symbol"]),
@@ -1210,12 +1690,20 @@ def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
                 "volume": item.get("volume"),
                 "volume_ratio": item.get("volume_ratio"),
                 "turnover_value": item.get("turnover_value"),
+                "market_cap": item.get("market_cap"),
+                "market_segment": item.get("market_segment"),
+                "universe_profile": item.get("universe_profile"),
                 "news_count": item.get("news_count", 0),
                 "disclosure_count": item.get("disclosure_count", 0),
                 "edge_model": item.get("edge_model"),
                 "edge_quality_score": item.get("edge_quality_score"),
                 "edge_quality_reasons": item.get("edge_quality_reasons"),
                 "edge_reward_risk": item.get("edge_reward_risk"),
+                "momentum_score": item.get("momentum_score"),
+                "momentum_components": item.get("momentum_components"),
+                "large_cap_top10_gate": item.get("large_cap_top10_gate"),
+                "universe_filters": item.get("universe_filters"),
+                "failed_universe_filters": item.get("failed_universe_filters"),
                 "claimed_by_worker": item.get("claimed_by_worker"),
                 "expires_at": item.get("expires_at"),
             }
@@ -1234,9 +1722,10 @@ def _record_snapshots(
             """
             INSERT INTO universe_price_snapshots (
                 scan_id, created_at, symbol, name, current_price, change_rate,
-                volume, volume_ratio, turnover_value, trend, source, raw_json
+                volume, volume_ratio, turnover_value, market_cap, market_segment,
+                universe_profile, trend, source, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1249,6 +1738,9 @@ def _record_snapshots(
                     _to_int(item.get("volume")),
                     _to_float(item.get("volume_ratio")),
                     _to_float(item.get("turnover_value")),
+                    _market_cap_krw(item),
+                    _market_segment(item),
+                    item.get("universe_profile"),
                     item.get("trend"),
                     item.get("source"),
                     _json(item),
@@ -1270,9 +1762,10 @@ def _record_candidates(
             INSERT INTO universe_candidates (
                 scan_id, created_at, symbol, name, rank, score, decision, reason,
                 current_price, change_rate, volume, volume_ratio, turnover_value,
-                news_count, disclosure_count, raw_json
+                market_cap, market_segment, universe_profile, news_count,
+                disclosure_count, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1289,6 +1782,9 @@ def _record_candidates(
                     _to_int(item.get("volume")),
                     _to_float(item.get("volume_ratio")),
                     _to_float(item.get("turnover_value")),
+                    _market_cap_krw(item),
+                    _market_segment(item),
+                    item.get("universe_profile"),
                     _to_int(item.get("news_count")) or 0,
                     _to_int(item.get("disclosure_count")) or 0,
                     _json(item),
@@ -1310,6 +1806,7 @@ def _record_scanner_candidates(
         item
         for item in candidates
         if int(item.get("rank") or 0) <= execution_limit
+        and item.get("status") != "ARCHIVED"
     ]
     with sqlite3.connect(path) as conn:
         conn.execute("DELETE FROM scanner_candidates")
@@ -1319,10 +1816,11 @@ def _record_scanner_candidates(
                 scan_id, scan_time, symbol, name, raw_score, expected_return,
                 expected_risk, trading_cost, slippage_cost, net_edge,
                 composite_score, rank, reason, status, decision, current_price,
-                change_rate, volume, volume_ratio, turnover_value, news_count,
-                disclosure_count, claimed_by_worker, expires_at, raw_json
+                change_rate, volume, volume_ratio, turnover_value, market_cap,
+                market_segment, universe_profile, news_count, disclosure_count,
+                claimed_by_worker, expires_at, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 _candidate_row_values(
@@ -1342,10 +1840,11 @@ def _record_scanner_candidates(
                 scan_id, scan_time, symbol, name, raw_score, expected_return,
                 expected_risk, trading_cost, slippage_cost, net_edge,
                 composite_score, rank, reason, status, decision, current_price,
-                change_rate, volume, volume_ratio, turnover_value, news_count,
-                disclosure_count, claimed_by_worker, expires_at, raw_json
+                change_rate, volume, volume_ratio, turnover_value, market_cap,
+                market_segment, universe_profile, news_count, disclosure_count,
+                claimed_by_worker, expires_at, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 _candidate_row_values(
@@ -1385,6 +1884,9 @@ def _candidate_row_values(
         _to_int(item.get("volume")),
         _to_float(item.get("volume_ratio")),
         _to_float(item.get("turnover_value")),
+        _market_cap_krw(item),
+        _market_segment(item),
+        item.get("universe_profile"),
         _to_int(item.get("news_count")) or 0,
         _to_int(item.get("disclosure_count")) or 0,
         item.get("claimed_by_worker"),

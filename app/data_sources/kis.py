@@ -116,6 +116,7 @@ def fetch_price_data(
     change_rate = _to_float(output.get("prdy_ctrt"))
     volume = _to_int(output.get("acml_vol"))
     turnover_value = _to_float(output.get("acml_tr_pbmn"))
+    market_cap = _market_cap_krw(output, current_price)
     indicators = _calculate_indicators(
         current_price=current_price,
         change_rate=change_rate,
@@ -143,6 +144,9 @@ def fetch_price_data(
         "volume": volume,
         "volume_ratio": indicators.get("volume_ratio"),
         "turnover_value": turnover_value,
+        "market_cap": market_cap,
+        "market_cap_krw": market_cap,
+        "market_segment": _market_segment(output),
         "trend": indicators.get("trend"),
         "overheated": _is_overheated(
             indicators.get("overheated"),
@@ -199,6 +203,49 @@ def _to_int(value: Any) -> int | None:
         return int(float(str(value).replace(",", "").strip()))
     except ValueError:
         return None
+
+
+def _market_cap_krw(output: dict[str, Any], current_price: float | None) -> float | None:
+    for key in (
+        "market_cap_krw",
+        "mket_cap",
+        "mkt_cap",
+        "stck_avls",
+        "avls",
+    ):
+        value = _to_float(output.get(key))
+        if value is not None and value > 0:
+            return value
+
+    hts_value = _to_float(output.get("hts_avls"))
+    if hts_value is not None and hts_value > 0:
+        return hts_value * 100_000_000
+
+    listed_shares = _to_float(
+        output.get("lstn_stcn")
+        or output.get("listed_shares")
+        or output.get("lstn_shrn")
+    )
+    if listed_shares is not None and listed_shares > 0 and current_price:
+        return listed_shares * current_price
+    return None
+
+
+def _market_segment(output: dict[str, Any]) -> str | None:
+    raw = (
+        output.get("mrkt_ctg")
+        or output.get("bstp_kor_isnm")
+        or output.get("market")
+        or output.get("market_segment")
+    )
+    if not raw:
+        return None
+    value = str(raw).strip().upper()
+    if "KOSDAQ" in value or "KQ" == value:
+        return "KOSDAQ"
+    if "KOSPI" in value or "KRX" in value or "KS" == value:
+        return "KOSPI"
+    return value
 
 
 def _parse_daily_candles(data: dict[str, Any]) -> list[dict[str, Any]]:

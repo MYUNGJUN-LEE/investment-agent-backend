@@ -317,7 +317,32 @@ def test_paper_run_once_rejects_consecutive_stop_losses(tmp_path, monkeypatch):
     assert "consecutive_stop_loss_limit_reached" in body["message"]
 
 
-def test_paper_run_once_rejects_new_entry_after_cutoff(tmp_path, monkeypatch):
+def test_paper_run_once_rejects_new_entry_outside_entry_windows(tmp_path, monkeypatch):
+    db_path = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr(paper_trading, "DEFAULT_DB_PATH", db_path)
+    monkeypatch.setattr(paper_trading, "_now", lambda: "2026-05-20T13:00:00")
+
+    response = client.post(
+        "/paper/run-once",
+        headers=_auth_headers(),
+        json={
+            "symbol": "005930",
+            "market": "KR",
+            "strategy_type": "daytrade",
+            "signal_type": "entry",
+            "price": 1000,
+            "quantity": 1,
+            "confidence": 0.8,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "rejected"
+    assert "entry_time_window_blocked" in body["message"]
+
+
+def test_paper_run_once_allows_new_entry_at_afternoon_window_end(tmp_path, monkeypatch):
     db_path = tmp_path / "paper.sqlite3"
     monkeypatch.setattr(paper_trading, "DEFAULT_DB_PATH", db_path)
     monkeypatch.setattr(paper_trading, "_now", lambda: "2026-05-20T15:20:00")
@@ -338,8 +363,7 @@ def test_paper_run_once_rejects_new_entry_after_cutoff(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "rejected"
-    assert "entry_cutoff_time_reached" in body["message"]
+    assert body["status"] == "success"
 
 
 def test_paper_run_once_must_pass_approve_order(tmp_path, monkeypatch):

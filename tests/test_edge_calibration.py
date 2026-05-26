@@ -166,6 +166,97 @@ def test_edge_entry_gate_passes_after_oos_and_top10_thresholds(tmp_path, monkeyp
     assert gate["top10_performance"]["sample_count"] == 5
 
 
+def test_edge_gate_uses_expectancy_instead_of_direct_win_rate(monkeypatch):
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_samples", 5)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_return_bps", 10_000)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_risk_bps", 10_000)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 10)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_win_rate", 0.50)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_expectancy_bps", 0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 30)
+
+    gate = edge_calibration._gate_from_metrics(
+        sample_count=5,
+        oos_sample_count=1,
+        mae_return_bps=100,
+        mae_risk_bps=100,
+        top10_performance={
+            "status": "ready",
+            "sample_count": 10,
+            "top_count": 10,
+            "avg_return_bps": 12,
+            "win_rate": 0.40,
+            "loss_rate": 0.60,
+            "avg_win_bps": 60,
+            "avg_loss_bps": 10,
+            "expectancy_bps": 18,
+        },
+        fill_adjustment={"multiplier": 1.0},
+        candidates=[{"symbol": "005930", "net_edge": 80}],
+    )
+
+    assert gate["approved"] is True
+    assert gate["required"]["target_top10_win_rate"] == 0.50
+
+    blocked = edge_calibration._gate_from_metrics(
+        sample_count=5,
+        oos_sample_count=1,
+        mae_return_bps=100,
+        mae_risk_bps=100,
+        top10_performance={
+            "status": "ready",
+            "sample_count": 10,
+            "top_count": 10,
+            "avg_return_bps": 12,
+            "win_rate": 0.60,
+            "loss_rate": 0.40,
+            "avg_win_bps": 10,
+            "avg_loss_bps": 40,
+            "expectancy_bps": -10,
+        },
+        fill_adjustment={"multiplier": 1.0},
+        candidates=[{"symbol": "005930", "net_edge": 80}],
+    )
+
+    assert blocked["approved"] is False
+    assert "top10_expectancy_bps" in blocked["message"]
+
+
+def test_edge_gate_caps_stale_top10_return_env_at_ten_bps(monkeypatch):
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_samples", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_return_bps", 10_000)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_risk_bps", 10_000)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 20)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_expectancy_bps", 0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 30)
+
+    gate = edge_calibration._gate_from_metrics(
+        sample_count=10,
+        oos_sample_count=10,
+        mae_return_bps=50,
+        mae_risk_bps=50,
+        top10_performance={
+            "status": "ready",
+            "sample_count": 10,
+            "top_count": 10,
+            "avg_return_bps": 12,
+            "win_rate": 0.40,
+            "loss_rate": 0.60,
+            "avg_win_bps": 90,
+            "avg_loss_bps": 20,
+            "expectancy_bps": 24,
+        },
+        fill_adjustment={"multiplier": 1.0},
+        candidates=[{"symbol": "035900", "net_edge": 100}],
+    )
+
+    assert gate["approved"] is True
+    assert gate["required"]["min_top10_avg_return_bps"] == 10
+    assert gate["required"]["configured_min_top10_avg_return_bps"] == 20
+
+
 def _insert_candidate(
     conn: sqlite3.Connection,
     *,

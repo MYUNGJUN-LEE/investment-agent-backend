@@ -256,14 +256,23 @@ persisted in `edge_training_samples`, retained up to
 `EDGE_CALIBRATION_SAMPLE_RETENTION_LIMIT`, and reused across restarts. New entry
 orders are blocked until the calibration gate passes: at least
 `EDGE_CALIBRATION_GATE_MIN_SAMPLES` stored samples, enough out-of-sample samples,
-MAE limits, positive top-10 realized performance, win-rate threshold, and
-fill-adjusted edge threshold. Paper and KIS broker fills update a persisted
+MAE limits, at least 10bps average top-10 realized performance, positive
+top-10 expectancy using `E = win_rate * avg_win_bps - loss_rate * avg_loss_bps`,
+and fill-adjusted edge threshold. The configured top-10 win-rate value is kept
+as a 50% target in the gate metadata rather than a standalone blocker. Paper
+and KIS broker fills update a persisted
 fill-quality multiplier that reduces expected return when fills/slippage are
 weak.
 The scanner calls one symbol at a time. By default it uses a fast swing-scan
 path: current price plus daily candles/ATR/momentum only, with the per-symbol
 sleep defaulting to 0 and capped by `UNIVERSE_SCANNER_SYMBOL_INTERVAL_CAP_SECONDS`.
 KIS HTTP requests are still serialized by `KIS_REQUEST_MIN_INTERVAL_SECONDS`.
+The default discovery universe is now biased away from the largest market-cap
+stocks and toward mid-cap/KOSDAQ quality names. Market-cap focus is enforced
+with `UNIVERSE_SCANNER_MIN_MARKET_CAP=300000000000` and
+`UNIVERSE_SCANNER_MAX_MARKET_CAP=2000000000000`; known large-cap symbols can
+enter the execution top 10 only when the scanner estimates at least
+`UNIVERSE_SCANNER_LARGE_CAP_MIN_3D_RETURN_BPS=500`.
 Set `UNIVERSE_SCANNER_INTRADAY_ENRICHMENT_ENABLED=true`,
 `UNIVERSE_SCANNER_NEWS_ENRICHMENT_ENABLED=true`, or
 `UNIVERSE_SCANNER_DISCLOSURE_ENRICHMENT_ENABLED=true` only when you want the
@@ -284,6 +293,15 @@ Operational safety defaults:
 
 - `AUTO_TRADING_ONE_SESSION_PER_ACCOUNT=true` keeps only one active
   auto-trading session per account key.
+- `TRADE_ORCHESTRATOR_BASE_POSITION_WEIGHT=0.10` makes the orchestrator target
+  roughly 10% capital per new symbol, with `TRADE_ORCHESTRATOR_MIN_POSITION_WEIGHT`
+  and `TRADE_ORCHESTRATOR_MAX_POSITION_WEIGHT` bounding lower/higher edge names.
+- `POSITION_TIME_STOP_TRADING_DAYS=5` exits a held position at the current price
+  if neither the fee-adjusted stop nor target is reached after 5 trading days.
+- `STRATEGY_CIRCUIT_BREAKER_WIN_RATE_FLOOR=0.375` halves new entry sizing after
+  a weak recent strategy window and pauses entries if the weak window persists.
+- `ENTRY_TIME_FILTER_ENABLED=true` allows new entries only during 09:00-10:30
+  and 14:30-15:20 KST, reducing whipsaw-prone breakout entries.
 - `LIVE_EXIT_CONFIRM_BEFORE_ENTRY=true` makes live orchestration submit exits
   first, reconcile KIS/order-state, and hold entries until the exited symbols are
   confirmed flat.
@@ -482,8 +500,8 @@ MONITOR_NEWS_INTERVAL_SECONDS=600
 MONITOR_SURGE_CHANGE_PCT=5
 MONITOR_DROP_CHANGE_PCT=-5
 MONITOR_VOLUME_SPIKE_RATIO=3
-# Position exits use ATR14: stop=entry-1.8*ATR14, target=entry+2.5R,
-# trailing_stop=highest_close-2.0*ATR14 after profit.
+# Position exits use fee-adjusted mechanical levels:
+# net stop about -3%, net target about +5%, target R/R between 1.5 and 2.5.
 BROKER_SYNC_INTERVAL_SECONDS=60
 ALERT_DB_PATH=data/alerts.sqlite3
 ALERT_WEBHOOK_URL=

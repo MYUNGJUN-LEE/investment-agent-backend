@@ -7,14 +7,16 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
-from app.models import AutoTradeStartRequest
+from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.strategies.rule_based import build_strategy_decision
 from app.workers import manager as worker_manager
 from app.trading import auto_trading
 from app.trading import auto_trading_store
 from app.trading import paper_trading
+from app.trading import risk_manager
 from app.trading import trade_orchestrator
 from app.trading import universe_scanner
+from app.trading.atr_exits import atr_exit_levels_from_price_data
 
 
 client = TestClient(app)
@@ -158,20 +160,17 @@ def test_auto_trading_applies_request_sizing_defaults(monkeypatch):
         }
 
     monkeypatch.setattr(auto_trading, "create_order_preview", fake_create_order_preview)
-    monkeypatch.setattr(
-        auto_trading,
-        "fetch_price_data",
-        lambda symbol: {
-            "status": "connected",
-            "current_price": 10000,
-            "latest_technical_features": {
-                "close": 10000,
-                "atr_14": 100,
-                "atr_14_pct": 0.01,
-            },
-            "technical_features": [{"close": 10000, "atr_14": 100}],
+    price_data = {
+        "status": "connected",
+        "current_price": 10000,
+        "latest_technical_features": {
+            "close": 10000,
+            "atr_14": 100,
+            "atr_14_pct": 0.01,
         },
-    )
+        "technical_features": [{"close": 10000, "atr_14": 100}],
+    }
+    monkeypatch.setattr(auto_trading, "fetch_price_data", lambda symbol: price_data)
 
     payload = _auto_trade_payload(
         account_equity=20_000_000,
@@ -191,8 +190,9 @@ def test_auto_trading_applies_request_sizing_defaults(monkeypatch):
     assert preview_calls[0].account_equity == 20_000_000
     assert preview_calls[0].risk_per_trade == 0.004
     assert preview_calls[0].cash_available == 500_000
-    assert preview_calls[0].stop_loss == 9820
-    assert preview_calls[0].take_profit == 10450
+    levels = atr_exit_levels_from_price_data(entry_price=10000, price_data=price_data)
+    assert preview_calls[0].stop_loss == levels["stop_loss"]
+    assert preview_calls[0].take_profit == levels["take_profit"]
 
 
 def test_auto_trading_blocks_before_preview_when_cash_is_insufficient(monkeypatch):
@@ -291,6 +291,41 @@ def test_position_expires_when_symbol_disappears_from_scanner_candidates(
     assert exits[0].requested_action == "exit"
     assert exits[0].quantity == 3
     assert still_valid == []
+
+
+def test_time_stop_exits_position_even_if_still_in_scanner_candidates(
+    tmp_path,
+    monkeypatch,
+):
+    paper_db = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr(paper_trading, "DEFAULT_DB_PATH", paper_db)
+    monkeypatch.setattr(settings, "position_time_stop_trading_days", 5)
+    with sqlite3.connect(paper_db) as conn:
+        conn.row_factory = sqlite3.Row
+        paper_trading.initialize_db(conn)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                symbol, name, market, quantity, avg_price, cost_basis,
+                realized_pnl, opened_at, updated_at
+            )
+            VALUES (
+                '005930', 'Samsung Electronics', 'KR', 3, 70000, 210000,
+                0, '2020-01-01T09:00:00', '2020-01-01T09:00:00'
+            )
+            """
+        )
+
+    exits = auto_trading._managed_position_exit_symbols(
+        req=AutoTradeStartRequest(execution_mode="paper"),
+        active_candidate_symbols={"005930"},
+    )
+
+    assert len(exits) == 1
+    assert exits[0].symbol == "005930"
+    assert exits[0].requested_action == "exit"
+    assert exits[0].quantity == 3
+    assert exits[0].expected_holding_days == 5
 
 
 def test_trade_orchestrator_executes_exit_for_removed_holding(
@@ -482,6 +517,151 @@ def test_orchestrated_entries_follow_net_edge_priority(monkeypatch):
 
     assert result["status"] == "executed"
     assert run_calls[:2] == ["000660", "005930"]
+
+
+def test_orchestrator_caps_position_near_ten_percent_and_weights_edge(monkeypatch):
+    monkeypatch.setattr(
+        auto_trading.risk_manager,
+        "strategy_circuit_breaker",
+        lambda **kwargs: {"action": "none", "position_scale": 1.0},
+    )
+    account = {"mode": "paper", "account_equity": 10_000_000, "cash_available": 10_000_000}
+    symbols = [
+        AutoTradeSymbolConfig(
+            symbol="005930",
+            market="KR",
+            strategy_type="swing",
+            requested_action="entry",
+            price=10_000,
+            stop_loss=9_700,
+            risk_per_trade=0.005,
+            expected_gross_edge_bps=50,
+        ),
+        AutoTradeSymbolConfig(
+            symbol="000660",
+            market="KR",
+            strategy_type="swing",
+            requested_action="entry",
+            price=10_000,
+            stop_loss=9_700,
+            risk_per_trade=0.005,
+            expected_gross_edge_bps=300,
+        ),
+    ]
+
+    allocated = auto_trading._allocate_cash_to_symbols(symbols, account)["symbols"]
+    by_symbol = {item.symbol: item for item in allocated}
+
+    assert by_symbol["005930"].position_size < by_symbol["000660"].position_size
+    assert 0.05 <= by_symbol["005930"].position_size <= 0.10
+    assert by_symbol["000660"].position_size <= 0.15
+    assert by_symbol["000660"].cash_available == by_symbol["000660"].quantity * 10_000
+
+
+def test_orchestrator_halves_position_when_strategy_circuit_breaker_scales(monkeypatch):
+    monkeypatch.setattr(
+        auto_trading.risk_manager,
+        "strategy_circuit_breaker",
+        lambda **kwargs: {"action": "scale_half", "position_scale": 0.5},
+    )
+    account = {"mode": "paper", "account_equity": 10_000_000, "cash_available": 10_000_000}
+    symbol = AutoTradeSymbolConfig(
+        symbol="000660",
+        market="KR",
+        strategy_type="swing",
+        requested_action="entry",
+        price=10_000,
+        stop_loss=9_700,
+        risk_per_trade=0.005,
+        expected_gross_edge_bps=300,
+    )
+
+    allocated = auto_trading._allocate_cash_to_symbols([symbol], account)["symbols"][0]
+
+    assert allocated.position_size <= 0.075
+    assert allocated.cash_available <= 750_000
+
+
+def _insert_strategy_exit(
+    conn: sqlite3.Connection,
+    *,
+    pnl: float,
+    created_at: str,
+    market: str = "KR",
+    strategy_type: str = "swing",
+) -> None:
+    cursor = conn.execute(
+        """
+        INSERT INTO signals (
+            created_at, symbol, market, strategy_type, signal_type, price,
+            confidence, source, raw_payload
+        )
+        VALUES (?, '005930', ?, ?, 'exit', 10000, 0.8, 'pytest', '{}')
+        """,
+        (created_at, market, strategy_type),
+    )
+    conn.execute(
+        """
+        INSERT INTO paper_orders (
+            signal_id, created_at, symbol, side, price, quantity, amount,
+            realized_pnl, net_realized_pnl, status, message
+        )
+        VALUES (?, ?, '005930', 'SELL', 10000, 1, 10000, ?, ?, 'FILLED', 'pytest')
+        """,
+        (cursor.lastrowid, created_at, pnl, pnl),
+    )
+
+
+def test_strategy_circuit_breaker_halves_position_after_weak_win_rate(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "strategy_circuit_breaker_enabled", True)
+    monkeypatch.setattr(settings, "strategy_circuit_breaker_lookback_trades", 8)
+    monkeypatch.setattr(settings, "strategy_circuit_breaker_min_trades", 8)
+    monkeypatch.setattr(settings, "strategy_circuit_breaker_win_rate_floor", 0.375)
+    monkeypatch.setattr(settings, "strategy_circuit_breaker_scale", 0.5)
+    with sqlite3.connect(tmp_path / "paper.sqlite3") as conn:
+        conn.row_factory = sqlite3.Row
+        paper_trading.initialize_db(conn)
+        for index, pnl in enumerate([-100, 120, -100, -100, 120, -100, -100, -100], start=1):
+            _insert_strategy_exit(conn, pnl=pnl, created_at=f"2026-05-20T10:0{index}:00")
+
+        result = risk_manager.strategy_circuit_breaker(
+            conn=conn,
+            market="KR",
+            strategy_type="swing",
+        )
+
+    assert result["action"] == "scale_half"
+    assert result["position_scale"] == 0.5
+    assert result["win_rate"] == 0.25
+
+
+def test_strategy_circuit_breaker_pauses_after_repeated_weak_windows(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "strategy_circuit_breaker_enabled", True)
+    monkeypatch.setattr(settings, "strategy_circuit_breaker_lookback_trades", 8)
+    monkeypatch.setattr(settings, "strategy_circuit_breaker_min_trades", 8)
+    monkeypatch.setattr(settings, "strategy_circuit_breaker_win_rate_floor", 0.375)
+    with sqlite3.connect(tmp_path / "paper.sqlite3") as conn:
+        conn.row_factory = sqlite3.Row
+        paper_trading.initialize_db(conn)
+        pnls = [-100, 120, -100, -100, 120, -100, -100, -100] * 2
+        for index, pnl in enumerate(pnls, start=1):
+            _insert_strategy_exit(conn, pnl=pnl, created_at=f"2026-05-20T10:{index:02d}:00")
+
+        result = risk_manager.strategy_circuit_breaker(
+            conn=conn,
+            market="KR",
+            strategy_type="swing",
+        )
+
+    assert result["action"] == "pause"
+    assert result["position_scale"] == 0.0
+    assert result["previous_win_rate"] == 0.25
 
 
 def test_start_reuses_active_session_for_same_account(tmp_path, monkeypatch):

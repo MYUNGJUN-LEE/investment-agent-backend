@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS positions (
     avg_price REAL NOT NULL,
     cost_basis REAL NOT NULL DEFAULT 0,
     realized_pnl REAL NOT NULL DEFAULT 0,
+    opened_at TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -186,6 +187,13 @@ def initialize_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         UPDATE positions
+        SET opened_at = updated_at
+        WHERE opened_at IS NULL
+        """
+    )
+    conn.execute(
+        """
+        UPDATE positions
         SET cost_basis = avg_price * quantity
         WHERE quantity > 0 AND (cost_basis IS NULL OR cost_basis = 0)
         """
@@ -258,6 +266,7 @@ def _ensure_order_columns(conn: sqlite3.Connection) -> None:
 def _ensure_position_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "positions", "cost_basis", "REAL NOT NULL DEFAULT 0")
     _ensure_column(conn, "positions", "sector", "TEXT")
+    _ensure_column(conn, "positions", "opened_at", "TEXT")
 
 
 def _ensure_signal_columns(conn: sqlite3.Connection) -> None:
@@ -391,6 +400,7 @@ def _handle_entry(
     current_qty = int(current["quantity"]) if current else 0
     current_cost_basis = _position_cost_basis(current) if current else 0.0
     realized_pnl = float(current["realized_pnl"]) if current else 0.0
+    opened_at = current.get("opened_at") if current and current_qty > 0 else created_at
 
     new_qty = current_qty + filled_qty
     new_cost_basis = current_cost_basis + execution.requested_amount + execution.total_cost
@@ -406,6 +416,7 @@ def _handle_entry(
         avg_price=new_avg,
         cost_basis=new_cost_basis,
         realized_pnl=realized_pnl,
+        opened_at=opened_at,
         updated_at=created_at,
     )
     return _insert_order(
@@ -522,6 +533,7 @@ def _handle_exit(
         avg_price=remaining_avg,
         cost_basis=max(0.0, remaining_cost_basis) if remaining_qty > 0 else 0.0,
         realized_pnl=realized_pnl,
+        opened_at=current.get("opened_at") if remaining_qty > 0 else None,
         updated_at=created_at,
     )
     return _insert_order(
@@ -662,14 +674,16 @@ def _upsert_position(
     avg_price: float,
     cost_basis: float,
     realized_pnl: float,
+    opened_at: str | None,
     updated_at: str,
 ) -> None:
     conn.execute(
         """
         INSERT INTO positions (
-            symbol, name, market, sector, quantity, avg_price, cost_basis, realized_pnl, updated_at
+            symbol, name, market, sector, quantity, avg_price, cost_basis,
+            realized_pnl, opened_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol) DO UPDATE SET
             name = excluded.name,
             market = excluded.market,
@@ -678,6 +692,7 @@ def _upsert_position(
             avg_price = excluded.avg_price,
             cost_basis = excluded.cost_basis,
             realized_pnl = excluded.realized_pnl,
+            opened_at = excluded.opened_at,
             updated_at = excluded.updated_at
         """,
         (
@@ -689,6 +704,7 @@ def _upsert_position(
             round(avg_price, 4),
             round(cost_basis, 4),
             round(realized_pnl, 2),
+            opened_at,
             updated_at,
         ),
     )
@@ -697,7 +713,8 @@ def _upsert_position(
 def _get_position(conn: sqlite3.Connection, symbol: str) -> dict[str, Any] | None:
     row = conn.execute(
         """
-        SELECT symbol, name, market, sector, quantity, avg_price, cost_basis, realized_pnl, updated_at
+        SELECT symbol, name, market, sector, quantity, avg_price, cost_basis,
+               realized_pnl, opened_at, updated_at
         FROM positions
         WHERE symbol = ?
         """,

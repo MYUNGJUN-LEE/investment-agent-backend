@@ -214,4 +214,4 @@ def test_swing_chart_flow_uses_daily_profile_over_intraday_orderbook(monkeypatch
 
     assert daytrade_result["entry_signal"] is False
     assert swing_result["entry_signal"] is True
-    assert "entry - 1.8 * ATR14" in swing_result["stop_loss_candidates"][0]
+    assert "fee-adjusted net -3.0%" in swing_result["stop_loss_candidates"][0]

@@ -67,7 +67,17 @@ class Settings(BaseSettings):
     trade_orchestrator_enabled: bool = True
     trade_orchestrator_interval_seconds: int = 60
     trade_orchestrator_execute_entries: bool = True
+    trade_orchestrator_base_position_weight: float = 0.10
+    trade_orchestrator_min_position_weight: float = 0.05
+    trade_orchestrator_max_position_weight: float = 0.15
+    trade_orchestrator_edge_weight_cap_bps: float = 300.0
     live_exit_confirm_before_entry: bool = True
+    position_time_stop_trading_days: int = 5
+    strategy_circuit_breaker_enabled: bool = True
+    strategy_circuit_breaker_win_rate_floor: float = 0.375
+    strategy_circuit_breaker_min_trades: int = 8
+    strategy_circuit_breaker_lookback_trades: int = 8
+    strategy_circuit_breaker_scale: float = 0.5
     edge_calibration_enabled: bool = True
     edge_calibration_db_path: str = "data/edge_calibration.sqlite3"
     edge_calibration_interval_seconds: int = 3600
@@ -83,8 +93,9 @@ class Settings(BaseSettings):
     edge_calibration_gate_min_oos_samples: int = 200
     edge_calibration_gate_max_mae_return_bps: float = 180.0
     edge_calibration_gate_max_mae_risk_bps: float = 180.0
-    edge_calibration_gate_min_top10_avg_return_bps: float = 20.0
-    edge_calibration_gate_min_top10_win_rate: float = 0.52
+    edge_calibration_gate_min_top10_avg_return_bps: float = 10.0
+    edge_calibration_gate_min_top10_win_rate: float = 0.50
+    edge_calibration_gate_min_top10_expectancy_bps: float = 0.0
     edge_calibration_gate_min_fill_adjusted_edge_bps: float = 30.0
     broker_sync_db_path: str = "data/broker_sync.sqlite3"
     order_state_db_path: str = "data/order_state.sqlite3"
@@ -132,6 +143,14 @@ class Settings(BaseSettings):
     universe_scanner_worker_hurdle_rate_bps: float = 50.0
     universe_scanner_default_spread_bps: float = 5.0
     universe_scanner_default_slippage_bps: float = 10.0
+    universe_scanner_min_turnover_value: float = 20_000_000_000.0
+    universe_scanner_min_volume: int = 300_000
+    universe_scanner_macro_min_risk_on_score: float = 35.0
+    universe_scanner_min_market_cap: float = 300_000_000_000.0
+    universe_scanner_max_market_cap: float = 2_000_000_000_000.0
+    universe_scanner_large_cap_min_3d_return_bps: float = 500.0
+    entry_time_filter_enabled: bool = True
+    entry_time_windows: str = "09:00-10:30,14:30-15:20"
     embedded_workers_enabled: bool = os.getenv("RENDER_SERVICE_TYPE") == "web"
     embedded_worker_broker_sync_enabled: bool = True
 

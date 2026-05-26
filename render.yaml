@@ -33,6 +33,30 @@ services:
         value: "60"
       - key: TRADE_ORCHESTRATOR_EXECUTE_ENTRIES
         value: "true"
+      - key: TRADE_ORCHESTRATOR_BASE_POSITION_WEIGHT
+        value: "0.10"
+      - key: TRADE_ORCHESTRATOR_MIN_POSITION_WEIGHT
+        value: "0.05"
+      - key: TRADE_ORCHESTRATOR_MAX_POSITION_WEIGHT
+        value: "0.15"
+      - key: TRADE_ORCHESTRATOR_EDGE_WEIGHT_CAP_BPS
+        value: "300"
+      - key: POSITION_TIME_STOP_TRADING_DAYS
+        value: "5"
+      - key: STRATEGY_CIRCUIT_BREAKER_ENABLED
+        value: "true"
+      - key: STRATEGY_CIRCUIT_BREAKER_WIN_RATE_FLOOR
+        value: "0.375"
+      - key: STRATEGY_CIRCUIT_BREAKER_MIN_TRADES
+        value: "8"
+      - key: STRATEGY_CIRCUIT_BREAKER_LOOKBACK_TRADES
+        value: "8"
+      - key: STRATEGY_CIRCUIT_BREAKER_SCALE
+        value: "0.5"
+      - key: ENTRY_TIME_FILTER_ENABLED
+        value: "true"
+      - key: ENTRY_TIME_WINDOWS
+        value: "09:00-10:30,14:30-15:20"
       - key: LIVE_EXIT_CONFIRM_BEFORE_ENTRY
         value: "true"
       - key: EDGE_CALIBRATION_ENABLED
@@ -64,9 +88,11 @@ services:
       - key: EDGE_CALIBRATION_GATE_MAX_MAE_RISK_BPS
         value: "180"
       - key: EDGE_CALIBRATION_GATE_MIN_TOP10_AVG_RETURN_BPS
-        value: "20"
+        value: "10"
       - key: EDGE_CALIBRATION_GATE_MIN_TOP10_WIN_RATE
-        value: "0.52"
+        value: "0.50"
+      - key: EDGE_CALIBRATION_GATE_MIN_TOP10_EXPECTANCY_BPS
+        value: "0"
       - key: EDGE_CALIBRATION_GATE_MIN_FILL_ADJUSTED_EDGE_BPS
         value: "30"
       - key: MONITOR_PRICE_INTERVAL_SECONDS
@@ -117,3 +143,15 @@ services:
         value: "5"
       - key: UNIVERSE_SCANNER_DEFAULT_SLIPPAGE_BPS
         value: "10"
+      - key: UNIVERSE_SCANNER_MIN_TURNOVER_VALUE
+        value: "20000000000"
+      - key: UNIVERSE_SCANNER_MIN_VOLUME
+        value: "300000"
+      - key: UNIVERSE_SCANNER_MACRO_MIN_RISK_ON_SCORE
+        value: "35"
+      - key: UNIVERSE_SCANNER_MIN_MARKET_CAP
+        value: "300000000000"
+      - key: UNIVERSE_SCANNER_MAX_MARKET_CAP
+        value: "2000000000000"
+      - key: UNIVERSE_SCANNER_LARGE_CAP_MIN_3D_RETURN_BPS
+        value: "500"

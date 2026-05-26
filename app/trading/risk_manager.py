@@ -23,7 +23,7 @@ class RiskLimits:
     max_weekly_loss_pct: float = 0.06
     max_monthly_loss_pct: float = 0.10
     max_consecutive_losses: int = 3
-    new_entry_cutoff_time: time = time(15, 10)
+    new_entry_cutoff_time: time = time(15, 20)
     max_leverage: float = 1.0
     max_orders_per_minute: int = 5
     max_orders_per_day: int = 50
@@ -57,8 +57,9 @@ def recommend_order_quantity(
 ) -> dict[str, Any]:
     """Recommend an entry quantity from account risk and stop distance."""
     limits = limits or DEFAULT_LIMITS
+    account_equity = float(account_equity)
     risk_per_share = abs(float(price) - float(stop_loss))
-    risk_amount = float(account_equity) * float(risk_per_trade)
+    risk_amount = account_equity * float(risk_per_trade)
     risk_quantity = int(risk_amount / risk_per_share) if risk_per_share else 0
     cash_quantity = (
         int(float(cash_available) / float(price))
@@ -66,7 +67,16 @@ def recommend_order_quantity(
         else None
     )
     max_order_quantity = int(limits.max_order_amount / float(price)) if price > 0 else 0
-    caps = [risk_quantity, max_order_quantity]
+    symbol_weight = min(
+        limits.max_symbol_weight,
+        max(0.0, float(settings.trade_orchestrator_max_position_weight or limits.max_symbol_weight)),
+    )
+    symbol_weight_quantity = (
+        int((account_equity * symbol_weight) / float(price))
+        if price > 0
+        else 0
+    )
+    caps = [risk_quantity, max_order_quantity, symbol_weight_quantity]
     if cash_quantity is not None:
         caps.append(cash_quantity)
     recommended_quantity = max(0, min(caps)) if caps else 0
@@ -75,14 +85,19 @@ def recommend_order_quantity(
         "risk_quantity": risk_quantity,
         "cash_quantity": cash_quantity,
         "max_order_quantity": max_order_quantity,
-        "account_equity": float(account_equity),
+        "symbol_weight_quantity": symbol_weight_quantity,
+        "symbol_weight_limit": symbol_weight,
+        "account_equity": account_equity,
         "risk_per_trade": float(risk_per_trade),
         "risk_amount": round(risk_amount, 2),
         "entry_price": float(price),
         "stop_loss": float(stop_loss),
         "risk_per_share": round(risk_per_share, 6),
         "estimated_amount": round(recommended_quantity * float(price), 2),
-        "formula": "account_equity * risk_per_trade / abs(entry_price - stop_price)",
+        "formula": (
+            "min(account risk quantity, cash quantity, max order quantity, "
+            "symbol weight quantity)"
+        ),
     }
 
 
@@ -107,14 +122,20 @@ def approve_order(
     weekly_loss = _realized_loss_since(conn, now_dt - timedelta(days=7))
     monthly_loss = _realized_loss_since(conn, now_dt - timedelta(days=30))
     consecutive_losses = _consecutive_stop_losses(conn)
-    symbol_exposure_limit = limits.portfolio_value * limits.max_symbol_weight
-    sector_exposure_limit = limits.portfolio_value * limits.max_sector_weight
+    account_equity = _account_equity(req, limits)
+    symbol_weight = min(
+        limits.max_symbol_weight,
+        max(0.0, float(settings.trade_orchestrator_max_position_weight or limits.max_symbol_weight)),
+    )
+    symbol_exposure_limit = account_equity * symbol_weight
+    sector_exposure_limit = account_equity * limits.max_sector_weight
     projected_symbol_exposure = _projected_symbol_exposure(conn, req, side, quantity)
     projected_sector_exposure = _projected_sector_exposure(conn, req, side, quantity)
     projected_daily_loss = daily_loss + _projected_order_loss(conn, req, side, quantity)
     projected_trade_loss = _projected_trade_loss(req, quantity, limits)
     max_trade_loss_amount = _account_equity(req, limits) * limits.max_trade_loss_pct
     position_sizing = _position_sizing(req, quantity, limits)
+    entry_time_filter = _entry_time_filter(now_dt.time())
     minute_order_count = _order_count_since(conn, now_dt - timedelta(minutes=1))
     daily_order_count = _order_count_since(conn, datetime.combine(now_dt.date(), time.min))
     edge_decision = (
@@ -129,6 +150,11 @@ def approve_order(
         strategy_type=req.strategy_type,
         portfolio_value=limits.portfolio_value,
         beta=req.market_beta,
+    )
+    circuit_breaker = strategy_circuit_breaker(
+        conn=conn,
+        market=req.market,
+        strategy_type=req.strategy_type,
     )
 
     checks = {
@@ -147,9 +173,11 @@ def approve_order(
         "max_consecutive_losses": limits.max_consecutive_losses,
         "projected_symbol_exposure": projected_symbol_exposure,
         "symbol_exposure_limit": symbol_exposure_limit,
+        "symbol_weight_limit": symbol_weight,
         "projected_sector_exposure": projected_sector_exposure,
         "sector_exposure_limit": sector_exposure_limit,
         "entry_cutoff_time": limits.new_entry_cutoff_time.isoformat(timespec="minutes"),
+        "entry_time_filter": entry_time_filter,
         "minute_order_count": minute_order_count,
         "max_orders_per_minute": limits.max_orders_per_minute,
         "daily_order_count": daily_order_count,
@@ -157,6 +185,7 @@ def approve_order(
         "position_sizing": position_sizing,
         "edge": edge_decision,
         "performance_metrics": performance_metrics,
+        "strategy_circuit_breaker": circuit_breaker,
         "dynamic_limits": dynamic_limits,
     }
 
@@ -207,6 +236,20 @@ def approve_order(
         )
 
     if side == "BUY":
+        if circuit_breaker.get("action") == "pause":
+            return _reject(
+                "strategy_circuit_breaker_paused",
+                str(circuit_breaker.get("message") or "Strategy circuit breaker paused entries"),
+                checks,
+            )
+
+        if not entry_time_filter["allowed"]:
+            return _reject(
+                "entry_time_window_blocked",
+                str(entry_time_filter["message"]),
+                checks,
+            )
+
         duplicate = _duplicate_order_exists(conn, req, side, now_dt, limits)
         if duplicate:
             return _reject("duplicate_order_detected", "Duplicate order detected", checks)
@@ -214,7 +257,7 @@ def approve_order(
         if req.cash_available is not None and amount > req.cash_available:
             return _reject("cash_available_exceeded", "Order exceeds available cash", checks)
 
-        if now_dt.time() >= limits.new_entry_cutoff_time:
+        if now_dt.time() > limits.new_entry_cutoff_time:
             return _reject(
                 "entry_cutoff_time_reached",
                 "New entries are blocked before market close",
@@ -270,6 +313,46 @@ def approve_order(
         message="Risk checks passed",
         checks=checks,
     )
+
+
+def _entry_time_filter(current_time: time) -> dict[str, Any]:
+    windows = _entry_time_windows()
+    if not settings.entry_time_filter_enabled:
+        return {
+            "enabled": False,
+            "allowed": True,
+            "windows": [f"{start:%H:%M}-{end:%H:%M}" for start, end in windows],
+            "current_time": current_time.isoformat(timespec="minutes"),
+            "message": "Entry time filter disabled",
+        }
+    allowed = any(start <= current_time <= end for start, end in windows)
+    return {
+        "enabled": True,
+        "allowed": allowed,
+        "windows": [f"{start:%H:%M}-{end:%H:%M}" for start, end in windows],
+        "current_time": current_time.isoformat(timespec="minutes"),
+        "message": (
+            "Entry time is inside the allowed breakout windows"
+            if allowed
+            else "New entries are allowed only during 09:00-10:30 and 14:30-15:20"
+        ),
+    }
+
+
+def _entry_time_windows() -> list[tuple[time, time]]:
+    parsed: list[tuple[time, time]] = []
+    for raw in str(settings.entry_time_windows or "").split(","):
+        if "-" not in raw:
+            continue
+        start_raw, end_raw = [part.strip() for part in raw.split("-", 1)]
+        try:
+            start = time.fromisoformat(start_raw)
+            end = time.fromisoformat(end_raw)
+        except ValueError:
+            continue
+        if start <= end:
+            parsed.append((start, end))
+    return parsed or [(time(9, 0), time(10, 30)), (time(14, 30), time(15, 20))]
 
 
 def _dynamic_risk_limits(
@@ -349,6 +432,131 @@ def _dynamic_risk_limits(
         "max_portfolio_correlation": max_corr,
         "reasons": reasons,
     }
+
+
+def strategy_circuit_breaker(
+    *,
+    conn: sqlite3.Connection,
+    market: str,
+    strategy_type: str,
+) -> dict[str, Any]:
+    if not settings.strategy_circuit_breaker_enabled:
+        return {
+            "enabled": False,
+            "action": "none",
+            "position_scale": 1.0,
+            "message": "Strategy circuit breaker disabled",
+        }
+
+    lookback = max(1, int(settings.strategy_circuit_breaker_lookback_trades or 8))
+    min_trades = max(1, int(settings.strategy_circuit_breaker_min_trades or lookback))
+    floor = max(0.0, min(1.0, float(settings.strategy_circuit_breaker_win_rate_floor or 0.375)))
+    scale = max(0.0, min(1.0, float(settings.strategy_circuit_breaker_scale or 0.5)))
+    pnls = _recent_strategy_exit_pnls(
+        conn=conn,
+        market=market,
+        strategy_type=strategy_type,
+        limit=lookback * 2,
+    )
+    recent = pnls[:lookback]
+    if len(recent) < min_trades:
+        return {
+            "enabled": True,
+            "action": "none",
+            "position_scale": 1.0,
+            "trade_count": len(recent),
+            "required_trades": min_trades,
+            "win_rate_floor": floor,
+            "message": "Not enough recent strategy exits for circuit breaker",
+        }
+
+    recent_win_rate = _win_rate(recent)
+    previous = pnls[lookback : lookback * 2]
+    previous_win_rate = _win_rate(previous) if len(previous) >= min_trades else None
+    losing_streak = _losing_streak(pnls)
+    action = "none"
+    position_scale = 1.0
+    if recent_win_rate < floor:
+        action = "scale_half"
+        position_scale = scale
+    if (
+        recent_win_rate < floor
+        and previous_win_rate is not None
+        and previous_win_rate < floor
+    ) or losing_streak >= max(3, min_trades):
+        action = "pause"
+        position_scale = 0.0
+
+    return {
+        "enabled": True,
+        "action": action,
+        "position_scale": position_scale,
+        "trade_count": len(recent),
+        "lookback_trades": lookback,
+        "win_rate": round(recent_win_rate, 6),
+        "previous_win_rate": round(previous_win_rate, 6)
+        if previous_win_rate is not None
+        else None,
+        "win_rate_floor": floor,
+        "losing_streak": losing_streak,
+        "message": (
+            "Strategy circuit breaker paused entries"
+            if action == "pause"
+            else "Strategy circuit breaker halved position size"
+            if action == "scale_half"
+            else "Strategy circuit breaker clear"
+        ),
+    }
+
+
+def _recent_strategy_exit_pnls(
+    *,
+    conn: sqlite3.Connection,
+    market: str,
+    strategy_type: str,
+    limit: int,
+) -> list[float]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT CASE
+                     WHEN o.net_realized_pnl != 0 THEN o.net_realized_pnl
+                     ELSE o.realized_pnl
+                   END AS pnl
+            FROM paper_orders o
+            JOIN signals s ON s.id = o.signal_id
+            WHERE o.status IN ('FILLED', 'PARTIALLY_FILLED')
+              AND o.side = 'SELL'
+              AND s.market = ?
+              AND s.strategy_type = ?
+            ORDER BY o.created_at DESC, o.id DESC
+            LIMIT ?
+            """,
+            (market, strategy_type, max(1, int(limit))),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    pnls: list[float] = []
+    for row in rows:
+        value = row["pnl"] if hasattr(row, "keys") else row[0]
+        pnls.append(float(value or 0.0))
+    return pnls
+
+
+def _win_rate(pnls: list[float]) -> float:
+    if not pnls:
+        return 0.0
+    return sum(1 for pnl in pnls if pnl > 0) / len(pnls)
+
+
+def _losing_streak(pnls: list[float]) -> int:
+    count = 0
+    for pnl in pnls:
+        if pnl < 0:
+            count += 1
+        else:
+            break
+    return count
 
 
 def _market_regime(req: PaperRunRequest) -> str:
