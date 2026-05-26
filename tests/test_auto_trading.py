@@ -775,7 +775,11 @@ def test_legacy_auto_trading_action_paths_return_2xx_json_for_gpt_clients(
 
     missing_auth_responses = [
         client.post("/auto-trading/stop", follow_redirects=False),
+        client.post("/auto-trading/stop/cached-session-id", follow_redirects=False),
+        client.get("/auto-trading/stop/cached-session-id", follow_redirects=False),
         client.get("/auto-trading/status", follow_redirects=False),
+        client.get("/auto-trading/status/cached-session-id", follow_redirects=False),
+        client.post("/auto-trading/restart/cached-session-id", follow_redirects=False),
         client.get("/auto-trading/sessions/", follow_redirects=False),
     ]
     authed_status_response = client.get(
@@ -788,7 +792,7 @@ def test_legacy_auto_trading_action_paths_return_2xx_json_for_gpt_clients(
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("application/json")
         assert response.json()["status"] == "error"
-        assert response.json()["http_status"] == 401
+        assert response.json()["http_status"] in {401, 405}
 
     assert authed_status_response.status_code == 200
     assert authed_status_response.headers["content-type"].startswith("application/json")

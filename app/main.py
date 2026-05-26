@@ -105,6 +105,36 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def action_response_contract_middleware(request: Request, call_next):
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        if _is_gpt_action_path(request):
+            return _gpt_exception_response(exc)
+        raise
+
+    if _is_gpt_action_path(request) and response.status_code >= 300:
+        return _gpt_json(
+            _gpt_error_payload(
+                error_type="http_error",
+                http_status=response.status_code,
+                message=(
+                    "Backend action route returned a non-2xx response; converted "
+                    "to JSON so GPT Actions can read the diagnostic payload."
+                ),
+                detail={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": response.status_code,
+                    "content_type": response.headers.get("content-type"),
+                    "location": response.headers.get("location"),
+                },
+            )
+        )
+    return response
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if _is_gpt_action_path(request):
@@ -163,6 +193,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 def _is_gpt_action_path(request: Request) -> bool:
     path = request.url.path.rstrip("/")
     if path == "/gpt" or path.startswith("/gpt/"):
+        return True
+    if path.startswith((
+        "/auto-trading/status/",
+        "/auto-trading/events/",
+        "/auto-trading/stop/",
+        "/auto-trading/restart/",
+    )):
         return True
     return path in {
         "/auto-trading",
