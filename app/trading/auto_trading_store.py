@@ -46,10 +46,18 @@ CREATE TABLE IF NOT EXISTS auto_trading_events (
 """
 
 
+def _connect(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    return conn
+
+
 def initialize_auto_trading_db(db_path: Path | str | None = None) -> None:
     path = _db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
@@ -67,7 +75,7 @@ def create_session(
     request_json = _request_json(req)
     account_key = account_key_for_request(req)
 
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
         if settings.auto_trading_one_session_per_account:
@@ -126,7 +134,7 @@ def get_session(
     path = _db_path(db_path)
     if not path.exists():
         return None
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
@@ -144,7 +152,7 @@ def get_active_session_for_account(
     path = _db_path(db_path)
     if not path.exists():
         return None
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
@@ -177,7 +185,7 @@ def list_sessions(
         where = "WHERE status = ?"
         params.append(status)
     params.append(limit)
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
@@ -203,7 +211,7 @@ def list_events(
     if not path.exists():
         return []
     limit = max(1, min(int(limit), 500))
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
@@ -234,7 +242,7 @@ def record_session_event(
     if not path.exists():
         return None
     now = _now()
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
         row = conn.execute(
@@ -279,7 +287,7 @@ def stop_session(
 ) -> dict[str, Any] | None:
     path = _db_path(db_path)
     now = _now()
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
         row = conn.execute(
@@ -325,7 +333,7 @@ def restart_session(
         if run_immediately
         else _plus_seconds(now, int(session["interval_seconds"]))
     )
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
         conn.execute(
@@ -358,7 +366,7 @@ def claim_due_sessions(
     path = _db_path(db_path)
     now = _now()
     lock_until = _plus_seconds(now, lock_seconds or settings.auto_trading_worker_lock_seconds)
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
@@ -409,7 +417,7 @@ def recover_overdue_active_sessions(
     )
     overdue_before = _minus_seconds(now, min_overdue)
     recovered_ids: list[str] = []
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
@@ -467,7 +475,7 @@ def complete_cycle(
     status = "stopped" if max_cycles is not None and cycle_count >= int(max_cycles) else "active"
     next_run_at = None if status == "stopped" else _plus_seconds(now, int(session["interval_seconds"]))
     path = _db_path(db_path)
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
         conn.execute(
@@ -506,7 +514,7 @@ def fail_cycle(
 ) -> dict[str, Any] | None:
     path = _db_path(db_path)
     now = _now()
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
         conn.execute(
