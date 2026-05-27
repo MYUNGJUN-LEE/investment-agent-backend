@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     edge_calibration_db_path: str = "data/edge_calibration.sqlite3"
     edge_calibration_interval_seconds: int = 3600
     edge_calibration_top10_performance_interval_seconds: int = 600
-    edge_calibration_horizon_seconds: int = 172800
+    edge_calibration_horizon_seconds: int = 86400
     edge_calibration_max_samples: int = 2000
     edge_calibration_min_samples: int = 30
     edge_calibration_future_price_limit: int = 1200

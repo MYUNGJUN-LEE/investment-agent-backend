@@ -64,9 +64,9 @@ services:
       - key: EDGE_CALIBRATION_INTERVAL_SECONDS
         value: "3600"
       - key: EDGE_CALIBRATION_HORIZON_SECONDS
-        value: "172800"
+        value: "86400"
       - key: EDGE_CALIBRATION_MAX_SAMPLES
-        value: "1000"
+        value: "2000"
       - key: EDGE_CALIBRATION_MIN_SAMPLES
         value: "30"
       - key: EDGE_CALIBRATION_FUTURE_PRICE_LIMIT
@@ -84,11 +84,11 @@ services:
       - key: EDGE_CALIBRATION_BLEND
         value: "0.35"
       - key: EDGE_CALIBRATION_TARGET_SAMPLES
-        value: "1000"
+        value: "3000"
       - key: EDGE_CALIBRATION_SAMPLE_RETENTION_LIMIT
         value: "10000"
       - key: EDGE_CALIBRATION_GATE_MIN_SAMPLES
-        value: "1000"
+        value: "600"
       - key: EDGE_CALIBRATION_GATE_MIN_OOS_SAMPLES
         value: "200"
       - key: EDGE_CALIBRATION_GATE_MAX_MAE_RETURN_BPS
