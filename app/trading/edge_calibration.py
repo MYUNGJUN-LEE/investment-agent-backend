@@ -285,14 +285,14 @@ def calibrate_edge_model(
         _record_run(calibration_path, result)
         return result
 
-    max_samples = max(1, int(max_samples or settings.edge_calibration_max_samples or 1000))
+    max_samples = max(1, int(max_samples or settings.edge_calibration_max_samples or 5000))
     min_samples = max(1, int(min_samples or settings.edge_calibration_min_samples or 30))
     horizon_seconds = max(60, int(settings.edge_calibration_horizon_seconds or 86400))
     ridge_lambda = max(0.0, float(settings.edge_calibration_ridge_lambda or 0.0))
     blend = max(0.0, min(1.0, float(settings.edge_calibration_blend or 0.35)))
     target_samples = max(
         min_samples,
-        int(settings.edge_calibration_target_samples or 1000),
+        int(settings.edge_calibration_target_samples or 3000),
     )
     training_limit = max(max_samples, target_samples)
 

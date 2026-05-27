@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     edge_calibration_interval_seconds: int = 3600
     edge_calibration_top10_performance_interval_seconds: int = 600
     edge_calibration_horizon_seconds: int = 172800
-    edge_calibration_max_samples: int = 1000
+    edge_calibration_max_samples: int = 2000
     edge_calibration_min_samples: int = 30
     edge_calibration_future_price_limit: int = 1200
     edge_calibration_label_snapshots_enabled: bool = True
@@ -98,9 +98,9 @@ class Settings(BaseSettings):
     edge_calibration_candidate_lookback_seconds: int | None = None
     edge_calibration_ridge_lambda: float = 10.0
     edge_calibration_blend: float = 0.35
-    edge_calibration_target_samples: int = 1000
+    edge_calibration_target_samples: int = 3000
     edge_calibration_sample_retention_limit: int = 10_000
-    edge_calibration_gate_min_samples: int = 1000
+    edge_calibration_gate_min_samples: int = 600
     edge_calibration_gate_min_oos_samples: int = 200
     edge_calibration_gate_max_mae_return_bps: float = 180.0
     edge_calibration_gate_max_mae_risk_bps: float = 180.0
