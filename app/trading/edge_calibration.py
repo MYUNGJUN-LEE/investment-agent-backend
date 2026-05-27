@@ -477,6 +477,8 @@ def get_edge_training_sample_summary(
             "message": _empty_sample_message(diagnostics),
             "sample_count": 0,
             "summary": _empty_sample_summary(),
+            "top10_performance": _empty_top10_performance(),
+            "label_policy": label_policy_summary(),
             "recent_samples": [],
             "symbol_summary": [],
             "diagnostics": diagnostics,
@@ -1743,44 +1745,7 @@ def _top10_performance_from_store(
         row = conn.execute(query, params).fetchone()
     sample_count = int(row["sample_count"] or 0) if row else 0
     if sample_count <= 0:
-        return {
-            "status": "empty",
-            "sample_count": 0,
-            "top_count": 10,
-            "sample_source": "all_stored_top10_samples" if limit is None else "limited_recent_top10_samples",
-            "sample_limit": limit,
-            "metric_sample_count": 0,
-            "total_return_bps": 0.0,
-            "total_risk_bps": 0.0,
-            "total_realized_net_edge_bps": 0.0,
-            "total_expected_return_bps": 0.0,
-            "total_expected_risk_bps": 0.0,
-            "total_predicted_net_edge_bps": 0.0,
-            "total_cost_bps": 0.0,
-            "avg_return_bps": None,
-            "avg_risk_bps": None,
-            "avg_realized_net_edge_bps": None,
-            "avg_expected_return_bps": None,
-            "avg_expected_risk_bps": None,
-            "avg_predicted_net_edge_bps": None,
-            "avg_raw_score": None,
-            "avg_composite_score": None,
-            "avg_cost_bps": None,
-            "avg_return_error_bps": None,
-            "mae_return_error_bps": None,
-            "avg_risk_error_bps": None,
-            "mae_risk_error_bps": None,
-            "avg_net_edge_error_bps": None,
-            "mae_net_edge_error_bps": None,
-            "win_rate": None,
-            "loss_rate": None,
-            "avg_win_bps": None,
-            "avg_loss_bps": None,
-            "reward_risk_ratio": None,
-            "expectancy_bps": None,
-            "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
-            "realized_net_edge_formula": "realized_return_bps - realized_risk_bps - trading_cost_bps - slippage_cost_bps",
-        }
+        return _empty_top10_performance(limit=limit)
     wins = int(row["win_count"] or 0)
     losses = int(row["loss_count"] or 0)
     win_rate = wins / sample_count
@@ -1828,6 +1793,47 @@ def _top10_performance_from_store(
         "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
         "realized_net_edge_formula": "realized_return_bps - realized_risk_bps - trading_cost_bps - slippage_cost_bps",
         "composite_score_formula": "raw_score * 0.25 + expected_return_score * 0.30 + net_edge_score * 0.35 - expected_risk_score * 0.10",
+    }
+
+
+def _empty_top10_performance(limit: int | None = None) -> dict[str, Any]:
+    return {
+        "status": "empty",
+        "sample_count": 0,
+        "top_count": 10,
+        "sample_source": "all_stored_top10_samples" if limit is None else "limited_recent_top10_samples",
+        "sample_limit": limit,
+        "metric_sample_count": 0,
+        "total_return_bps": 0.0,
+        "total_risk_bps": 0.0,
+        "total_realized_net_edge_bps": 0.0,
+        "total_expected_return_bps": 0.0,
+        "total_expected_risk_bps": 0.0,
+        "total_predicted_net_edge_bps": 0.0,
+        "total_cost_bps": 0.0,
+        "avg_return_bps": None,
+        "avg_risk_bps": None,
+        "avg_realized_net_edge_bps": None,
+        "avg_expected_return_bps": None,
+        "avg_expected_risk_bps": None,
+        "avg_predicted_net_edge_bps": None,
+        "avg_raw_score": None,
+        "avg_composite_score": None,
+        "avg_cost_bps": None,
+        "avg_return_error_bps": None,
+        "mae_return_error_bps": None,
+        "avg_risk_error_bps": None,
+        "mae_risk_error_bps": None,
+        "avg_net_edge_error_bps": None,
+        "mae_net_edge_error_bps": None,
+        "win_rate": None,
+        "loss_rate": None,
+        "avg_win_bps": None,
+        "avg_loss_bps": None,
+        "reward_risk_ratio": None,
+        "expectancy_bps": None,
+        "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
+        "realized_net_edge_formula": "realized_return_bps - realized_risk_bps - trading_cost_bps - slippage_cost_bps",
     }
 
 

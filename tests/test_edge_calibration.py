@@ -594,8 +594,12 @@ def _insert_training_sample(
     raw_score: float | None = None,
     composite_score: float | None = None,
     status: str = "READY",
-    label_observation_span_seconds: int = 86_400,
+    label_observation_span_seconds: int | None = None,
 ) -> None:
+    if label_observation_span_seconds is None:
+        label_observation_span_seconds = int(
+            edge_calibration.settings.edge_calibration_horizon_seconds or 86_400
+        )
     conn.execute(
         """
         INSERT INTO edge_training_samples (
