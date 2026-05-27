@@ -252,7 +252,11 @@ def process_due_sessions(
                         "broker_sync": sync_result,
                     }
                 )
-            updated = auto_trading_store.complete_cycle(session["session_id"], results)
+            updated = auto_trading_store.complete_cycle(
+                session["session_id"],
+                results,
+                worker_id=worker_id,
+            )
             processed.append(
                 {
                     "session_id": session["session_id"],
@@ -261,7 +265,11 @@ def process_due_sessions(
                 }
             )
         except Exception as exc:
-            updated = auto_trading_store.fail_cycle(session["session_id"], str(exc))
+            updated = auto_trading_store.fail_cycle(
+                session["session_id"],
+                str(exc),
+                worker_id=worker_id,
+            )
             processed.append(
                 {
                     "session_id": session["session_id"],

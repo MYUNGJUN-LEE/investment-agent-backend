@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     auto_trading_db_path: str = "data/auto_trading.sqlite3"
     auto_trading_worker_poll_seconds: float = 2.0
     auto_trading_worker_lock_seconds: int = 7200
+    auto_trading_stale_lock_recover_seconds: int = 1200
     auto_trading_symbol_workers: int = 1
     auto_trading_max_open_positions: int = 5
     auto_trading_one_session_per_account: bool = True
@@ -150,6 +151,7 @@ class Settings(BaseSettings):
     universe_scanner_news_enrichment_enabled: bool = False
     universe_scanner_disclosure_enrichment_enabled: bool = False
     universe_scanner_min_scanned_symbols_for_trading: int = 15
+    universe_scanner_max_scan_seconds: int = 900
     universe_scanner_candidate_ttl_seconds: int = 7200
     universe_scanner_worker_hurdle_rate_bps: float = 40.0
     universe_scanner_default_spread_bps: float = 5.0

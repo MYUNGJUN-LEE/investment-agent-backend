@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS auto_trading_sessions (
     cycle_count INTEGER NOT NULL DEFAULT 0,
     next_run_at TEXT,
     locked_by TEXT,
+    locked_at TEXT,
     locked_until TEXT,
     last_error TEXT,
     last_results_json TEXT NOT NULL DEFAULT '[]',
@@ -299,8 +300,8 @@ def stop_session(
         conn.execute(
             """
             UPDATE auto_trading_sessions
-            SET status = 'stopped', updated_at = ?, next_run_at = NULL,
-                locked_by = NULL, locked_until = NULL
+                SET status = 'stopped', updated_at = ?, next_run_at = NULL,
+                locked_by = NULL, locked_at = NULL, locked_until = NULL
             WHERE session_id = ?
             """,
             (now, session_id),
@@ -340,7 +341,8 @@ def restart_session(
             """
             UPDATE auto_trading_sessions
             SET status = 'active', updated_at = ?, next_run_at = ?,
-                locked_by = NULL, locked_until = NULL, last_error = NULL
+                locked_by = NULL, locked_at = NULL, locked_until = NULL,
+                last_error = NULL
             WHERE session_id = ?
             """,
             (now, next_run_at, session_id),
@@ -388,12 +390,12 @@ def claim_due_sessions(
             cursor = conn.execute(
                 """
                 UPDATE auto_trading_sessions
-                SET locked_by = ?, locked_until = ?, updated_at = ?
+                SET locked_by = ?, locked_at = ?, locked_until = ?, updated_at = ?
                 WHERE session_id = ?
                   AND status = 'active'
                   AND (locked_until IS NULL OR locked_until < ?)
                 """,
-                (worker_id, lock_until, now, row["session_id"], now),
+                (worker_id, now, lock_until, now, row["session_id"], now),
             )
             if cursor.rowcount:
                 claimed.append(_row_to_session(row))
@@ -415,6 +417,20 @@ def _worker_lock_seconds(lock_seconds: int | None = None) -> int:
     return max(7200, configured, scanner_floor)
 
 
+def _stale_lock_recover_seconds() -> int:
+    configured = max(
+        60,
+        int(settings.auto_trading_stale_lock_recover_seconds or 1200),
+    )
+    source_count = max(1, int(settings.universe_scanner_max_source_symbols or 1))
+    interval = max(0.0, float(settings.universe_scanner_symbol_interval_seconds or 0.0))
+    cap = max(0.0, float(settings.universe_scanner_symbol_interval_cap_seconds or 0.0))
+    if cap > 0:
+        interval = min(interval, cap)
+    scanner_floor = int(source_count * interval) + 600
+    return max(configured, scanner_floor)
+
+
 def recover_overdue_active_sessions(
     *,
     db_path: Path | str | None = None,
@@ -431,6 +447,7 @@ def recover_overdue_active_sessions(
         else max(0.0, float(min_overdue_seconds))
     )
     overdue_before = _minus_seconds(now, min_overdue)
+    stale_before = _minus_seconds(now, _stale_lock_recover_seconds())
     recovered_ids: list[str] = []
     with _connect(path) as conn:
         conn.row_factory = sqlite3.Row
@@ -443,9 +460,13 @@ def recover_overdue_active_sessions(
             WHERE status = 'active'
               AND (next_run_at IS NULL OR next_run_at <= ?)
               AND locked_until IS NOT NULL
-              AND locked_until <= ?
+              AND (
+                  locked_until <= ?
+                  OR (locked_at IS NOT NULL AND locked_at <= ?)
+                  OR (locked_at IS NULL AND updated_at <= ?)
+              )
             """,
-            (overdue_before, now),
+            (overdue_before, now, stale_before, stale_before),
         ).fetchall()
         for row in rows:
             session_id = row["session_id"]
@@ -453,7 +474,7 @@ def recover_overdue_active_sessions(
                 """
                 UPDATE auto_trading_sessions
                 SET updated_at = ?, next_run_at = ?, locked_by = NULL,
-                    locked_until = NULL
+                    locked_at = NULL, locked_until = NULL
                 WHERE session_id = ?
                 """,
                 (now, now, session_id),
@@ -479,6 +500,7 @@ def complete_cycle(
     session_id: str,
     results: list[dict[str, Any]],
     db_path: Path | str | None = None,
+    worker_id: str | None = None,
 ) -> dict[str, Any] | None:
     session = get_session(session_id, db_path=db_path)
     if not session:
@@ -493,23 +515,30 @@ def complete_cycle(
     with _connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
-        conn.execute(
+        params: tuple[Any, ...]
+        where = "WHERE session_id = ?"
+        params = (
+            status,
+            now,
+            cycle_count,
+            next_run_at,
+            _json(results),
+            session_id,
+        )
+        if worker_id is not None:
+            where += " AND locked_by = ?"
+            params = (*params, worker_id)
+        cursor = conn.execute(
             """
             UPDATE auto_trading_sessions
             SET status = ?, updated_at = ?, cycle_count = ?, next_run_at = ?,
-                locked_by = NULL, locked_until = NULL, last_error = NULL,
+                locked_by = NULL, locked_at = NULL, locked_until = NULL, last_error = NULL,
                 last_results_json = ?
-            WHERE session_id = ?
-            """,
-            (
-                status,
-                now,
-                cycle_count,
-                next_run_at,
-                _json(results),
-                session_id,
-            ),
+            """ + where,
+            params,
         )
+        if worker_id is not None and not cursor.rowcount:
+            return get_session(session_id, db_path=db_path)
         _insert_event(
             conn=conn,
             session_id=session_id,
@@ -526,21 +555,29 @@ def fail_cycle(
     session_id: str,
     error: str,
     db_path: Path | str | None = None,
+    worker_id: str | None = None,
 ) -> dict[str, Any] | None:
     path = _db_path(db_path)
     now = _now()
     with _connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_session_columns(conn)
-        conn.execute(
+        where = "WHERE session_id = ?"
+        params: tuple[Any, ...] = (now, error, session_id)
+        if worker_id is not None:
+            where += " AND locked_by = ?"
+            params = (*params, worker_id)
+        cursor = conn.execute(
             """
             UPDATE auto_trading_sessions
             SET status = 'error', updated_at = ?, next_run_at = NULL,
-                locked_by = NULL, locked_until = NULL, last_error = ?
-            WHERE session_id = ?
-            """,
-            (now, error, session_id),
+                locked_by = NULL, locked_at = NULL, locked_until = NULL,
+                last_error = ?
+            """ + where,
+            params,
         )
+        if worker_id is not None and not cursor.rowcount:
+            return get_session(session_id, db_path=db_path)
         _insert_event(
             conn=conn,
             session_id=session_id,
@@ -642,6 +679,7 @@ def _account_key_from_payload(payload: dict[str, Any]) -> str:
 
 def _ensure_session_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "auto_trading_sessions", "account_key", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "auto_trading_sessions", "locked_at", "TEXT")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_auto_trading_sessions_account_status

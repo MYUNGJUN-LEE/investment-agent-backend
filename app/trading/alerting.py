@@ -10,6 +10,8 @@ import httpx
 
 from app.config import settings
 
+content=_json_bytes(outbound_payload)
+headers={"Content-Type": "application/json; charset=utf-8"}
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS alert_deliveries (
@@ -115,11 +117,21 @@ def _deliver_one(alert: dict[str, Any], source: str) -> dict[str, Any]:
         }
 
     try:
-        response = httpx.post(
-            settings.alert_webhook_url,
-            json=payload,
-            timeout=settings.alert_webhook_timeout,
+        webhook_url = str(settings.alert_webhook_url)
+
+        outbound_payload = (
+            _build_discord_payload(payload)
+            if _is_discord_webhook(webhook_url)
+            else payload
         )
+
+        response = httpx.post(
+            webhook_url,
+            content=_json_bytes(outbound_payload),
+            timeout=settings.alert_webhook_timeout,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
         return {
             **payload,
             "delivery_status": "sent" if response.status_code < 400 else "failed",

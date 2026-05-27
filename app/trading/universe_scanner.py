@@ -237,7 +237,7 @@ def scan_universe_for_auto_trade(
     path = _db_path(db_path)
     initialize_universe_db(path)
 
-    snapshots = _collect_price_snapshots(source_symbols)
+    snapshots, collection = _collect_price_snapshots(source_symbols)
     _record_snapshots(path, scan_id, created_at, snapshots)
 
     ranked = sorted(
@@ -279,10 +279,14 @@ def scan_universe_for_auto_trade(
     ]
     result = {
         "scan_id": scan_id,
-        "status": "success",
+        "status": "partial" if collection["timed_out"] else "success",
         "created_at": created_at,
         "source_symbol_count": len(source_symbols),
         "snapshot_count": len(snapshots),
+        "snapshot_error_count": collection["error_count"],
+        "snapshot_collection_seconds": collection["elapsed_seconds"],
+        "snapshot_collection_timed_out": collection["timed_out"],
+        "snapshot_collection_message": collection.get("message"),
         "candidate_limit": candidate_limit,
         "final_limit": final_limit,
         "candidate_count": len(candidates),
@@ -619,12 +623,34 @@ def _resolve_source_symbols(req: AutoTradeStartRequest) -> dict[str, str | None]
     }
 
 
-def _collect_price_snapshots(source_symbols: dict[str, str | None]) -> list[dict[str, Any]]:
+def _collect_price_snapshots(
+    source_symbols: dict[str, str | None],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     snapshots: list[dict[str, Any]] = []
     symbol_interval_seconds = _scanner_symbol_interval_seconds()
+    started = time_module.monotonic()
+    max_seconds = max(60.0, float(settings.universe_scanner_max_scan_seconds or 900))
+    timed_out = False
+    message: str | None = None
     for index, (symbol, name) in enumerate(source_symbols.items()):
+        elapsed = time_module.monotonic() - started
+        if index and elapsed >= max_seconds:
+            timed_out = True
+            message = (
+                f"Universe scan stopped after {elapsed:.1f}s before symbol {symbol}; "
+                f"stored {len(snapshots)}/{len(source_symbols)} snapshots."
+            )
+            break
         if index and symbol_interval_seconds:
-            time_module.sleep(symbol_interval_seconds)
+            remaining = max_seconds - (time_module.monotonic() - started)
+            if remaining <= 0:
+                timed_out = True
+                message = (
+                    f"Universe scan stopped before sleep for symbol {symbol}; "
+                    f"stored {len(snapshots)}/{len(source_symbols)} snapshots."
+                )
+                break
+            time_module.sleep(min(symbol_interval_seconds, remaining))
         try:
             price_data = _fetch_scanner_price_data(symbol)
         except Exception as exc:
@@ -637,7 +663,13 @@ def _collect_price_snapshots(source_symbols: dict[str, str | None]) -> list[dict
         price_data["name"] = name or DEFAULT_UNIVERSE.get(symbol)
         price_data = _with_static_universe_metadata(price_data)
         snapshots.append(price_data)
-    return snapshots
+    elapsed = round(time_module.monotonic() - started, 3)
+    return snapshots, {
+        "timed_out": timed_out,
+        "elapsed_seconds": elapsed,
+        "error_count": sum(1 for item in snapshots if item.get("status") == "error"),
+        "message": message,
+    }
 
 
 def _with_static_universe_metadata(price_data: dict[str, Any]) -> dict[str, Any]:

@@ -395,11 +395,12 @@ def test_universe_scanner_uses_fast_price_fetch_and_caps_symbol_sleep(monkeypatc
 
     monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
 
-    snapshots = universe_scanner._collect_price_snapshots(
+    snapshots, collection = universe_scanner._collect_price_snapshots(
         {"005930": "Samsung", "000660": "SK hynix"}
     )
 
     assert [item["symbol"] for item in snapshots] == ["005930", "000660"]
+    assert collection["timed_out"] is False
     assert calls == [("005930", False), ("000660", False)]
     assert sleeps == [0.01]
 
@@ -762,9 +763,31 @@ def test_universe_scanner_collects_symbols_sequentially(monkeypatch):
 
     monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
 
-    snapshots = universe_scanner._collect_price_snapshots(
+    snapshots, collection = universe_scanner._collect_price_snapshots(
         {"005930": "Samsung Electronics", "000660": "SK hynix"}
     )
 
     assert calls == ["005930", "000660"]
+    assert collection["timed_out"] is False
     assert [item["symbol"] for item in snapshots] == ["005930", "000660"]
+
+
+def test_universe_scanner_stops_collection_at_scan_deadline(monkeypatch):
+    clock = {"value": 0.0}
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_scan_seconds", 60)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_symbol_interval_seconds", 0)
+    monkeypatch.setattr(universe_scanner.time_module, "monotonic", lambda: clock["value"])
+
+    def fake_fetch_price_data(symbol: str) -> dict:
+        clock["value"] += 61
+        return {"symbol": symbol, "current_price": 1000, "source": "test"}
+
+    monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
+
+    snapshots, collection = universe_scanner._collect_price_snapshots(
+        {"005930": "Samsung Electronics", "000660": "SK hynix"}
+    )
+
+    assert [item["symbol"] for item in snapshots] == ["005930"]
+    assert collection["timed_out"] is True
+    assert "stored 1/2 snapshots" in collection["message"]
