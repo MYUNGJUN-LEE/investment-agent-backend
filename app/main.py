@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 import re
 from typing import Any
@@ -717,6 +718,120 @@ def refresh_edge_training_sample_summary(limit: int = 20):
         "samples": get_edge_training_sample_summary(limit=limit),
         "label_policy": label_policy_summary(),
     }
+
+
+@app.get(
+    "/admin/runtime-status",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getAdminRuntimeStatus",
+    summary="Get read-only admin dashboard runtime status",
+)
+def admin_runtime_status(limit: int = 20):
+    from app.workers.manager import embedded_worker_status
+
+    auto_status = control_auto_trading_from_gpt(
+        GptAutoTradeControlRequest(command="status")
+    )
+    samples = get_edge_training_sample_summary(limit=limit)
+    latest_universe = get_latest_universe_scan()
+    workers = embedded_worker_status()
+    summary = _admin_runtime_summary(
+        auto_status=auto_status,
+        samples=samples,
+        latest_universe=latest_universe,
+        workers=workers,
+    )
+    return {
+        "status": "success",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "summary": summary,
+        "auto_trading": auto_status,
+        "latest_universe": latest_universe,
+        "samples": samples,
+        "workers": workers,
+    }
+
+
+def _admin_runtime_summary(
+    *,
+    auto_status: dict[str, Any],
+    samples: dict[str, Any],
+    latest_universe: dict[str, Any],
+    workers: dict[str, Any],
+) -> dict[str, Any]:
+    active_sessions = auto_status.get("active_sessions") or []
+    worker_rows = workers.get("workers") or []
+    worker_count = len(worker_rows)
+    alive_workers = [row for row in worker_rows if row.get("alive")]
+    trading_worker_alive = any(
+        row.get("name") == "trading_worker" and row.get("alive")
+        for row in worker_rows
+    )
+    diagnostics = samples.get("diagnostics") or {}
+    label_policy = samples.get("label_policy") or {}
+    top10 = samples.get("top10_performance") or {}
+    scan_count = _to_int(diagnostics.get("universe_scan_count"))
+    sample_count = _to_int(samples.get("sample_count"))
+    candidate_count = _to_int(diagnostics.get("scanner_candidate_history_count"))
+    snapshot_count = _to_int(diagnostics.get("universe_price_snapshot_count"))
+
+    if active_sessions and trading_worker_alive:
+        scanner_state = "running"
+    elif active_sessions:
+        scanner_state = "worker_down"
+    elif scan_count > 0:
+        scanner_state = "idle"
+    else:
+        scanner_state = "not_started"
+
+    if sample_count > 0:
+        sample_state = "ready"
+    elif scan_count > 0 and label_policy.get("label_at_horizon_end"):
+        sample_state = "waiting_for_horizon"
+    elif scan_count > 0:
+        sample_state = "waiting_for_future_prices"
+    else:
+        sample_state = "empty"
+
+    return {
+        "scanner_state": scanner_state,
+        "sample_state": sample_state,
+        "active_session_count": len(active_sessions),
+        "worker_count": worker_count,
+        "alive_worker_count": len(alive_workers),
+        "trading_worker_alive": trading_worker_alive,
+        "cycle_count": sum(_to_int(row.get("cycle_count")) for row in active_sessions),
+        "latest_session_updated_at": active_sessions[0].get("updated_at")
+        if active_sessions
+        else None,
+        "latest_session_next_run_at": active_sessions[0].get("next_run_at")
+        if active_sessions
+        else None,
+        "latest_scan_id": latest_universe.get("scan_id"),
+        "latest_scan_status": latest_universe.get("status"),
+        "latest_scan_time": diagnostics.get("latest_scan_time")
+        or latest_universe.get("created_at")
+        or latest_universe.get("scan_time"),
+        "latest_scan_final_count": _to_int(latest_universe.get("final_count")),
+        "latest_scan_executable_count": _to_int(
+            latest_universe.get("executable_count")
+        ),
+        "universe_scan_count": scan_count,
+        "scanner_candidate_history_count": candidate_count,
+        "universe_price_snapshot_count": snapshot_count,
+        "sample_count": sample_count,
+        "top10_sample_count": _to_int(top10.get("sample_count")),
+        "last_training_sample_at": diagnostics.get("last_training_sample_at"),
+        "label_horizon_seconds": _to_int(label_policy.get("horizon_seconds")),
+        "label_min_age_seconds": _to_int(label_policy.get("min_label_age_seconds")),
+    }
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 @app.post(

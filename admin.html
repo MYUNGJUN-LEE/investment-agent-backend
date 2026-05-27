@@ -153,6 +153,29 @@
       background: var(--surface);
     }
 
+    .refresh-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .checkline {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .checkline input {
+      width: auto;
+      height: auto;
+      margin: 0;
+    }
+
     .pill {
       display: inline-flex;
       align-items: center;
@@ -182,6 +205,40 @@
       font: 12px/1.55 var(--mono);
       white-space: pre-wrap;
       word-break: break-word;
+    }
+
+    .runtime-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .state-card {
+      display: grid;
+      gap: 4px;
+      min-height: 70px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+    }
+
+    .state-card span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .state-card strong {
+      font-size: 17px;
+      line-height: 1.2;
+      word-break: break-word;
+    }
+
+    .state-card small {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.25;
     }
 
     table {
@@ -269,13 +326,16 @@
       header { grid-template-columns: 1fr; }
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
+      .runtime-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     }
 
     @media (max-width: 560px) {
       .grid { grid-template-columns: 1fr; }
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .runtime-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       header, aside, .content { padding: 12px; }
       input, select, button { width: 100%; }
+      .checkline input { width: auto; }
     }
   </style>
 </head>
@@ -387,8 +447,41 @@
 
     <div class="content">
       <div class="statusbar">
-        <span id="lastAction" class="muted">Ready</span>
+        <div class="stack">
+          <span id="lastAction" class="muted">Ready</span>
+          <span id="runtimeUpdated" class="muted">Runtime not loaded.</span>
+        </div>
+        <div class="refresh-controls">
+          <label class="checkline"><input id="autoRefresh" type="checkbox" checked /> Auto refresh</label>
+          <select id="refreshSeconds" class="small">
+            <option value="10">10s</option>
+            <option value="30" selected>30s</option>
+            <option value="60">60s</option>
+          </select>
+          <button data-action="runtimeStatus">Refresh</button>
+        </div>
         <span id="lastStatus" class="pill">Idle</span>
+      </div>
+
+      <div class="panel">
+        <div class="panelhead">
+          <h2>Runtime Overview</h2>
+          <span id="runtimeMeta" class="muted">No runtime data loaded.</span>
+        </div>
+        <div class="runtime-grid">
+          <div class="state-card"><span>Scanner</span><strong id="scannerState">-</strong><small id="scannerDetail">-</small></div>
+          <div class="state-card"><span>Samples</span><strong id="sampleState">-</strong><small id="sampleDetail">-</small></div>
+          <div class="state-card"><span>Workers</span><strong id="workerState">-</strong><small id="workerDetail">-</small></div>
+          <div class="state-card"><span>Active Sessions</span><strong id="activeSessionCount">0</strong><small id="sessionDetail">-</small></div>
+          <div class="state-card"><span>Latest Scan</span><strong id="latestScanState">-</strong><small id="latestScanDetail">-</small></div>
+          <div class="state-card"><span>Scan Runs</span><strong id="runtimeScanCount">0</strong><small id="runtimeCandidateCount">-</small></div>
+          <div class="state-card"><span>Price Snapshots</span><strong id="runtimeSnapshotCount">0</strong><small id="runtimeLatestScanTime">-</small></div>
+          <div class="state-card"><span>Stored Samples</span><strong id="runtimeSampleCount">0</strong><small id="runtimeTop10Count">-</small></div>
+          <div class="state-card"><span>Label Horizon</span><strong id="runtimeHorizon">-</strong><small id="runtimeLabelAge">-</small></div>
+          <div class="state-card"><span>Cycle Count</span><strong id="runtimeCycleCount">0</strong><small id="runtimeNextRun">-</small></div>
+          <div class="state-card"><span>Final Candidates</span><strong id="runtimeFinalCount">0</strong><small id="runtimeExecutableCount">-</small></div>
+          <div class="state-card"><span>Last Sample</span><strong id="runtimeLastSample">-</strong><small id="runtimeSampleNote">-</small></div>
+        </div>
       </div>
 
       <div class="panel">
@@ -507,6 +600,34 @@
       output: document.getElementById("output"),
       lastAction: document.getElementById("lastAction"),
       lastStatus: document.getElementById("lastStatus"),
+      runtimeUpdated: document.getElementById("runtimeUpdated"),
+      runtimeMeta: document.getElementById("runtimeMeta"),
+      autoRefresh: document.getElementById("autoRefresh"),
+      refreshSeconds: document.getElementById("refreshSeconds"),
+      scannerState: document.getElementById("scannerState"),
+      scannerDetail: document.getElementById("scannerDetail"),
+      sampleState: document.getElementById("sampleState"),
+      sampleDetail: document.getElementById("sampleDetail"),
+      workerState: document.getElementById("workerState"),
+      workerDetail: document.getElementById("workerDetail"),
+      activeSessionCount: document.getElementById("activeSessionCount"),
+      sessionDetail: document.getElementById("sessionDetail"),
+      latestScanState: document.getElementById("latestScanState"),
+      latestScanDetail: document.getElementById("latestScanDetail"),
+      runtimeScanCount: document.getElementById("runtimeScanCount"),
+      runtimeCandidateCount: document.getElementById("runtimeCandidateCount"),
+      runtimeSnapshotCount: document.getElementById("runtimeSnapshotCount"),
+      runtimeLatestScanTime: document.getElementById("runtimeLatestScanTime"),
+      runtimeSampleCount: document.getElementById("runtimeSampleCount"),
+      runtimeTop10Count: document.getElementById("runtimeTop10Count"),
+      runtimeHorizon: document.getElementById("runtimeHorizon"),
+      runtimeLabelAge: document.getElementById("runtimeLabelAge"),
+      runtimeCycleCount: document.getElementById("runtimeCycleCount"),
+      runtimeNextRun: document.getElementById("runtimeNextRun"),
+      runtimeFinalCount: document.getElementById("runtimeFinalCount"),
+      runtimeExecutableCount: document.getElementById("runtimeExecutableCount"),
+      runtimeLastSample: document.getElementById("runtimeLastSample"),
+      runtimeSampleNote: document.getElementById("runtimeSampleNote"),
       sessionsTable: document.getElementById("sessionsTable"),
       universeMeta: document.getElementById("universeMeta"),
       universeTable: document.getElementById("universeTable"),
@@ -575,6 +696,7 @@
       monitorStatus: { method: "GET", path: "/monitor/status" },
       monitorRunDue: { method: "POST", path: "/monitor/run-due" },
       schema: { method: "GET", path: "/action-schema.yaml", text: true, auth: false },
+      runtimeStatus: { method: "GET", path: "/admin/runtime-status?limit=20", after: renderRuntimeStatus },
       startPaper: {
         method: "POST",
         path: "/gpt/auto-trading/start-paper",
@@ -632,7 +754,12 @@
       localStorage.setItem("adminBaseUrl", cleanBaseUrl());
       localStorage.setItem("adminApiKey", els.apiKey.value.trim());
       setStatus("Saved", "ok");
+      scheduleRuntimeRefresh();
+      refreshRuntimeStatus({ quiet: false });
     });
+
+    els.autoRefresh.addEventListener("change", scheduleRuntimeRefresh);
+    els.refreshSeconds.addEventListener("change", scheduleRuntimeRefresh);
 
     document.querySelectorAll("[data-action]").forEach(button => {
       button.addEventListener("click", () => runNamedAction(button.dataset.action, button));
@@ -671,10 +798,9 @@
 
     function overviewAction() {
       return {
-        method: "POST",
-        path: "/universe/scan-and-refresh-samples?sample_limit=20",
-        body: { auto_discover_symbols: true },
-        after: renderScanAndRefreshSamples
+        method: "GET",
+        path: "/admin/runtime-status?limit=20",
+        after: renderRuntimeStatus
       };
     }
 
@@ -772,6 +898,7 @@
         if (spec.after) spec.after(result);
         if (name === "startPaper" || name === "startLive" || name === "stopAll" || name === "stopSession" || name === "restartSession") {
           await refreshAutoStatus();
+          await refreshRuntimeStatus({ quiet: true });
         }
       } catch (err) {
         showError(err);
@@ -783,12 +910,14 @@
       }
     }
 
-    async function request(spec) {
+    async function request(spec, options = {}) {
       const method = spec.method || "GET";
       const hasBody = spec.body !== undefined && method !== "GET";
       const url = spec.path.startsWith("http") ? spec.path : `${cleanBaseUrl()}${spec.path}`;
-      els.lastAction.textContent = `${method} ${spec.path}`;
-      setStatus("Running", "warn");
+      if (!options.quiet) {
+        els.lastAction.textContent = `${method} ${spec.path}`;
+        setStatus("Running", "warn");
+      }
       const response = await fetch(url, {
         method,
         headers: headers(spec.auth, hasBody),
@@ -801,7 +930,7 @@
       if (!response.ok) {
         throw new Error(`${response.status} ${typeof payload === "string" ? payload : JSON.stringify(payload)}`);
       }
-      setStatus(statusLabel(payload), statusClass(payload));
+      if (!options.quiet) setStatus(statusLabel(payload), statusClass(payload));
       return payload;
     }
 
@@ -829,6 +958,63 @@
     function showError(err) {
       setStatus("Error", "bad");
       els.output.textContent = String(err && err.message ? err.message : err);
+    }
+
+    function renderRuntimeStatus(data) {
+      const summary = data.summary || {};
+      const auto = data.auto_trading || {};
+      const samples = data.samples || {};
+      const latest = data.latest_universe || {};
+      const workers = data.workers || {};
+      renderSessionsFromAutoStatus(auto);
+      if (latest.status) renderUniverse(latest);
+      if (samples.summary || samples.diagnostics) renderEdgeSamples(samples);
+
+      const scannerState = summary.scanner_state || "unknown";
+      const sampleState = summary.sample_state || "unknown";
+      els.runtimeMeta.textContent = [
+        `generated ${data.generated_at || "-"}`,
+        `scan ${shortId(summary.latest_scan_id || latest.scan_id || "")}`,
+        `session updates ${summary.latest_session_updated_at || "-"}`
+      ].filter(Boolean).join(" | ");
+      els.runtimeUpdated.textContent = `Runtime updated ${data.generated_at || new Date().toLocaleTimeString()}`;
+
+      els.scannerState.textContent = stateLabel(scannerState);
+      els.scannerState.className = classForState(scannerState);
+      els.scannerDetail.textContent = summary.latest_scan_time
+        ? `latest scan ${summary.latest_scan_time}`
+        : "waiting for first scan";
+
+      els.sampleState.textContent = stateLabel(sampleState);
+      els.sampleState.className = classForState(sampleState);
+      els.sampleDetail.textContent = sampleState === "waiting_for_horizon"
+        ? "labels wait for horizon completion"
+        : `${fmtNumber(summary.sample_count, 0)} stored samples`;
+
+      els.workerState.textContent = `${fmtNumber(summary.alive_worker_count, 0)}/${fmtNumber(summary.worker_count, 0)}`;
+      els.workerState.className = summary.alive_worker_count === summary.worker_count ? "ok" : "bad";
+      els.workerDetail.textContent = workerNames(workers);
+
+      els.activeSessionCount.textContent = fmtNumber(summary.active_session_count, 0);
+      els.sessionDetail.textContent = summary.latest_session_updated_at || "-";
+      els.latestScanState.textContent = stateLabel(summary.latest_scan_status || latest.status || "-");
+      els.latestScanState.className = statusTextClass(summary.latest_scan_status || latest.status || "");
+      els.latestScanDetail.textContent = shortId(summary.latest_scan_id || latest.scan_id || "");
+      els.runtimeScanCount.textContent = fmtNumber(summary.universe_scan_count, 0);
+      els.runtimeCandidateCount.textContent = `${fmtNumber(summary.scanner_candidate_history_count, 0)} candidates`;
+      els.runtimeSnapshotCount.textContent = fmtNumber(summary.universe_price_snapshot_count, 0);
+      els.runtimeLatestScanTime.textContent = summary.latest_scan_time || "-";
+      els.runtimeSampleCount.textContent = fmtNumber(summary.sample_count, 0);
+      els.runtimeTop10Count.textContent = `${fmtNumber(summary.top10_sample_count, 0)} top10`;
+      els.runtimeHorizon.textContent = fmtSeconds(summary.label_horizon_seconds);
+      els.runtimeLabelAge.textContent = `min age ${fmtSeconds(summary.label_min_age_seconds)}`;
+      els.runtimeCycleCount.textContent = fmtNumber(summary.cycle_count, 0);
+      els.runtimeNextRun.textContent = summary.latest_session_next_run_at || "-";
+      els.runtimeFinalCount.textContent = fmtNumber(summary.latest_scan_final_count, 0);
+      els.runtimeExecutableCount.textContent = `${fmtNumber(summary.latest_scan_executable_count, 0)} executable`;
+      els.runtimeLastSample.textContent = summary.last_training_sample_at ? "ready" : "-";
+      els.runtimeLastSample.className = summary.last_training_sample_at ? "ok" : "warn";
+      els.runtimeSampleNote.textContent = summary.last_training_sample_at || "no realized labels yet";
     }
 
     function renderSessionsFromAutoStatus(data) {
@@ -1023,6 +1209,28 @@
       });
     }
 
+    function stateLabel(value) {
+      return String(value || "-").replaceAll("_", " ");
+    }
+
+    function classForState(value) {
+      const state = String(value || "").toLowerCase();
+      if (["running", "ready", "success"].includes(state)) return "ok";
+      if (["waiting_for_horizon", "waiting_for_future_prices", "idle", "empty"].includes(state)) return "warn";
+      if (["worker_down", "error", "failed"].includes(state)) return "bad";
+      return "";
+    }
+
+    function statusTextClass(value) {
+      return statusClass({ status: value || "unknown" });
+    }
+
+    function workerNames(workers) {
+      const rows = workers && Array.isArray(workers.workers) ? workers.workers : [];
+      if (!rows.length) return "-";
+      return rows.map(row => `${row.name}:${row.alive ? "on" : "off"}`).join(" ");
+    }
+
     function shortId(value) {
       value = String(value || "");
       return value.length > 12 ? `${value.slice(0, 8)}...${value.slice(-4)}` : value;
@@ -1057,6 +1265,15 @@
       return `${(number * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
     }
 
+    function fmtSeconds(value) {
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds) || seconds <= 0) return "-";
+      if (seconds >= 86400) return `${(seconds / 86400).toLocaleString(undefined, { maximumFractionDigits: 1 })}d`;
+      if (seconds >= 3600) return `${(seconds / 3600).toLocaleString(undefined, { maximumFractionDigits: 1 })}h`;
+      if (seconds >= 60) return `${Math.round(seconds / 60)}m`;
+      return `${Math.round(seconds)}s`;
+    }
+
     function escapeHtml(value) {
       return String(value || "")
         .replaceAll("&", "&amp;")
@@ -1078,15 +1295,42 @@
     async function refreshOverview() {
       try {
         const result = await request(actions.overview);
-        renderScanAndRefreshSamples(result);
+        renderRuntimeStatus(result);
       } catch (err) {
         showError(err);
       }
     }
 
+    let runtimeRefreshTimer = null;
+
+    async function refreshRuntimeStatus(options = {}) {
+      if (!els.apiKey.value.trim()) {
+        setStatus("Auth needed", "warn");
+        return;
+      }
+      try {
+        const result = await request(actions.runtimeStatus, { quiet: options.quiet !== false });
+        renderRuntimeStatus(result);
+        if (options.quiet === false) showResult(result);
+      } catch (err) {
+        els.runtimeUpdated.textContent = `Runtime update failed: ${String(err.message || err)}`;
+        if (options.quiet === false) showError(err);
+      }
+    }
+
+    function scheduleRuntimeRefresh() {
+      if (runtimeRefreshTimer) {
+        clearInterval(runtimeRefreshTimer);
+        runtimeRefreshTimer = null;
+      }
+      if (!els.autoRefresh.checked || !els.apiKey.value.trim()) return;
+      const seconds = Number(els.refreshSeconds.value || 30);
+      runtimeRefreshTimer = setInterval(() => refreshRuntimeStatus({ quiet: true }), seconds * 1000);
+    }
+
     if (els.apiKey.value.trim()) {
-      refreshAutoStatus();
-      refreshOverview();
+      refreshRuntimeStatus({ quiet: false });
+      scheduleRuntimeRefresh();
     } else {
       setStatus("Auth needed", "warn");
     }

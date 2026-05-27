@@ -93,6 +93,9 @@ def test_admin_dashboard_is_served():
     assert "Start Live Auto" in response.text
     assert "/live/orders" in response.text
     assert "Universe Scan" in response.text
+    assert "Runtime Overview" in response.text
+    assert "Auto refresh" in response.text
+    assert "/admin/runtime-status" in response.text
     assert "Edge Samples" in response.text
     assert "Top10 Expectancy" in response.text
     assert "Avg Expected Return" in response.text
@@ -125,6 +128,22 @@ def test_edge_training_samples_endpoint_returns_summary():
     assert "universe_scan_count" in body["diagnostics"]
     assert "total_auto_trading_cycle_count" in body["diagnostics"]
     assert "recent_samples" in body
+
+
+def test_admin_runtime_status_endpoint_returns_compact_summary():
+    response = client.get("/admin/runtime-status", headers=_auth_headers())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert "generated_at" in body
+    assert "summary" in body
+    assert "auto_trading" in body
+    assert "latest_universe" in body
+    assert "samples" in body
+    assert "workers" in body
+    assert "scanner_state" in body["summary"]
+    assert "sample_state" in body["summary"]
+    assert "universe_scan_count" in body["summary"]
 
 
 def test_edge_training_samples_refresh_endpoint_returns_diagnostics(monkeypatch):
