@@ -253,6 +253,7 @@ def scan_universe_for_auto_trade(
         scan_time=created_at,
         final_limit=final_limit,
         hurdle_rate=hurdle_rate,
+        execution_mode=req.execution_mode,
     )
     _record_candidates(path, scan_id, created_at, ranked_candidates)
     _record_scanner_candidates(
@@ -421,6 +422,7 @@ def initialize_universe_db(db_path: Path | str | None = None) -> None:
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_universe_schema_migrations(conn)
+        _backfill_scanner_candidate_history_from_legacy(conn)
 
 
 def _ensure_universe_schema_migrations(conn: sqlite3.Connection) -> None:
@@ -447,6 +449,154 @@ def _ensure_column(
     }
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _backfill_scanner_candidate_history_from_legacy(conn: sqlite3.Connection) -> None:
+    """Populate the newer scanner history table from older universe candidate rows."""
+    conn.row_factory = sqlite3.Row
+    edge_model = load_edge_model()
+    hurdle_rate = float(settings.universe_scanner_worker_hurdle_rate_bps or 0.0)
+    ttl_seconds = int(settings.universe_scanner_candidate_ttl_seconds or 3600)
+    while True:
+        rows = conn.execute(
+            """
+            SELECT
+                c.*,
+                r.final_limit AS run_final_limit,
+                r.created_at AS run_created_at
+            FROM universe_candidates c
+            JOIN universe_scan_runs r ON r.scan_id = c.scan_id
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM scanner_candidate_history h
+                WHERE h.scan_id = c.scan_id
+                  AND h.symbol = c.symbol
+            )
+            ORDER BY c.created_at ASC, c.rank ASC, c.id ASC
+            LIMIT 500
+            """
+        ).fetchall()
+        if not rows:
+            break
+
+        values = []
+        for row in rows:
+            scan_time = str(row["created_at"] or row["run_created_at"] or _now())
+            final_limit = (
+                _to_int(row["run_final_limit"])
+                or int(settings.universe_scanner_final_limit or 10)
+            )
+            item = _legacy_candidate_row_to_scanner_item(
+                row,
+                scan_time=scan_time,
+                final_limit=final_limit,
+                hurdle_rate=hurdle_rate,
+                ttl_seconds=ttl_seconds,
+                edge_model=edge_model,
+            )
+            values.append(
+                _candidate_row_values(
+                    scan_id=str(row["scan_id"]),
+                    scan_time=scan_time,
+                    item=item,
+                )
+            )
+        conn.executemany(
+            """
+            INSERT INTO scanner_candidate_history (
+                scan_id, scan_time, symbol, name, raw_score, expected_return,
+                expected_risk, trading_cost, slippage_cost, net_edge,
+                composite_score, rank, reason, status, decision, current_price,
+                change_rate, volume, volume_ratio, turnover_value, market_cap,
+                market_segment, universe_profile, news_count, disclosure_count,
+                claimed_by_worker, expires_at, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+
+
+def _legacy_candidate_row_to_scanner_item(
+    row: sqlite3.Row,
+    *,
+    scan_time: str,
+    final_limit: int,
+    hurdle_rate: float,
+    ttl_seconds: int,
+    edge_model: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    raw_payload = _parse_json(row["raw_json"], {})
+    raw_payload = raw_payload if isinstance(raw_payload, dict) else {}
+    rank = _to_int(row["rank"]) or 0
+    score = _to_float(row["score"]) or 0.0
+    candidate = {
+        **raw_payload,
+        "symbol": row["symbol"],
+        "name": row["name"],
+        "rank": rank,
+        "score": score,
+        "decision": row["decision"] or raw_payload.get("decision") or "exclude",
+        "reason": row["reason"] or raw_payload.get("reason") or "legacy backfill",
+        "current_price": _to_float(row["current_price"]),
+        "change_rate": _to_float(row["change_rate"]),
+        "volume": _to_int(row["volume"]),
+        "volume_ratio": _to_float(row["volume_ratio"]),
+        "turnover_value": _to_float(row["turnover_value"]),
+        "market_cap": _to_float(row["market_cap"]),
+        "market_segment": row["market_segment"],
+        "universe_profile": row["universe_profile"],
+        "news_count": _to_int(row["news_count"]) or 0,
+        "disclosure_count": _to_int(row["disclosure_count"]) or 0,
+        "expires_at": _plus_seconds(scan_time, ttl_seconds),
+    }
+    try:
+        scored = _with_expected_value_scores(
+            candidate,
+            expires_at=str(candidate["expires_at"]),
+            edge_model=edge_model,
+        )
+        status, reason = _execution_status_for_candidate(
+            scored,
+            rank=rank,
+            execution_limit=final_limit,
+            hurdle_rate=hurdle_rate,
+            entry_gate={
+                "status": "legacy_backfill",
+                "approved": True,
+                "message": "legacy universe_candidates backfill",
+            },
+        )
+        return {
+            **scored,
+            "rank": rank,
+            "status": status,
+            "reason": reason,
+            "worker_hurdle_rate": round(hurdle_rate, 4),
+            "entry_gate": {
+                "status": "legacy_backfill",
+                "approved": True,
+            },
+        }
+    except Exception as exc:
+        fallback_status = "ARCHIVED" if rank > final_limit else "SKIPPED"
+        trading_cost = _estimate_round_trip_trading_cost_bps()
+        slippage_cost = 8.0
+        expected_return = max(0.0, min(500.0, score * 1.8))
+        expected_risk = 140.0
+        net_edge = expected_return - expected_risk - trading_cost - slippage_cost
+        return {
+            **candidate,
+            "raw_score": round(score, 4),
+            "expected_return": round(expected_return, 4),
+            "expected_risk": round(expected_risk, 4),
+            "trading_cost": round(trading_cost, 4),
+            "slippage_cost": round(slippage_cost, 4),
+            "net_edge": round(net_edge, 4),
+            "composite_score": round(score, 4),
+            "status": fallback_status,
+            "reason": f"{candidate['reason']}; legacy backfill fallback: {exc}",
+        }
 
 
 def _resolve_source_symbols(req: AutoTradeStartRequest) -> dict[str, str | None]:
@@ -970,6 +1120,7 @@ def _rank_execution_candidates(
     scan_time: str,
     final_limit: int,
     hurdle_rate: float,
+    execution_mode: str = "paper",
 ) -> list[dict[str, Any]]:
     expires_at = _plus_seconds(
         scan_time,
@@ -984,7 +1135,7 @@ def _rank_execution_candidates(
         )
         for item in candidates
     ]
-    entry_gate = edge_entry_gate(scored)
+    entry_gate = _edge_entry_gate_for_mode(scored, execution_mode=execution_mode)
     ranked = sorted(
         scored,
         key=lambda item: (
@@ -1016,6 +1167,19 @@ def _rank_execution_candidates(
             }
         )
     return prepared
+
+
+def _edge_entry_gate_for_mode(
+    candidates: list[dict[str, Any]],
+    *,
+    execution_mode: str,
+) -> dict[str, Any]:
+    try:
+        return edge_entry_gate(candidates, execution_mode=execution_mode)
+    except TypeError as exc:
+        if "execution_mode" not in str(exc):
+            raise
+        return edge_entry_gate(candidates)
 
 
 def _execution_priority(candidate: dict[str, Any]) -> int:

@@ -42,7 +42,7 @@ services:
       - key: TRADE_ORCHESTRATOR_EDGE_WEIGHT_CAP_BPS
         value: "300"
       - key: POSITION_TIME_STOP_TRADING_DAYS
-        value: "5"
+        value: "2"
       - key: STRATEGY_CIRCUIT_BREAKER_ENABLED
         value: "true"
       - key: STRATEGY_CIRCUIT_BREAKER_WIN_RATE_FLOOR
@@ -64,13 +64,21 @@ services:
       - key: EDGE_CALIBRATION_INTERVAL_SECONDS
         value: "3600"
       - key: EDGE_CALIBRATION_HORIZON_SECONDS
-        value: "86400"
+        value: "172800"
       - key: EDGE_CALIBRATION_MAX_SAMPLES
         value: "1000"
       - key: EDGE_CALIBRATION_MIN_SAMPLES
         value: "30"
       - key: EDGE_CALIBRATION_FUTURE_PRICE_LIMIT
-        value: "96"
+        value: "1200"
+      - key: EDGE_CALIBRATION_REFRESH_AFTER_SCAN
+        value: "true"
+      - key: EDGE_CALIBRATION_MIN_LABEL_AGE_SECONDS
+        value: "300"
+      - key: EDGE_CALIBRATION_MIN_FUTURE_SNAPSHOTS
+        value: "2"
+      - key: EDGE_CALIBRATION_LABEL_AT_HORIZON_END
+        value: "true"
       - key: EDGE_CALIBRATION_RIDGE_LAMBDA
         value: "10"
       - key: EDGE_CALIBRATION_BLEND
@@ -88,7 +96,9 @@ services:
       - key: EDGE_CALIBRATION_GATE_MAX_MAE_RISK_BPS
         value: "180"
       - key: EDGE_CALIBRATION_GATE_MIN_TOP10_AVG_RETURN_BPS
-        value: "10"
+        value: "5"
+      - key: EDGE_CALIBRATION_PAPER_MIN_TOP10_AVG_RETURN_BPS
+        value: "5"
       - key: EDGE_CALIBRATION_GATE_MIN_TOP10_WIN_RATE
         value: "0.50"
       - key: EDGE_CALIBRATION_GATE_MIN_TOP10_EXPECTANCY_BPS
@@ -132,13 +142,13 @@ services:
       - key: UNIVERSE_SCANNER_SYMBOL_INTERVAL_SECONDS
         value: "60"
       - key: UNIVERSE_SCANNER_MAX_SOURCE_SYMBOLS
-        value: "15"
+        value: "100"
       - key: UNIVERSE_SCANNER_MIN_SCANNED_SYMBOLS_FOR_TRADING
         value: "15"
       - key: UNIVERSE_SCANNER_CANDIDATE_TTL_SECONDS
-        value: "3600"
+        value: "7200"
       - key: UNIVERSE_SCANNER_WORKER_HURDLE_RATE_BPS
-        value: "50"
+        value: "40"
       - key: UNIVERSE_SCANNER_DEFAULT_SPREAD_BPS
         value: "5"
       - key: UNIVERSE_SCANNER_DEFAULT_SLIPPAGE_BPS

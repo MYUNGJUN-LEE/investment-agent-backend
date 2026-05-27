@@ -30,6 +30,7 @@ from app.trading import order_state
 from app.trading import paper_trading
 from app.trading import risk_manager
 from app.trading.atr_exits import atr_exit_levels_from_price_data
+from app.trading.edge_calibration import refresh_edge_training_samples
 from app.trading.universe_scanner import (
     scan_universe_for_auto_trade,
     scanner_candidate_to_symbol_config,
@@ -340,6 +341,18 @@ def _run_cycle(
         if not symbols:
             results_prefix[0]["message"] = "Universe scanner found no tradable candidates"
             return results_prefix
+        if settings.edge_calibration_enabled and settings.edge_calibration_refresh_after_scan:
+            try:
+                label_refresh = refresh_edge_training_samples()
+                results_prefix[0]["label_refresh"] = label_refresh
+                results_prefix[0]["stored_sample_count"] = label_refresh.get(
+                    "stored_sample_count"
+                )
+            except Exception as exc:
+                results_prefix[0]["label_refresh"] = {
+                    "status": "error",
+                    "message": str(exc),
+                }
 
     if _requires_live_exit_confirmation(req) and any(
         symbol_cfg.requested_action == "exit" for symbol_cfg in symbols
@@ -498,7 +511,10 @@ def build_orchestrated_symbol_plan(
         req=req,
         active_candidate_symbols=active_candidate_symbols,
     )
-    entry_gate = edge_entry_gate(active_candidates)
+    entry_gate = _edge_entry_gate_for_mode(
+        active_candidates,
+        execution_mode=req.execution_mode,
+    )
 
     entry_symbols: list[AutoTradeSymbolConfig] = []
     if execute_entries and entry_gate.get("approved", False):
@@ -515,6 +531,19 @@ def build_orchestrated_symbol_plan(
         "entry_symbols": entry_symbols,
         "entry_gate": entry_gate,
     }
+
+
+def _edge_entry_gate_for_mode(
+    candidates: list[dict[str, Any]],
+    *,
+    execution_mode: str,
+) -> dict[str, Any]:
+    try:
+        return edge_entry_gate(candidates, execution_mode=execution_mode)
+    except TypeError as exc:
+        if "execution_mode" not in str(exc):
+            raise
+        return edge_entry_gate(candidates)
 
 
 def _entry_symbols_from_scanner_candidates(

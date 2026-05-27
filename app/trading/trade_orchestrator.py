@@ -9,6 +9,7 @@ from app.trading.edge_calibration import (
     calibrate_edge_model_if_due,
     record_fill_adjustment_from_fills,
     refresh_edge_training_samples,
+    refresh_top10_performance_if_due,
 )
 from app.trading.universe_scanner import (
     get_active_scanner_candidates,
@@ -28,6 +29,10 @@ def run_trade_orchestrator_once(
     initialize_universe_db()
     label_refresh = _safe_step("edge_label_refresh", refresh_edge_training_samples)
     calibration_result = _safe_step("edge_calibration", calibrate_edge_model_if_due)
+    top10_performance_refresh = _safe_step(
+        "top10_performance",
+        refresh_top10_performance_if_due,
+    )
     fill_adjustment = _safe_step("fill_adjustment", record_fill_adjustment_from_fills)
 
     sessions = auto_trading_store.list_sessions(status="active", limit=session_limit)
@@ -37,6 +42,7 @@ def run_trade_orchestrator_once(
             "worker_id": worker_id,
             "message": "No active auto-trading sessions",
             "label_refresh": label_refresh,
+            "top10_performance_refresh": top10_performance_refresh,
             "recovered_session_count": len(recovered_sessions),
             "edge_calibration": calibration_result,
             "fill_adjustment": fill_adjustment,
@@ -74,6 +80,7 @@ def run_trade_orchestrator_once(
             "worker_id": worker_id,
             "message": "scanner_candidates is empty; no orchestrated exit or entry attempted",
             "label_refresh": label_refresh,
+            "top10_performance_refresh": top10_performance_refresh,
             "recovered_session_count": len(recovered_sessions),
             "edge_calibration": calibration_result,
             "fill_adjustment": fill_adjustment,
@@ -138,6 +145,7 @@ def run_trade_orchestrator_once(
         "status": status,
         "worker_id": worker_id,
         "label_refresh": label_refresh,
+        "top10_performance_refresh": top10_performance_refresh,
         "recovered_session_count": len(recovered_sessions),
         "edge_calibration": calibration_result,
         "fill_adjustment": fill_adjustment,

@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import Body, FastAPI, Header, HTTPException, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from app.services.naver_news import search_naver_news
 
 from app.brokers.kis_client import KisApiError, KisClient
@@ -36,6 +36,7 @@ from app.models import (
     PipelineResponse,
 )
 from app.data_sources.market_context import StaticMarketContextProvider, fetch_market_context
+from app.maintenance.data_reset import RESET_CONFIRMATION, reset_trading_data
 from app.services.pipeline import run_full_pipeline
 from app.trading.auto_trading import (
     AutoTradingError,
@@ -53,6 +54,9 @@ from app.trading.edge_calibration import (
     calibrate_edge_model,
     edge_entry_gate,
     get_edge_calibration_status,
+    get_edge_training_sample_summary,
+    refresh_edge_training_samples,
+    refresh_top10_performance_if_due,
 )
 from app.trading.kis_paper_e2e import KisPaperE2EError, preflight_kis_paper_e2e
 from app.trading.live_trading import LiveTradingError, execute_live_order
@@ -69,6 +73,7 @@ from app.trading.order_approval import (
 from app.trading.paper_trading import run_paper_once
 from app.trading.universe_scanner import (
     get_latest_universe_scan,
+    initialize_universe_db,
     scan_universe_for_auto_trade,
 )
 
@@ -626,8 +631,41 @@ def gpt_start_paper_auto_trading_endpoint(
     operation_id="scanTradingUniverse",
     summary="Discover and rank auto-trading candidates",
 )
-def scan_trading_universe(req: AutoTradeStartRequest):
-    return scan_universe_for_auto_trade(req)
+def scan_trading_universe(
+    req: AutoTradeStartRequest,
+    refresh_samples: bool = False,
+    sample_limit: int = 20,
+):
+    scan_result = scan_universe_for_auto_trade(req)
+    if not refresh_samples:
+        return scan_result
+    initialize_universe_db()
+    refresh = refresh_edge_training_samples()
+    top10 = refresh_top10_performance_if_due(force=True)
+    return {
+        "status": "success",
+        "scan": scan_result,
+        "refresh": refresh,
+        "top10_performance_refresh": top10,
+        "samples": get_edge_training_sample_summary(limit=sample_limit),
+    }
+
+
+@app.post(
+    "/universe/scan-and-refresh-samples",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="scanUniverseAndRefreshSamples",
+    summary="Run universe scan then refresh edge training samples",
+)
+def scan_universe_and_refresh_samples(
+    req: AutoTradeStartRequest,
+    sample_limit: int = 20,
+):
+    return scan_trading_universe(
+        req,
+        refresh_samples=True,
+        sample_limit=sample_limit,
+    )
 
 
 @app.get(
@@ -648,6 +686,57 @@ def latest_trading_universe():
 )
 def edge_calibration_status():
     return get_edge_calibration_status()
+
+
+@app.get(
+    "/edge-calibration/samples",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getEdgeTrainingSampleSummary",
+    summary="Get edge training sample count and realized bps totals",
+)
+def edge_training_sample_summary(limit: int = 20):
+    return get_edge_training_sample_summary(limit=limit)
+
+
+@app.post(
+    "/edge-calibration/refresh-samples",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="refreshEdgeTrainingSamples",
+    summary="Refresh edge training samples and top-10 performance from stored scanner data",
+)
+def refresh_edge_training_sample_summary(limit: int = 20):
+    from app.trading.edge_calibration import label_policy_summary
+
+    initialize_universe_db()
+    refresh = refresh_edge_training_samples()
+    top10 = refresh_top10_performance_if_due(force=True)
+    return {
+        "status": "success",
+        "refresh": refresh,
+        "top10_performance_refresh": top10,
+        "samples": get_edge_training_sample_summary(limit=limit),
+        "label_policy": label_policy_summary(),
+    }
+
+
+@app.post(
+    "/admin/reset-data",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="resetGeneratedTradingData",
+    summary="Delete generated SQLite/cache data from the current backend storage",
+)
+def reset_generated_trading_data(payload: dict[str, Any] = Body(...)):
+    confirm = str(payload.get("confirm") or "")
+    if confirm != RESET_CONFIRMATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"confirm must be exactly {RESET_CONFIRMATION}",
+        )
+    return reset_trading_data(
+        confirm=confirm,
+        include_all_data_files=bool(payload.get("include_all_data_files", True)),
+        dry_run=bool(payload.get("dry_run", False)),
+    )
 
 
 @app.get(
@@ -1183,6 +1272,23 @@ def run_market_monitor_job(job_name: str):
         return run_monitor_job(job_name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get(
+    "/admin.html",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+@app.get(
+    "/admin",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def admin_dashboard():
+    path = Path(__file__).resolve().parents[1] / "admin.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="admin.html not found")
+    return FileResponse(path, media_type="text/html")
 
 
 @app.get(

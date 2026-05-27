@@ -1,0 +1,1095 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Investment Agent Admin</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --surface: #ffffff;
+      --text: #17202a;
+      --muted: #617085;
+      --line: #d8dee9;
+      --soft: #eef3f8;
+      --accent: #1769e0;
+      --accent-weak: #e9f1ff;
+      --ok: #0b7654;
+      --warn: #9a5b00;
+      --bad: #b42318;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, .96);
+      backdrop-filter: blur(10px);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 750;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 14px;
+      color: var(--muted);
+      font-weight: 750;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+
+    button, input, select, textarea {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }
+
+    input, select {
+      height: 34px;
+      padding: 0 10px;
+    }
+
+    textarea {
+      min-height: 150px;
+      padding: 10px;
+      resize: vertical;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    button {
+      min-height: 34px;
+      padding: 0 11px;
+      cursor: pointer;
+      font-weight: 650;
+    }
+
+    button:hover { border-color: #9aa9bd; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.soft { background: var(--accent-weak); border-color: #b8d0fb; color: #0f4aa0; }
+    button.danger { color: var(--bad); }
+    button:disabled { cursor: wait; opacity: .58; }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(300px, 420px) minmax(0, 1fr);
+      min-height: calc(100vh - 63px);
+    }
+
+    aside {
+      border-right: 1px solid var(--line);
+      background: var(--surface);
+      padding: 16px;
+      overflow: auto;
+    }
+
+    section {
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    section:last-child { border-bottom: 0; }
+
+    .content {
+      display: grid;
+      grid-template-rows: auto auto minmax(240px, 1fr);
+      gap: 14px;
+      padding: 16px;
+      min-width: 0;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .full { grid-column: 1 / -1; }
+    .stack { display: grid; gap: 8px; }
+    .grow { flex: 1 1 220px; min-width: 0; }
+    .small { width: 110px; }
+
+    .statusbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: var(--soft);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .pill.ok { color: var(--ok); background: #e7f6ef; }
+    .pill.bad { color: var(--bad); background: #fdebea; }
+    .pill.warn { color: var(--warn); background: #fff3d7; }
+
+    .output {
+      margin: 0;
+      min-height: 240px;
+      overflow: auto;
+      border: 1px solid #1f2937;
+      border-radius: 6px;
+      background: #0f172a;
+      color: #e5eefb;
+      padding: 14px;
+      font: 12px/1.55 var(--mono);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--soft);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    td code {
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .tablewrap {
+      overflow: auto;
+      border-radius: 6px;
+    }
+
+    .panel {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      min-width: 0;
+    }
+
+    .panelhead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .metric {
+      display: grid;
+      gap: 2px;
+      min-height: 58px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--soft);
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .metric strong {
+      font-size: 18px;
+      line-height: 1.2;
+    }
+
+    .muted { color: var(--muted); }
+    .ok { color: var(--ok); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+
+    @media (max-width: 960px) {
+      header { grid-template-columns: 1fr; }
+      main { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid var(--line); }
+    }
+
+    @media (max-width: 560px) {
+      .grid { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      header, aside, .content { padding: 12px; }
+      input, select, button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Investment Agent Admin</h1>
+    <div class="row">
+      <input id="baseUrl" class="grow" placeholder="API base URL" />
+      <input id="apiKey" class="grow" type="password" placeholder="X-API-Key" />
+      <button id="saveSettings" class="soft">Save</button>
+    </div>
+  </header>
+
+  <main>
+    <aside>
+      <section>
+        <h2>Backend</h2>
+        <div class="grid">
+          <button data-action="health">Health</button>
+          <button data-action="gptHealth">GPT Health</button>
+          <button data-action="workers">Workers</button>
+          <button data-action="monitorStatus">Monitor Status</button>
+          <button data-action="monitorRunDue">Run Due Monitor</button>
+          <button data-action="schema">Action Schema</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Auto Trading</h2>
+        <div class="grid">
+          <button data-action="startPaper" class="primary">Start Paper</button>
+          <button data-action="stopAll" class="danger">Stop All</button>
+          <button data-action="autoStatus">Status</button>
+          <button data-action="sessions">Sessions</button>
+          <button data-action="scanUniverse">Scan Universe</button>
+          <button data-action="scanAndRefreshSamples" class="primary">Scan + Refresh Samples</button>
+          <button data-action="latestUniverse">Latest Universe</button>
+          <button data-action="edgeStatus">Edge Status</button>
+          <button data-action="edgeSamples">Edge Samples</button>
+          <button data-action="refreshSamples">Refresh Samples</button>
+          <button data-action="overview">Refresh Overview</button>
+        </div>
+        <div class="stack" style="margin-top:10px">
+          <input id="sessionId" placeholder="session_id" />
+          <div class="grid">
+            <button data-action="sessionStatus">Session Status</button>
+            <button data-action="events">Events</button>
+            <button data-action="stopSession" class="danger">Stop Session</button>
+            <button data-action="restartSession">Restart</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Live Trading</h2>
+        <div class="stack" style="margin-top:10px">
+          <input id="liveConfirmToken" type="password" placeholder="LIVE_TRADING_CONFIRM_TOKEN" />
+          <input id="liveAck" placeholder="Type LIVE before live actions" />
+          <div class="grid">
+            <button data-action="startLive" class="danger">Start Live Auto</button>
+            <button data-action="submitLiveOrder" class="danger">Submit Live Order</button>
+          </div>
+          <div class="grid">
+            <input id="liveSymbol" placeholder="symbol" value="005930" />
+            <select id="liveSide">
+              <option value="buy">buy</option>
+              <option value="sell">sell</option>
+            </select>
+            <input id="livePrice" placeholder="limit price" />
+            <input id="liveQuantity" placeholder="quantity" />
+            <input id="liveDecisionPrice" placeholder="decision price" />
+            <input id="liveStopLoss" placeholder="stop loss" />
+            <input id="liveTakeProfit" placeholder="take profit" />
+            <input id="liveClientOrderId" placeholder="client_order_id" />
+          </div>
+          <textarea id="liveReason" style="min-height:68px" placeholder="reason">manual admin live order</textarea>
+        </div>
+      </section>
+
+      <section>
+        <h2>KIS</h2>
+        <div class="row" style="margin-top:10px">
+          <input id="symbol" class="small" placeholder="symbol" value="005930" />
+          <input id="productCodes" class="small" placeholder="products" value="01,00,02" />
+        </div>
+        <div class="grid">
+          <button data-action="kisConfig">Config</button>
+          <button data-action="kisProbe">Probe</button>
+          <button data-action="kisPreflight">Preflight</button>
+          <button data-action="brokerSync">Broker Sync</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Custom Request</h2>
+        <div class="stack" style="margin-top:10px">
+          <div class="row">
+            <select id="customMethod" class="small">
+              <option>GET</option>
+              <option>POST</option>
+            </select>
+            <input id="customPath" class="grow" value="/gpt/auto-trading/status" />
+          </div>
+          <textarea id="customBody">{}</textarea>
+          <button data-action="custom" class="full">Send Custom Request</button>
+        </div>
+      </section>
+    </aside>
+
+    <div class="content">
+      <div class="statusbar">
+        <span id="lastAction" class="muted">Ready</span>
+        <span id="lastStatus" class="pill">Idle</span>
+      </div>
+
+      <div class="panel">
+        <div class="panelhead">
+          <h2>Universe Scan</h2>
+          <span id="universeMeta" class="muted">No universe data loaded.</span>
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Symbol</th>
+                <th>Status</th>
+                <th>Raw</th>
+                <th>Return bps</th>
+                <th>Risk bps</th>
+                <th>Net Edge</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody id="universeTable">
+              <tr><td colspan="8" class="muted">No universe candidates loaded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panelhead">
+          <h2>Edge Samples</h2>
+          <span id="sampleMeta" class="muted">No sample data loaded.</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><span>Samples</span><strong id="sampleCount">0</strong></div>
+          <div class="metric"><span>Total Return bps</span><strong id="totalReturnBps">0</strong></div>
+          <div class="metric"><span>Total Risk bps</span><strong id="totalRiskBps">0</strong></div>
+          <div class="metric"><span>Net Total bps</span><strong id="netTotalBps">0</strong></div>
+          <div class="metric"><span>Total Realized Net Edge</span><strong id="totalRealizedNetEdgeBps">0</strong></div>
+          <div class="metric"><span>Avg Realized Net Edge</span><strong id="avgRealizedNetEdgeBps">-</strong></div>
+          <div class="metric"><span>Net Edge Win Rate</span><strong id="netEdgeWinRate">-</strong></div>
+          <div class="metric"><span>Price Win Rate</span><strong id="winRate">-</strong></div>
+          <div class="metric"><span>Total Expected Return</span><strong id="totalExpectedReturnBps">0</strong></div>
+          <div class="metric"><span>Total Predicted Edge</span><strong id="totalPredictedNetEdgeBps">0</strong></div>
+          <div class="metric"><span>Avg Return bps</span><strong id="avgReturnBps">-</strong></div>
+          <div class="metric"><span>Avg Risk bps</span><strong id="avgRiskBps">-</strong></div>
+          <div class="metric"><span>Avg Net bps</span><strong id="avgNetBps">-</strong></div>
+          <div class="metric"><span>Avg Expected Return</span><strong id="avgExpectedReturnBps">-</strong></div>
+          <div class="metric"><span>Avg Predicted Edge</span><strong id="avgPredictedNetEdgeBps">-</strong></div>
+          <div class="metric"><span>MAE Edge Error</span><strong id="maeNetEdgeErrorBps">-</strong></div>
+          <div class="metric"><span>Metric Samples</span><strong id="metricSampleCount">0</strong></div>
+          <div class="metric"><span>Top10 Samples</span><strong id="top10SampleCount">0</strong></div>
+          <div class="metric"><span>Top10 Avg Return</span><strong id="top10AvgReturnBps">-</strong></div>
+          <div class="metric"><span>Top10 Realized Net Edge</span><strong id="top10AvgRealizedNetEdgeBps">-</strong></div>
+          <div class="metric"><span>Top10 Win Rate</span><strong id="top10WinRate">-</strong></div>
+          <div class="metric"><span>Top10 Expected bps</span><strong id="top10ExpectedReturnBps">-</strong></div>
+          <div class="metric"><span>Top10 Predicted Edge</span><strong id="top10PredictedNetEdgeBps">-</strong></div>
+          <div class="metric"><span>Top10 Expectancy</span><strong id="top10ExpectancyBps">-</strong></div>
+          <div class="metric"><span>Top10 Source</span><strong id="top10Source">-</strong></div>
+          <div class="metric"><span>Scan Runs</span><strong id="scanRunCount">0</strong></div>
+          <div class="metric"><span>Candidate History</span><strong id="candidateHistoryCount">0</strong></div>
+          <div class="metric"><span>Future Labels</span><strong id="futureLabelCount">0</strong></div>
+          <div class="metric"><span>Total Cycles</span><strong id="totalCycleCount">0</strong></div>
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Observed</th>
+                <th>Symbol</th>
+                <th>Rank</th>
+                <th>Entry</th>
+                <th>Observed</th>
+                <th>Return bps</th>
+                <th>Risk bps</th>
+                <th>Realized Net</th>
+                <th>Expected bps</th>
+                <th>Pred. Edge</th>
+                <th>Edge Error</th>
+              </tr>
+            </thead>
+            <tbody id="samplesTable">
+              <tr><td colspan="11" class="muted">No edge samples loaded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Session</th>
+              <th>Status</th>
+              <th>Mode</th>
+              <th>Cycle</th>
+              <th>Updated</th>
+              <th>Next Run</th>
+            </tr>
+          </thead>
+          <tbody id="sessionsTable">
+            <tr><td colspan="6" class="muted">No session data loaded.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <pre id="output" class="output">{}</pre>
+    </div>
+  </main>
+
+  <script>
+    const els = {
+      apiKey: document.getElementById("apiKey"),
+      baseUrl: document.getElementById("baseUrl"),
+      saveSettings: document.getElementById("saveSettings"),
+      output: document.getElementById("output"),
+      lastAction: document.getElementById("lastAction"),
+      lastStatus: document.getElementById("lastStatus"),
+      sessionsTable: document.getElementById("sessionsTable"),
+      universeMeta: document.getElementById("universeMeta"),
+      universeTable: document.getElementById("universeTable"),
+      sampleMeta: document.getElementById("sampleMeta"),
+      sampleCount: document.getElementById("sampleCount"),
+      totalReturnBps: document.getElementById("totalReturnBps"),
+      totalRiskBps: document.getElementById("totalRiskBps"),
+      netTotalBps: document.getElementById("netTotalBps"),
+      totalRealizedNetEdgeBps: document.getElementById("totalRealizedNetEdgeBps"),
+      avgRealizedNetEdgeBps: document.getElementById("avgRealizedNetEdgeBps"),
+      netEdgeWinRate: document.getElementById("netEdgeWinRate"),
+      totalExpectedReturnBps: document.getElementById("totalExpectedReturnBps"),
+      totalPredictedNetEdgeBps: document.getElementById("totalPredictedNetEdgeBps"),
+      avgReturnBps: document.getElementById("avgReturnBps"),
+      avgRiskBps: document.getElementById("avgRiskBps"),
+      avgNetBps: document.getElementById("avgNetBps"),
+      avgExpectedReturnBps: document.getElementById("avgExpectedReturnBps"),
+      avgPredictedNetEdgeBps: document.getElementById("avgPredictedNetEdgeBps"),
+      maeNetEdgeErrorBps: document.getElementById("maeNetEdgeErrorBps"),
+      metricSampleCount: document.getElementById("metricSampleCount"),
+      winRate: document.getElementById("winRate"),
+      top10SampleCount: document.getElementById("top10SampleCount"),
+      top10AvgReturnBps: document.getElementById("top10AvgReturnBps"),
+      top10AvgRealizedNetEdgeBps: document.getElementById("top10AvgRealizedNetEdgeBps"),
+      top10WinRate: document.getElementById("top10WinRate"),
+      top10ExpectedReturnBps: document.getElementById("top10ExpectedReturnBps"),
+      top10PredictedNetEdgeBps: document.getElementById("top10PredictedNetEdgeBps"),
+      top10ExpectancyBps: document.getElementById("top10ExpectancyBps"),
+      top10Source: document.getElementById("top10Source"),
+      scanRunCount: document.getElementById("scanRunCount"),
+      candidateHistoryCount: document.getElementById("candidateHistoryCount"),
+      futureLabelCount: document.getElementById("futureLabelCount"),
+      totalCycleCount: document.getElementById("totalCycleCount"),
+      samplesTable: document.getElementById("samplesTable"),
+      sessionId: document.getElementById("sessionId"),
+      symbol: document.getElementById("symbol"),
+      productCodes: document.getElementById("productCodes"),
+      customMethod: document.getElementById("customMethod"),
+      customPath: document.getElementById("customPath"),
+      customBody: document.getElementById("customBody"),
+      liveConfirmToken: document.getElementById("liveConfirmToken"),
+      liveAck: document.getElementById("liveAck"),
+      liveSymbol: document.getElementById("liveSymbol"),
+      liveSide: document.getElementById("liveSide"),
+      livePrice: document.getElementById("livePrice"),
+      liveQuantity: document.getElementById("liveQuantity"),
+      liveDecisionPrice: document.getElementById("liveDecisionPrice"),
+      liveStopLoss: document.getElementById("liveStopLoss"),
+      liveTakeProfit: document.getElementById("liveTakeProfit"),
+      liveClientOrderId: document.getElementById("liveClientOrderId"),
+      liveReason: document.getElementById("liveReason")
+    };
+
+    const defaults = {
+      baseUrl: window.location.origin,
+      apiKey: ""
+    };
+
+    els.baseUrl.value = localStorage.getItem("adminBaseUrl") || defaults.baseUrl;
+    els.apiKey.value = localStorage.getItem("adminApiKey") || defaults.apiKey;
+
+    const actions = {
+      health: { method: "GET", path: "/health", auth: false },
+      gptHealth: { method: "POST", path: "/gpt/health", body: {} },
+      workers: { method: "GET", path: "/gpt/workers/status" },
+      monitorStatus: { method: "GET", path: "/monitor/status" },
+      monitorRunDue: { method: "POST", path: "/monitor/run-due" },
+      schema: { method: "GET", path: "/action-schema.yaml", text: true, auth: false },
+      startPaper: {
+        method: "POST",
+        path: "/gpt/auto-trading/start-paper",
+        body: {
+          auto_discover_symbols: true,
+          force_new: false,
+          interval_seconds: 60,
+          auto_confirm_paper: true
+        }
+      },
+      stopAll: { method: "POST", path: "/gpt/auto-trading/control", body: { command: "stop" } },
+      startLive: startLiveAutoAction,
+      submitLiveOrder: submitLiveOrderAction,
+      autoStatus: { method: "GET", path: "/gpt/auto-trading/status", after: renderSessionsFromAutoStatus },
+      sessions: { method: "GET", path: "/auto-trading/sessions", after: renderSessionsFromList },
+      scanUniverse: {
+        method: "POST",
+        path: "/universe/scan",
+        body: {
+          auto_discover_symbols: true
+        },
+        after: renderUniverse
+      },
+      scanAndRefreshSamples: {
+        method: "POST",
+        path: "/universe/scan-and-refresh-samples?sample_limit=20",
+        body: {
+          auto_discover_symbols: true
+        },
+        after: renderScanAndRefreshSamples
+      },
+      latestUniverse: { method: "GET", path: "/universe/latest", after: renderUniverse },
+      edgeStatus: { method: "GET", path: "/edge-calibration/status", after: renderEdgeStatus },
+      edgeSamples: { method: "GET", path: "/edge-calibration/samples?limit=20", after: renderEdgeSamples },
+      refreshSamples: { method: "POST", path: "/edge-calibration/refresh-samples?limit=20", after: renderRefreshSamples },
+      overview: overviewAction,
+      kisConfig: { method: "GET", path: "/gpt/broker/kis/config-status" },
+      kisProbe: () => ({
+        method: "GET",
+        path: `/gpt/broker/kis/account-probe?symbol=${encodeURIComponent(els.symbol.value || "005930")}&product_codes=${encodeURIComponent(els.productCodes.value || "01,00,02")}`
+      }),
+      kisPreflight: () => ({
+        method: "POST",
+        path: `/gpt/broker/kis/paper-preflight?symbol=${encodeURIComponent(els.symbol.value || "005930")}`
+      }),
+      brokerSync: { method: "POST", path: "/broker/kis/sync" },
+      sessionStatus: () => ({ method: "GET", path: `/auto-trading/status/${sessionId()}` }),
+      events: () => ({ method: "GET", path: `/auto-trading/events/${sessionId()}?limit=50` }),
+      stopSession: () => ({ method: "POST", path: `/auto-trading/stop/${sessionId()}` }),
+      restartSession: () => ({ method: "POST", path: `/auto-trading/restart/${sessionId()}` }),
+      custom: customAction
+    };
+
+    els.saveSettings.addEventListener("click", () => {
+      localStorage.setItem("adminBaseUrl", cleanBaseUrl());
+      localStorage.setItem("adminApiKey", els.apiKey.value.trim());
+      setStatus("Saved", "ok");
+    });
+
+    document.querySelectorAll("[data-action]").forEach(button => {
+      button.addEventListener("click", () => runNamedAction(button.dataset.action, button));
+    });
+
+    function cleanBaseUrl() {
+      return (els.baseUrl.value.trim() || window.location.origin).replace(/\/+$/, "");
+    }
+
+    function sessionId() {
+      const value = els.sessionId.value.trim();
+      if (!value) throw new Error("session_id is required");
+      return encodeURIComponent(value);
+    }
+
+    function headers(needsAuth, hasBody) {
+      const output = {};
+      if (hasBody) output["Content-Type"] = "application/json";
+      const key = els.apiKey.value.trim();
+      if (needsAuth !== false && key) output["X-API-Key"] = key;
+      return output;
+    }
+
+    function customAction() {
+      let body = undefined;
+      const raw = els.customBody.value.trim();
+      if (els.customMethod.value !== "GET" && raw) {
+        body = JSON.parse(raw);
+      }
+      return {
+        method: els.customMethod.value,
+        path: els.customPath.value.trim(),
+        body
+      };
+    }
+
+    function overviewAction() {
+      return {
+        method: "POST",
+        path: "/universe/scan-and-refresh-samples?sample_limit=20",
+        body: { auto_discover_symbols: true },
+        after: renderScanAndRefreshSamples
+      };
+    }
+
+    function startLiveAutoAction() {
+      requireLiveAck();
+      return {
+        method: "POST",
+        path: "/gpt/auto-trading/control",
+        body: {
+          command: "start",
+          execution_mode: "live",
+          auto_discover_symbols: true,
+          force_new: false,
+          interval_seconds: 60,
+          live_confirm_token: liveConfirmToken()
+        }
+      };
+    }
+
+    function submitLiveOrderAction() {
+      requireLiveAck();
+      const price = positiveNumber(els.livePrice.value, "limit price");
+      const body = compactBody({
+        symbol: els.liveSymbol.value.trim(),
+        market: "KR",
+        strategy_type: "swing",
+        risk_level: "medium",
+        side: els.liveSide.value,
+        order_type: "limit",
+        price,
+        quantity: positiveInteger(els.liveQuantity.value, "quantity"),
+        decision_price: els.liveDecisionPrice.value.trim()
+          ? positiveNumber(els.liveDecisionPrice.value, "decision price")
+          : price,
+        confirm_token: liveConfirmToken(),
+        client_order_id: els.liveClientOrderId.value.trim(),
+        reason: els.liveReason.value.trim(),
+        stop_loss: optionalPositiveNumber(els.liveStopLoss.value, "stop loss"),
+        take_profit: optionalPositiveNumber(els.liveTakeProfit.value, "take profit")
+      });
+      if (!body.symbol) throw new Error("symbol is required");
+      return { method: "POST", path: "/live/orders", body };
+    }
+
+    function requireLiveAck() {
+      if (els.liveAck.value.trim() !== "LIVE") {
+        throw new Error("Type LIVE in the live confirmation field before live actions.");
+      }
+      liveConfirmToken();
+      if (!window.confirm("This action can submit real KIS orders. Continue?")) {
+        throw new Error("Live action cancelled.");
+      }
+    }
+
+    function liveConfirmToken() {
+      const value = els.liveConfirmToken.value.trim();
+      if (!value) throw new Error("LIVE_TRADING_CONFIRM_TOKEN is required");
+      return value;
+    }
+
+    function positiveNumber(value, label) {
+      const number = Number(String(value).replaceAll(",", "").trim());
+      if (!Number.isFinite(number) || number <= 0) throw new Error(`${label} must be a positive number`);
+      return number;
+    }
+
+    function optionalPositiveNumber(value, label) {
+      const raw = String(value || "").trim();
+      return raw ? positiveNumber(raw, label) : undefined;
+    }
+
+    function positiveInteger(value, label) {
+      const number = Number.parseInt(String(value).replaceAll(",", "").trim(), 10);
+      if (!Number.isInteger(number) || number <= 0) throw new Error(`${label} must be a positive integer`);
+      return number;
+    }
+
+    function compactBody(value) {
+      return Object.fromEntries(
+        Object.entries(value).filter(([, item]) => item !== undefined && item !== null && item !== "")
+      );
+    }
+
+    async function runNamedAction(name, button) {
+      const original = button ? button.textContent : "";
+      try {
+        if (button) {
+          button.disabled = true;
+          button.textContent = "Running";
+        }
+        const specFactory = actions[name];
+        const spec = typeof specFactory === "function" ? specFactory() : specFactory;
+        const result = await request(spec);
+        showResult(result);
+        if (spec.after) spec.after(result);
+        if (name === "startPaper" || name === "startLive" || name === "stopAll" || name === "stopSession" || name === "restartSession") {
+          await refreshAutoStatus();
+        }
+      } catch (err) {
+        showError(err);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = original;
+        }
+      }
+    }
+
+    async function request(spec) {
+      const method = spec.method || "GET";
+      const hasBody = spec.body !== undefined && method !== "GET";
+      const url = spec.path.startsWith("http") ? spec.path : `${cleanBaseUrl()}${spec.path}`;
+      els.lastAction.textContent = `${method} ${spec.path}`;
+      setStatus("Running", "warn");
+      const response = await fetch(url, {
+        method,
+        headers: headers(spec.auth, hasBody),
+        body: hasBody ? JSON.stringify(spec.body) : undefined
+      });
+      const contentType = response.headers.get("content-type") || "";
+      const payload = spec.text || !contentType.includes("application/json")
+        ? await response.text()
+        : await response.json();
+      if (!response.ok) {
+        throw new Error(`${response.status} ${typeof payload === "string" ? payload : JSON.stringify(payload)}`);
+      }
+      setStatus(statusLabel(payload), statusClass(payload));
+      return payload;
+    }
+
+    function statusLabel(payload) {
+      if (payload && typeof payload === "object" && payload.status) return String(payload.status);
+      return "OK";
+    }
+
+    function statusClass(payload) {
+      const status = statusLabel(payload).toLowerCase();
+      if (["ok", "success", "started", "ready"].includes(status)) return "ok";
+      if (["error", "failed", "blocked"].includes(status)) return "bad";
+      return "warn";
+    }
+
+    function setStatus(text, type) {
+      els.lastStatus.textContent = text;
+      els.lastStatus.className = `pill ${type || ""}`.trim();
+    }
+
+    function showResult(result) {
+      els.output.textContent = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+    }
+
+    function showError(err) {
+      setStatus("Error", "bad");
+      els.output.textContent = String(err && err.message ? err.message : err);
+    }
+
+    function renderSessionsFromAutoStatus(data) {
+      renderSessions(data.active_sessions || data.recent_sessions || []);
+    }
+
+    function renderSessionsFromList(data) {
+      renderSessions(data.sessions || []);
+    }
+
+    function renderUniverse(data) {
+      const storedCandidates = data.candidates || [];
+      const candidates = storedCandidates.length ? storedCandidates : (data.final_candidates || []);
+      const status = data.status || "unknown";
+      const scanId = data.scan_id ? `scan ${shortId(data.scan_id)}` : "no scan id";
+      const counts = [
+        `status ${status}`,
+        scanId,
+        `source ${data.source_symbol_count || 0}`,
+        `snapshots ${data.snapshot_count || 0}`,
+        `candidates ${candidates.length}`,
+        data.created_at || data.scan_time || ""
+      ].filter(Boolean);
+      els.universeMeta.textContent = counts.join(" | ");
+      if (!candidates.length) {
+        els.universeTable.innerHTML = '<tr><td colspan="8" class="muted">No universe candidates loaded.</td></tr>';
+        return;
+      }
+      els.universeTable.innerHTML = candidates.map(row => `
+        <tr>
+          <td>${escapeHtml(row.rank || "")}</td>
+          <td><code>${escapeHtml(row.symbol || "")}</code><div class="muted">${escapeHtml(row.name || "")}</div></td>
+          <td class="${statusClass(row)}">${escapeHtml(row.status || row.decision || "")}</td>
+          <td>${fmtNumber(row.raw_score)}</td>
+          <td>${fmtBps(row.expected_return)}</td>
+          <td>${fmtBps(row.expected_risk)}</td>
+          <td class="${Number(row.net_edge || 0) > 0 ? "ok" : "bad"}">${fmtBps(row.net_edge)}</td>
+          <td>${escapeHtml(row.reason || "")}</td>
+        </tr>
+      `).join("");
+    }
+
+    function renderEdgeSamples(data) {
+      const summary = data.summary || {};
+      const policy = data.label_policy || {};
+      els.sampleMeta.textContent = [
+        `status ${data.status || "unknown"}`,
+        `samples ${summary.sample_count || data.sample_count || 0}`,
+        `price wins ${summary.win_count || 0}`,
+        `price losses ${summary.loss_count || 0}`,
+        policy.min_label_age_seconds !== undefined
+          ? `label age >= ${policy.min_label_age_seconds}s`
+          : "",
+        policy.horizon_seconds !== undefined
+          ? `horizon ${policy.horizon_seconds}s`
+          : ""
+      ].filter(Boolean).join(" | ");
+      els.sampleCount.textContent = fmtNumber(summary.sample_count || data.sample_count || 0, 0);
+      els.totalReturnBps.textContent = fmtBps(summary.total_return_bps);
+      els.totalRiskBps.textContent = fmtBps(summary.total_risk_bps);
+      els.netTotalBps.textContent = fmtBps(summary.net_total_bps);
+      els.totalRealizedNetEdgeBps.textContent = fmtBps(summary.total_realized_net_edge_bps);
+      els.avgRealizedNetEdgeBps.textContent = fmtBps(summary.avg_realized_net_edge_bps);
+      els.netEdgeWinRate.textContent = fmtPercent(summary.net_edge_win_rate);
+      els.totalExpectedReturnBps.textContent = fmtBps(summary.total_expected_return_bps);
+      els.totalPredictedNetEdgeBps.textContent = fmtBps(summary.total_predicted_net_edge_bps);
+      els.avgReturnBps.textContent = fmtBps(summary.avg_return_bps);
+      els.avgRiskBps.textContent = fmtBps(summary.avg_risk_bps);
+      els.avgNetBps.textContent = fmtBps(summary.avg_net_bps);
+      els.avgExpectedReturnBps.textContent = fmtBps(summary.avg_expected_return_bps);
+      els.avgPredictedNetEdgeBps.textContent = fmtBps(summary.avg_predicted_net_edge_bps);
+      els.maeNetEdgeErrorBps.textContent = fmtBps(summary.mae_net_edge_error_bps);
+      els.metricSampleCount.textContent = fmtNumber(summary.metric_sample_count || 0, 0);
+      els.winRate.textContent = fmtPercent(summary.win_rate);
+      renderDiagnostics(data.diagnostics || {});
+      renderTop10Performance(data.top10_performance || {});
+
+      const samples = data.recent_samples || [];
+      if (!samples.length) {
+        els.samplesTable.innerHTML = '<tr><td colspan="11" class="muted">No edge samples loaded.</td></tr>';
+        return;
+      }
+      els.samplesTable.innerHTML = samples.map(row => `
+        <tr>
+          <td>${escapeHtml(row.observed_at || "")}</td>
+          <td><code>${escapeHtml(row.symbol || "")}</code></td>
+          <td>${escapeHtml(row.rank || "")}</td>
+          <td>${fmtNumber(row.entry_price)}</td>
+          <td>${fmtNumber(row.observed_price)}</td>
+          <td class="${Number(row.realized_return_bps || 0) >= 0 ? "ok" : "bad"}">${fmtBps(row.realized_return_bps)}</td>
+          <td>${fmtBps(row.realized_risk_bps)}</td>
+          <td class="${Number(row.realized_net_edge_bps || 0) >= 0 ? "ok" : "bad"}">${fmtBps(row.realized_net_edge_bps)}</td>
+          <td>${fmtBps(row.expected_return_bps)}</td>
+          <td class="${Number(row.net_edge_bps || 0) >= 0 ? "ok" : "bad"}">${fmtBps(row.net_edge_bps)}</td>
+          <td class="${Number(row.net_edge_error_bps || 0) >= 0 ? "ok" : "bad"}">${fmtBps(row.net_edge_error_bps)}</td>
+        </tr>
+      `).join("");
+    }
+
+    function renderTop10Performance(top10) {
+      if (!top10 || !top10.sample_count) {
+        els.top10SampleCount.textContent = "0";
+        els.top10AvgReturnBps.textContent = "-";
+        els.top10AvgRealizedNetEdgeBps.textContent = "-";
+        els.top10WinRate.textContent = "-";
+        els.top10ExpectedReturnBps.textContent = "-";
+        els.top10PredictedNetEdgeBps.textContent = "-";
+        els.top10ExpectancyBps.textContent = "-";
+        els.top10Source.textContent = "-";
+        return;
+      }
+      els.top10SampleCount.textContent = fmtNumber(top10.sample_count || 0, 0);
+      els.top10AvgReturnBps.textContent = fmtBps(top10.avg_return_bps);
+      els.top10AvgRealizedNetEdgeBps.textContent = fmtBps(top10.avg_realized_net_edge_bps);
+      els.top10WinRate.textContent = fmtPercent(top10.win_rate);
+      els.top10ExpectedReturnBps.textContent = fmtBps(top10.avg_expected_return_bps);
+      els.top10PredictedNetEdgeBps.textContent = fmtBps(top10.avg_predicted_net_edge_bps);
+      els.top10ExpectancyBps.textContent = fmtBps(top10.expectancy_bps);
+      els.top10Source.textContent = shortText(top10.sample_source || "-", 18);
+    }
+
+    function renderScanAndRefreshSamples(data) {
+      if (data.scan) renderUniverse(data.scan);
+      if (data.samples) renderEdgeSamples(data.samples);
+      if (data.refresh) renderRefreshSamples({ ...data.refresh, samples: data.samples });
+      if (data.top10_performance_refresh) {
+        renderTop10Performance(data.top10_performance_refresh.top10_performance || {});
+      }
+      showResult(data);
+    }
+
+    function renderRefreshSamples(data) {
+      const samples = data.samples || data;
+      if (samples.summary || samples.recent_samples) renderEdgeSamples(samples);
+      if (data.label_snapshot_sync) {
+        const sync = data.label_snapshot_sync;
+        els.sampleMeta.textContent = [
+          els.sampleMeta.textContent,
+          `label sync +${sync.inserted || 0}`,
+          sync.symbol_count ? `symbols ${sync.symbol_count}` : ""
+        ].filter(Boolean).join(" | ");
+      }
+      if (data.inserted_count !== undefined) {
+        els.sampleMeta.textContent = [
+          els.sampleMeta.textContent,
+          `inserted ${data.inserted_count}`,
+          `examined ${data.examined_count ?? 0}`,
+          `skipped ${data.skipped_count ?? 0}`
+        ].filter(Boolean).join(" | ");
+      }
+      if (data.top10_performance_refresh && data.top10_performance_refresh.top10_performance) {
+        renderEdgeStatus({
+          latest_top10_performance: data.top10_performance_refresh.top10_performance,
+          last_top10_performance_at: data.top10_performance_refresh.last_run_at
+        });
+      }
+    }
+
+    function renderEdgeStatus(data) {
+      renderTop10Performance(data.latest_top10_performance || data.top10_performance || {});
+      if (data.last_top10_performance_at) {
+        els.sampleMeta.textContent = `${els.sampleMeta.textContent} | top10 ${data.last_top10_performance_at}`;
+      }
+    }
+
+    function renderDiagnostics(diagnostics) {
+      els.scanRunCount.textContent = fmtNumber(diagnostics.universe_scan_count || 0, 0);
+      els.candidateHistoryCount.textContent = fmtNumber(diagnostics.scanner_candidate_history_count || 0, 0);
+      els.futureLabelCount.textContent = fmtNumber(diagnostics.candidate_with_future_snapshot_count || 0, 0);
+      els.totalCycleCount.textContent = fmtNumber(diagnostics.total_auto_trading_cycle_count || 0, 0);
+    }
+
+    function renderSessions(rows) {
+      if (!rows.length) {
+        els.sessionsTable.innerHTML = '<tr><td colspan="6" class="muted">No sessions.</td></tr>';
+        return;
+      }
+      els.sessionsTable.innerHTML = rows.map(row => `
+        <tr data-session="${escapeHtml(row.session_id || "")}">
+          <td><button data-fill-session="${escapeHtml(row.session_id || "")}"><code>${escapeHtml(shortId(row.session_id))}</code></button></td>
+          <td class="${statusClass(row)}">${escapeHtml(row.status || "")}</td>
+          <td>${escapeHtml(row.execution_mode || "")}</td>
+          <td>${escapeHtml(String(row.cycle_count || 0))}</td>
+          <td>${escapeHtml(row.updated_at || "")}</td>
+          <td>${escapeHtml(row.next_run_at || "")}</td>
+        </tr>
+      `).join("");
+      document.querySelectorAll("[data-fill-session]").forEach(button => {
+        button.addEventListener("click", () => {
+          els.sessionId.value = button.dataset.fillSession || "";
+        });
+      });
+    }
+
+    function shortId(value) {
+      value = String(value || "");
+      return value.length > 12 ? `${value.slice(0, 8)}...${value.slice(-4)}` : value;
+    }
+
+    function shortText(value, maxLength) {
+      value = String(value || "");
+      return value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
+    }
+
+    function fmtNumber(value, digits = 2) {
+      if (value === undefined || value === null || value === "") return "-";
+      const number = Number(value);
+      if (!Number.isFinite(number)) return escapeHtml(value);
+      return number.toLocaleString(undefined, {
+        maximumFractionDigits: digits,
+        minimumFractionDigits: 0
+      });
+    }
+
+    function fmtBps(value, suffix = " bps") {
+      if (value === undefined || value === null || value === "") return "-";
+      const number = Number(value);
+      if (!Number.isFinite(number)) return escapeHtml(value);
+      return `${number.toLocaleString(undefined, { maximumFractionDigits: 2 })}${suffix}`;
+    }
+
+    function fmtPercent(value) {
+      if (value === undefined || value === null || value === "") return "-";
+      const number = Number(value);
+      if (!Number.isFinite(number)) return escapeHtml(value);
+      return `${(number * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function refreshAutoStatus() {
+      try {
+        const result = await request(actions.autoStatus);
+        renderSessionsFromAutoStatus(result);
+      } catch (err) {
+        showError(err);
+      }
+    }
+
+    async function refreshOverview() {
+      try {
+        const result = await request(actions.overview);
+        renderScanAndRefreshSamples(result);
+      } catch (err) {
+        showError(err);
+      }
+    }
+
+    if (els.apiKey.value.trim()) {
+      refreshAutoStatus();
+      refreshOverview();
+    } else {
+      setStatus("Auth needed", "warn");
+    }
+  </script>
+</body>
+</html>

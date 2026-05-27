@@ -659,6 +659,95 @@ def test_universe_scanner_keeps_only_top_ten_execution_candidates(
     assert archived_count == 2
 
 
+def test_initialize_universe_db_backfills_legacy_candidate_history(tmp_path, monkeypatch):
+    db_path = tmp_path / "universe.sqlite3"
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_scanner_worker_hurdle_rate_bps",
+        0,
+    )
+    universe_scanner.initialize_universe_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO universe_scan_runs (
+                scan_id, created_at, source_symbol_count, candidate_limit,
+                final_limit, status, error, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-scan",
+                "2026-05-24T09:00:00",
+                1,
+                1,
+                1,
+                "success",
+                None,
+                "{}",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO universe_candidates (
+                scan_id, created_at, symbol, name, rank, score, decision, reason,
+                current_price, change_rate, volume, volume_ratio, turnover_value,
+                market_cap, market_segment, universe_profile, news_count,
+                disclosure_count, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-scan",
+                "2026-05-24T09:00:00",
+                "005930",
+                "Samsung Electronics",
+                1,
+                80.0,
+                "buy_candidate",
+                "legacy candidate",
+                70000.0,
+                2.0,
+                2_000_000,
+                2.0,
+                90_000_000_000,
+                400_000_000_000_000,
+                "KOSPI",
+                "large_cap",
+                0,
+                0,
+                "{}",
+            ),
+        )
+
+    universe_scanner.initialize_universe_db(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT symbol, raw_score, expected_return, expected_risk, net_edge,
+                   composite_score, rank, status
+            FROM scanner_candidate_history
+            WHERE scan_id = 'legacy-scan'
+            """
+        ).fetchone()
+        active_count = conn.execute(
+            "SELECT COUNT(*) FROM scanner_candidates"
+        ).fetchone()[0]
+
+    assert row is not None
+    assert row["symbol"] == "005930"
+    assert row["raw_score"] == 80.0
+    assert row["expected_return"] is not None
+    assert row["expected_risk"] is not None
+    assert row["net_edge"] is not None
+    assert row["composite_score"] is not None
+    assert row["rank"] == 1
+    assert row["status"] in {"READY", "SKIPPED", "EXCLUDED", "ARCHIVED"}
+    assert active_count == 0
+
+
 def test_universe_scanner_collects_symbols_sequentially(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(

@@ -1,7 +1,14 @@
 from fastapi.testclient import TestClient
+from app.config import settings
 from app.main import app
 
 client = TestClient(app)
+
+
+def _auth_headers() -> dict[str, str]:
+    if settings.backend_api_key:
+        return {"X-API-Key": settings.backend_api_key}
+    return {}
 
 
 def test_health():
@@ -74,6 +81,84 @@ def test_action_schema_uses_forwarded_public_host(monkeypatch):
 
     assert response.status_code == 200
     assert "  - url: https://api.autoinvestmentkorea.online" in response.text
+
+
+def test_admin_dashboard_is_served():
+    response = client.get("/admin.html")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Investment Agent Admin" in response.text
+    assert "/gpt/auto-trading/start-paper" in response.text
+    assert "/gpt/broker/kis/account-probe" in response.text
+    assert "Start Live Auto" in response.text
+    assert "/live/orders" in response.text
+    assert "Universe Scan" in response.text
+    assert "Edge Samples" in response.text
+    assert "Top10 Expectancy" in response.text
+    assert "Avg Expected Return" in response.text
+    assert "MAE Edge Error" in response.text
+    assert "Scan + Refresh Samples" in response.text
+    assert "Refresh Samples" in response.text
+    assert "/edge-calibration/samples" in response.text
+    assert "/edge-calibration/refresh-samples" in response.text
+
+    alias_response = client.get("/admin")
+    assert alias_response.status_code == 200
+    assert "Investment Agent Admin" in alias_response.text
+
+
+def test_edge_training_samples_endpoint_returns_summary():
+    response = client.get("/edge-calibration/samples", headers=_auth_headers())
+    assert response.status_code == 200
+    body = response.json()
+    assert "sample_count" in body
+    assert "summary" in body
+    assert "diagnostics" in body
+    assert "total_return_bps" in body["summary"]
+    assert "total_risk_bps" in body["summary"]
+    assert "avg_expected_return_bps" in body["summary"]
+    assert "avg_realized_net_edge_bps" in body["summary"]
+    assert "net_edge_win_rate" in body["summary"]
+    assert "mae_net_edge_error_bps" in body["summary"]
+    assert "top10_performance" in body
+    assert "label_policy" in body
+    assert "universe_scan_count" in body["diagnostics"]
+    assert "total_auto_trading_cycle_count" in body["diagnostics"]
+    assert "recent_samples" in body
+
+
+def test_edge_training_samples_refresh_endpoint_returns_diagnostics(monkeypatch):
+    monkeypatch.setattr(
+        "app.main.refresh_edge_training_samples",
+        lambda: {"status": "success", "inserted_count": 0},
+    )
+    monkeypatch.setattr("app.main.initialize_universe_db", lambda: None)
+    monkeypatch.setattr(
+        "app.main.refresh_top10_performance_if_due",
+        lambda force=False: {"status": "success", "top10_performance": {"sample_count": 0}},
+    )
+    monkeypatch.setattr(
+        "app.main.get_edge_training_sample_summary",
+        lambda limit=20: {"status": "empty", "diagnostics": {}},
+    )
+
+    response = client.post("/edge-calibration/refresh-samples", headers=_auth_headers())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert "refresh" in body
+    assert "top10_performance_refresh" in body
+    assert "samples" in body
+    assert "diagnostics" in body["samples"]
+
+
+def test_admin_reset_data_endpoint_requires_confirmation():
+    response = client.post(
+        "/admin/reset-data",
+        headers=_auth_headers(),
+        json={"confirm": "wrong", "dry_run": True},
+    )
+    assert response.status_code == 400
 
 
 def test_naver_news_endpoint(monkeypatch):
