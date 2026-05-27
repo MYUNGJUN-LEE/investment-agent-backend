@@ -1292,6 +1292,8 @@ def auto_trading_dashboard():
         <option value="error">Error</option>
       </select>
       <button class="primary" onclick="loadSessions()">Refresh</button>
+      <button onclick="loadLatestUniverse()">Latest Universe</button>
+      <button onclick="scanUniverse()">Scan Universe</button>
     </div>
   </header>
   <main>
@@ -1379,6 +1381,28 @@ def auto_trading_dashboard():
       await api(`/auto-trading/restart/${sessionId}`, {method: "POST"});
       await loadSessions();
       await loadEvents(sessionId);
+    }
+
+    async function loadLatestUniverse() {
+      try {
+        const data = await api(`/universe/latest`);
+        eventsBox.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        eventsBox.textContent = `Failed to load latest universe: ${err.message}`;
+      }
+    }
+
+    async function scanUniverse() {
+      try {
+        summary.textContent = "Scanning universe (this may take a while)...";
+        eventsBox.textContent = "Scanning universe...";
+        const data = await api(`/universe/scan`, {method: "POST", body: JSON.stringify({}), headers: {"Content-Type": "application/json"}});
+        eventsBox.textContent = JSON.stringify(data, null, 2);
+        summary.textContent = "Universe scan complete.";
+      } catch (err) {
+        eventsBox.textContent = `Failed to scan universe: ${err.message}`;
+        summary.textContent = `Scan failed.`;
+      }
     }
 
     statusFilter.addEventListener("change", loadSessions);
