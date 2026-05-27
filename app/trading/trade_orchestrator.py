@@ -162,7 +162,6 @@ def _complete_orchestrator_session(
     result: dict[str, Any],
     event_type: str,
 ) -> None:
-    auto_trading_store.complete_cycle(session_id, [result])
     auto_trading_store.record_session_event(
         session_id,
         event_type=event_type,

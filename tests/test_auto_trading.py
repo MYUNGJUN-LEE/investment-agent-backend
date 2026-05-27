@@ -430,11 +430,10 @@ def test_orchestrator_completes_blocked_gate_cycle(tmp_path, monkeypatch):
 
     assert result["status"] == "blocked"
     assert result["results"][0]["status"] == "blocked"
-    assert updated["cycle_count"] == 1
-    assert datetime.fromisoformat(updated["next_run_at"]) > datetime.fromisoformat(session["next_run_at"])
-    assert [event["event_type"] for event in events[:2]] == [
+    assert updated["cycle_count"] == 0
+    assert updated["next_run_at"] == session["next_run_at"]
+    assert [event["event_type"] for event in events[:1]] == [
         "orchestrator_completed",
-        "cycle_completed",
     ]
 
 
@@ -458,8 +457,8 @@ def test_orchestrator_completes_cycle_when_candidates_are_empty(tmp_path, monkey
 
     assert result["status"] == "blocked"
     assert result["results"][0]["message"].startswith("scanner_candidates is empty")
-    assert updated["cycle_count"] == 1
-    assert datetime.fromisoformat(updated["next_run_at"]) > datetime.fromisoformat(session["next_run_at"])
+    assert updated["cycle_count"] == 0
+    assert updated["next_run_at"] == session["next_run_at"]
 
 
 def test_orchestrated_entries_follow_net_edge_priority(monkeypatch):
