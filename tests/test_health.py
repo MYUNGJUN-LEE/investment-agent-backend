@@ -144,6 +144,9 @@ def test_admin_runtime_status_endpoint_returns_compact_summary():
     assert "scanner_state" in body["summary"]
     assert "sample_state" in body["summary"]
     assert "universe_scan_count" in body["summary"]
+    assert "latest_scan_age_seconds" in body["summary"]
+    assert "scanner_stale_after_seconds" in body["summary"]
+    assert "locked_session_count" in body["summary"]
 
 
 def test_edge_training_samples_refresh_endpoint_returns_diagnostics(monkeypatch):

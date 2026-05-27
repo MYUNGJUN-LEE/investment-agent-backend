@@ -981,9 +981,7 @@
 
       els.scannerState.textContent = stateLabel(scannerState);
       els.scannerState.className = classForState(scannerState);
-      els.scannerDetail.textContent = summary.latest_scan_time
-        ? `latest scan ${summary.latest_scan_time}`
-        : "waiting for first scan";
+      els.scannerDetail.textContent = scannerDetailText(summary);
 
       els.sampleState.textContent = stateLabel(sampleState);
       els.sampleState.className = classForState(sampleState);
@@ -1009,7 +1007,9 @@
       els.runtimeHorizon.textContent = fmtSeconds(summary.label_horizon_seconds);
       els.runtimeLabelAge.textContent = `min age ${fmtSeconds(summary.label_min_age_seconds)}`;
       els.runtimeCycleCount.textContent = fmtNumber(summary.cycle_count, 0);
-      els.runtimeNextRun.textContent = summary.latest_session_next_run_at || "-";
+      els.runtimeNextRun.textContent = summary.latest_locked_until
+        ? `locked until ${summary.latest_locked_until}`
+        : (summary.latest_session_next_run_at || "-");
       els.runtimeFinalCount.textContent = fmtNumber(summary.latest_scan_final_count, 0);
       els.runtimeExecutableCount.textContent = `${fmtNumber(summary.latest_scan_executable_count, 0)} executable`;
       els.runtimeLastSample.textContent = summary.last_training_sample_at ? "ready" : "-";
@@ -1216,9 +1216,29 @@
     function classForState(value) {
       const state = String(value || "").toLowerCase();
       if (["running", "ready", "success"].includes(state)) return "ok";
-      if (["waiting_for_horizon", "waiting_for_future_prices", "idle", "empty"].includes(state)) return "warn";
-      if (["worker_down", "error", "failed"].includes(state)) return "bad";
+      if (["running_locked", "waiting_for_horizon", "waiting_for_future_prices", "idle", "empty"].includes(state)) return "warn";
+      if (["stale", "worker_down", "error", "failed"].includes(state)) return "bad";
       return "";
+    }
+
+    function scannerDetailText(summary) {
+      if (summary.scanner_state === "stale") {
+        return [
+          summary.latest_scan_age_seconds !== null && summary.latest_scan_age_seconds !== undefined
+            ? `scan age ${fmtSeconds(summary.latest_scan_age_seconds)}`
+            : "",
+          summary.next_run_lag_seconds !== null && summary.next_run_lag_seconds !== undefined
+            ? `next lag ${fmtSeconds(summary.next_run_lag_seconds)}`
+            : "",
+          `stale after ${fmtSeconds(summary.scanner_stale_after_seconds)}`
+        ].filter(Boolean).join(" | ");
+      }
+      if (summary.locked_session_count) {
+        return `scan lock active until ${summary.latest_locked_until || "-"}`;
+      }
+      return summary.latest_scan_time
+        ? `latest scan ${summary.latest_scan_time}`
+        : "waiting for first scan";
     }
 
     function statusTextClass(value) {

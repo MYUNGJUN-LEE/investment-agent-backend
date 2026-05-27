@@ -728,22 +728,27 @@ def refresh_edge_training_sample_summary(limit: int = 20):
 )
 def admin_runtime_status(limit: int = 20):
     from app.workers.manager import embedded_worker_status
+    from app.trading import auto_trading_store
 
+    generated_at = datetime.now().isoformat(timespec="seconds")
     auto_status = control_auto_trading_from_gpt(
         GptAutoTradeControlRequest(command="status")
     )
     samples = get_edge_training_sample_summary(limit=limit)
     latest_universe = get_latest_universe_scan()
     workers = embedded_worker_status()
+    raw_active_sessions = auto_trading_store.list_sessions(status="active", limit=50)
     summary = _admin_runtime_summary(
+        generated_at=generated_at,
         auto_status=auto_status,
         samples=samples,
         latest_universe=latest_universe,
         workers=workers,
+        raw_active_sessions=raw_active_sessions,
     )
     return {
         "status": "success",
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": generated_at,
         "summary": summary,
         "auto_trading": auto_status,
         "latest_universe": latest_universe,
@@ -754,12 +759,15 @@ def admin_runtime_status(limit: int = 20):
 
 def _admin_runtime_summary(
     *,
+    generated_at: str,
     auto_status: dict[str, Any],
     samples: dict[str, Any],
     latest_universe: dict[str, Any],
     workers: dict[str, Any],
+    raw_active_sessions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     active_sessions = auto_status.get("active_sessions") or []
+    raw_active_sessions = raw_active_sessions or []
     worker_rows = workers.get("workers") or []
     worker_count = len(worker_rows)
     alive_workers = [row for row in worker_rows if row.get("alive")]
@@ -774,9 +782,39 @@ def _admin_runtime_summary(
     sample_count = _to_int(samples.get("sample_count"))
     candidate_count = _to_int(diagnostics.get("scanner_candidate_history_count"))
     snapshot_count = _to_int(diagnostics.get("universe_price_snapshot_count"))
+    latest_scan_time = (
+        diagnostics.get("latest_scan_time")
+        or latest_universe.get("created_at")
+        or latest_universe.get("scan_time")
+    )
+    latest_next_run_at = active_sessions[0].get("next_run_at") if active_sessions else None
+    now_dt = _parse_iso(generated_at) or datetime.now()
+    latest_scan_age_seconds = _age_seconds(latest_scan_time, now_dt)
+    next_run_lag_seconds = _age_seconds(latest_next_run_at, now_dt)
+    stale_after_seconds = _scanner_stale_after_seconds(active_sessions)
+    locked_sessions = [
+        row
+        for row in raw_active_sessions
+        if _is_future_time(row.get("locked_until"), now_dt)
+    ]
+    latest_locked_until = max(
+        (str(row.get("locked_until")) for row in locked_sessions if row.get("locked_until")),
+        default=None,
+    )
 
     if active_sessions and trading_worker_alive:
-        scanner_state = "running"
+        if (
+            scan_count > 0
+            and latest_scan_age_seconds is not None
+            and latest_scan_age_seconds > stale_after_seconds
+            and next_run_lag_seconds is not None
+            and next_run_lag_seconds > stale_after_seconds
+        ):
+            scanner_state = "stale"
+        elif locked_sessions:
+            scanner_state = "running_locked"
+        else:
+            scanner_state = "running"
     elif active_sessions:
         scanner_state = "worker_down"
     elif scan_count > 0:
@@ -804,14 +842,15 @@ def _admin_runtime_summary(
         "latest_session_updated_at": active_sessions[0].get("updated_at")
         if active_sessions
         else None,
-        "latest_session_next_run_at": active_sessions[0].get("next_run_at")
-        if active_sessions
-        else None,
+        "latest_session_next_run_at": latest_next_run_at,
+        "next_run_lag_seconds": next_run_lag_seconds,
+        "locked_session_count": len(locked_sessions),
+        "latest_locked_until": latest_locked_until,
         "latest_scan_id": latest_universe.get("scan_id"),
         "latest_scan_status": latest_universe.get("status"),
-        "latest_scan_time": diagnostics.get("latest_scan_time")
-        or latest_universe.get("created_at")
-        or latest_universe.get("scan_time"),
+        "latest_scan_time": latest_scan_time,
+        "latest_scan_age_seconds": latest_scan_age_seconds,
+        "scanner_stale_after_seconds": stale_after_seconds,
         "latest_scan_final_count": _to_int(latest_universe.get("final_count")),
         "latest_scan_executable_count": _to_int(
             latest_universe.get("executable_count")
@@ -832,6 +871,43 @@ def _to_int(value: Any) -> int:
         return int(float(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _age_seconds(value: Any, now_dt: datetime) -> int | None:
+    parsed = _parse_iso(value)
+    if not parsed:
+        return None
+    return max(0, int((now_dt - parsed).total_seconds()))
+
+
+def _is_future_time(value: Any, now_dt: datetime) -> bool:
+    parsed = _parse_iso(value)
+    return bool(parsed and parsed > now_dt)
+
+
+def _scanner_stale_after_seconds(active_sessions: list[dict[str, Any]]) -> int:
+    session_interval = max(
+        [_to_int(row.get("interval_seconds")) for row in active_sessions] or [60]
+    )
+    source_count = max(1, int(settings.universe_scanner_max_source_symbols or 1))
+    symbol_interval = max(
+        0.0,
+        float(settings.universe_scanner_symbol_interval_seconds or 0.0),
+    )
+    cap = max(0.0, float(settings.universe_scanner_symbol_interval_cap_seconds or 0.0))
+    if cap > 0:
+        symbol_interval = min(symbol_interval, cap)
+    estimated_scan_seconds = int(source_count * symbol_interval) + 300
+    return max(900, session_interval * 5, estimated_scan_seconds * 2)
 
 
 @app.post(
