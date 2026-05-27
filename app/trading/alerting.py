@@ -10,8 +10,8 @@ import httpx
 
 from app.config import settings
 
-content=_json_bytes(outbound_payload)
-headers={"Content-Type": "application/json; charset=utf-8"}
+
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS alert_deliveries (
@@ -96,6 +96,9 @@ def notify_alerts(
             ],
         )
     return deliveries
+
+def _json_bytes(data: Any) -> bytes:
+    return json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
 
 
 def _deliver_one(alert: dict[str, Any], source: str) -> dict[str, Any]:
