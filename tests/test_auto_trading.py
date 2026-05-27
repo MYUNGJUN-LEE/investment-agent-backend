@@ -1376,6 +1376,15 @@ def test_auto_trading_worker_does_not_recover_active_lock(tmp_path, monkeypatch)
     assert updated["locked_until"] == "2999-01-01T00:00:00"
 
 
+def test_auto_trading_worker_lock_has_long_scan_floor(monkeypatch):
+    monkeypatch.setattr(settings, "auto_trading_worker_lock_seconds", 60)
+    monkeypatch.setattr(settings, "universe_scanner_max_source_symbols", 100)
+    monkeypatch.setattr(settings, "universe_scanner_symbol_interval_seconds", 60)
+    monkeypatch.setattr(settings, "universe_scanner_symbol_interval_cap_seconds", 2)
+
+    assert auto_trading_store._worker_lock_seconds() == 7200
+
+
 def test_requested_exit_forces_sell_strategy_decision():
     decision = build_strategy_decision(
         {

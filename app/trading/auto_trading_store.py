@@ -365,7 +365,7 @@ def claim_due_sessions(
 ) -> list[dict[str, Any]]:
     path = _db_path(db_path)
     now = _now()
-    lock_until = _plus_seconds(now, lock_seconds or settings.auto_trading_worker_lock_seconds)
+    lock_until = _plus_seconds(now, _worker_lock_seconds(lock_seconds))
     with _connect(path) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA_SQL)
@@ -398,6 +398,21 @@ def claim_due_sessions(
             if cursor.rowcount:
                 claimed.append(_row_to_session(row))
     return claimed
+
+
+def _worker_lock_seconds(lock_seconds: int | None = None) -> int:
+    configured = (
+        int(lock_seconds)
+        if lock_seconds is not None
+        else int(settings.auto_trading_worker_lock_seconds or 0)
+    )
+    source_count = max(1, int(settings.universe_scanner_max_source_symbols or 1))
+    interval = max(0.0, float(settings.universe_scanner_symbol_interval_seconds or 0.0))
+    cap = max(0.0, float(settings.universe_scanner_symbol_interval_cap_seconds or 0.0))
+    if cap > 0:
+        interval = min(interval, cap)
+    scanner_floor = int(source_count * interval) + 300
+    return max(7200, configured, scanner_floor)
 
 
 def recover_overdue_active_sessions(
