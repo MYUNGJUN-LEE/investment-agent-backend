@@ -428,7 +428,7 @@ def recover_overdue_active_sessions(
             WHERE status = 'active'
               AND (next_run_at IS NULL OR next_run_at <= ?)
               AND locked_until IS NOT NULL
-              AND locked_until > ?
+              AND locked_until <= ?
             """,
             (overdue_before, now),
         ).fetchall()

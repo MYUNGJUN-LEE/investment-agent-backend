@@ -1327,7 +1327,7 @@ def test_auto_trading_worker_recovers_overdue_locked_session(tmp_path, monkeypat
             UPDATE auto_trading_sessions
             SET next_run_at = '2000-01-01T00:00:00',
                 locked_by = 'dead-worker',
-                locked_until = '2999-01-01T00:00:00'
+                locked_until = '2000-01-01T00:00:00'
             WHERE session_id = ?
             """,
             (session["session_id"],),
@@ -1342,6 +1342,38 @@ def test_auto_trading_worker_recovers_overdue_locked_session(tmp_path, monkeypat
     assert updated["locked_by"] is None
     assert updated["locked_until"] is None
     assert any(event["event_type"] == "schedule_recovered" for event in events)
+
+
+def test_auto_trading_worker_does_not_recover_active_lock(tmp_path, monkeypatch):
+    auto_db = tmp_path / "auto.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(auto_db))
+    monkeypatch.setattr(
+        auto_trading,
+        "_run_cycle",
+        lambda req, session_id=None: [{"symbol": "005930", "status": "mocked"}],
+    )
+    session = auto_trading_store.create_session(
+        AutoTradeStartRequest(run_immediately=True, interval_seconds=60)
+    )
+    with sqlite3.connect(auto_db) as conn:
+        conn.execute(
+            """
+            UPDATE auto_trading_sessions
+            SET next_run_at = '2000-01-01T00:00:00',
+                locked_by = 'active-worker',
+                locked_until = '2999-01-01T00:00:00'
+            WHERE session_id = ?
+            """,
+            (session["session_id"],),
+        )
+
+    processed = auto_trading.process_due_sessions(worker_id="test-worker")
+    updated = auto_trading_store.get_session(session["session_id"], db_path=auto_db)
+
+    assert processed == []
+    assert updated["cycle_count"] == 0
+    assert updated["locked_by"] == "active-worker"
+    assert updated["locked_until"] == "2999-01-01T00:00:00"
 
 
 def test_requested_exit_forces_sell_strategy_decision():
