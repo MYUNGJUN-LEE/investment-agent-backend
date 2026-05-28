@@ -1,0 +1,1 @@
+﻿observed_at,scan_time,symbol,rank,status,entry_price,observed_price,return_check_bps,realized_return_bps,realized_risk_bps,realized_net_edge_bps,expected_return_bps,expected_risk_bps,trading_cost_bps,slippage_cost_bps,net_edge_bps,raw_score,composite_score,label_observation_span_seconds

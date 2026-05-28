@@ -1174,6 +1174,7 @@ def _rank_execution_candidates(
             _execution_priority(item),
             float(item.get("composite_score") or 0),
             float(item.get("net_edge") or 0),
+            -float(item.get("expected_risk") or 0),
             float(item.get("raw_score") or 0),
         ),
         reverse=True,
@@ -1214,9 +1215,89 @@ def _edge_entry_gate_for_mode(
         return edge_entry_gate(candidates)
 
 
-def _execution_priority(candidate: dict[str, Any]) -> int:
+def _execution_priority(candidate: dict[str, Any]) -> float:
+    """Sort likely executable candidates above raw momentum-only candidates."""
     gate = candidate.get("large_cap_top10_gate") or _large_cap_top10_gate(candidate)
-    return 1 if gate.get("passed", True) else 0
+    if not gate.get("passed", True):
+        return -100.0
+
+    priority = 10.0
+    decision = str(candidate.get("decision") or "").lower()
+    has_price = bool(candidate.get("current_price"))
+
+    if has_price and decision == "buy_candidate":
+        priority += 25.0
+    elif has_price and decision == "watch":
+        priority += 5.0
+    else:
+        priority -= 25.0
+
+    net_edge = _to_float(candidate.get("net_edge")) or 0.0
+    if net_edge > 0:
+        priority += min(20.0, net_edge / 10.0)
+    else:
+        priority += max(-25.0, net_edge / 10.0)
+
+    expected_risk = _to_float(candidate.get("expected_risk"))
+    if expected_risk is not None:
+        if expected_risk <= 250:
+            priority += 8.0
+        elif expected_risk >= 450:
+            priority -= 12.0
+        else:
+            priority -= min(8.0, expected_risk / 100.0)
+
+    reward_risk = candidate.get("edge_reward_risk") or {}
+    expected_value = _to_float(reward_risk.get("expected_value_after_cost_bps"))
+    reward_risk_ratio = _to_float(reward_risk.get("reward_risk_ratio"))
+
+    if expected_value is not None:
+        priority += 8.0 if expected_value > 0 else -10.0
+    if reward_risk_ratio is not None:
+        priority += 8.0 if reward_risk_ratio >= 1.5 else -10.0
+
+    return round(priority, 4)
+
+
+def _execution_status_bonus(
+    candidate: dict[str, Any],
+    *,
+    net_edge: float,
+    expected_risk: float,
+    reward_risk: dict[str, Any] | None,
+) -> float:
+    """Small score adjustment for candidates that look executable before final gating."""
+    bonus = 0.0
+    decision = str(candidate.get("decision") or "").lower()
+    has_price = bool(candidate.get("current_price"))
+
+    if has_price and decision == "buy_candidate":
+        bonus += 15.0
+    elif has_price and decision == "watch":
+        bonus -= 5.0
+    else:
+        bonus -= 20.0
+
+    if net_edge > 0:
+        bonus += min(15.0, net_edge / 15.0)
+    else:
+        bonus += max(-20.0, net_edge / 10.0)
+
+    if expected_risk <= 250:
+        bonus += 5.0
+    elif expected_risk >= 450:
+        bonus -= 8.0
+
+    rr = reward_risk or {}
+    expected_value = _to_float(rr.get("expected_value_after_cost_bps"))
+    reward_risk_ratio = _to_float(rr.get("reward_risk_ratio"))
+
+    if expected_value is not None:
+        bonus += 8.0 if expected_value > 0 else -8.0
+    if reward_risk_ratio is not None:
+        bonus += 7.0 if reward_risk_ratio >= 1.5 else -7.0
+
+    return max(-30.0, min(30.0, bonus))
 
 
 def _with_expected_value_scores(
@@ -1282,11 +1363,18 @@ def _with_expected_value_scores(
     expected_return_score = _score_bps(expected_return, cap_bps=350)
     net_edge_score = _score_bps(net_edge, cap_bps=250)
     expected_risk_score = _score_bps(expected_risk, cap_bps=350)
+    executable_status_bonus = _execution_status_bonus(
+        candidate,
+        net_edge=net_edge,
+        expected_risk=expected_risk,
+        reward_risk=reward_risk,
+    )
     composite_score = (
-        raw_score * 0.25
-        + expected_return_score * 0.30
-        + net_edge_score * 0.35
-        - expected_risk_score * 0.10
+        raw_score * 0.10
+        + expected_return_score * 0.20
+        + net_edge_score * 0.45
+        - expected_risk_score * 0.20
+        + executable_status_bonus
     )
     large_cap_gate = _large_cap_top10_gate(
         {
@@ -1303,6 +1391,12 @@ def _with_expected_value_scores(
         "slippage_cost": round(slippage_cost, 4),
         "net_edge": round(net_edge, 4),
         "composite_score": round(max(0.0, min(100.0, composite_score)), 4),
+        "composite_score_formula": (
+            "raw_score * 0.10 + expected_return_score * 0.20 "
+            "+ net_edge_score * 0.45 - expected_risk_score * 0.20 "
+            "+ executable_status_bonus"
+        ),
+        "executable_status_bonus": round(executable_status_bonus, 4),
         "expires_at": expires_at,
         "edge_model": edge_model_name,
         "edge_quality_score": quality["score"],

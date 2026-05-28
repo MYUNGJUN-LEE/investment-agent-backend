@@ -52,6 +52,45 @@ DEFAULT_RISK_COEFFICIENTS = {
     "low_turnover": 20.0,
 }
 
+
+REALIZED_RISK_WEIGHT = 0.10
+
+ELIGIBLE_EDGE_SAMPLE_STATUSES = {
+    "BUY",
+    "WATCH",
+    "CANDIDATE",
+    "EXECUTABLE",
+}
+
+INELIGIBLE_EDGE_SAMPLE_STATUSES = {
+    "EXCLUDED",
+    "SKIPPED",
+    "ARCHIVED",
+    "BLOCKED",
+    "NOT_EXECUTABLE",
+}
+
+ELIGIBLE_EDGE_SAMPLE_STATUS_SQL = (
+    "UPPER(COALESCE(status, '')) IN "
+    "('BUY', 'WATCH', 'CANDIDATE', 'EXECUTABLE')"
+)
+
+REALIZED_NET_EDGE_SQL = (
+    f"realized_return_bps - (realized_risk_bps * {REALIZED_RISK_WEIGHT:.2f}) "
+    "- COALESCE(trading_cost_bps, 0) - COALESCE(slippage_cost_bps, 0)"
+)
+
+REALIZED_NET_EDGE_FORMULA = (
+    f"realized_return_bps - realized_risk_bps * {REALIZED_RISK_WEIGHT:.2f} "
+    "- trading_cost_bps - slippage_cost_bps"
+)
+
+COMPOSITE_SCORE_FORMULA = (
+    "raw_score * 0.10 + expected_return_score * 0.20 "
+    "+ net_edge_score * 0.45 - expected_risk_score * 0.20 "
+    "+ executable_status_bonus"
+)
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS edge_calibration_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +164,24 @@ CREATE TABLE IF NOT EXISTS top_candidate_performance (
     raw_json TEXT NOT NULL
 );
 """
+
+
+def _normalize_sample_status(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _is_edge_training_sample_status_allowed(value: Any) -> bool:
+    status = _normalize_sample_status(value)
+    if status in INELIGIBLE_EDGE_SAMPLE_STATUSES:
+        return False
+    return status in ELIGIBLE_EDGE_SAMPLE_STATUSES
+
+
+def _row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
 
 
 def initialize_edge_calibration_db(db_path: Path | str | None = None) -> None:
@@ -431,7 +488,7 @@ def get_edge_calibration_status(
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         run = conn.execute(
-            """
+            f"""
             SELECT *
             FROM edge_calibration_runs
             ORDER BY id DESC
@@ -442,7 +499,7 @@ def get_edge_calibration_status(
             "SELECT COUNT(*) FROM edge_coefficients"
         ).fetchone()[0]
         stored_sample_count = conn.execute(
-            "SELECT COUNT(*) FROM edge_training_samples"
+            f"SELECT COUNT(*) FROM edge_training_samples WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}"
         ).fetchone()[0]
     return {
         "status": "ready" if coefficient_count else "empty",
@@ -490,13 +547,13 @@ def get_edge_training_sample_summary(
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         aggregate = conn.execute(
-            """
+            f"""
             SELECT
                 COUNT(*) AS sample_count,
                 COALESCE(SUM(realized_return_bps), 0) AS total_return_bps,
                 COALESCE(SUM(realized_risk_bps), 0) AS total_risk_bps,
                 COALESCE(SUM(
-                    realized_return_bps - realized_risk_bps
+                    realized_return_bps - (realized_risk_bps * 0.10)
                     - COALESCE(trading_cost_bps, 0)
                     - COALESCE(slippage_cost_bps, 0)
                 ), 0) AS total_realized_net_edge_bps,
@@ -517,13 +574,13 @@ def get_edge_training_sample_summary(
                 AVG(realized_risk_bps - expected_risk_bps) AS avg_risk_error_bps,
                 AVG(ABS(realized_risk_bps - expected_risk_bps)) AS mae_risk_error_bps,
                 AVG(
-                    realized_return_bps - realized_risk_bps
+                    realized_return_bps - (realized_risk_bps * 0.10)
                     - COALESCE(trading_cost_bps, 0)
                     - COALESCE(slippage_cost_bps, 0)
                     - net_edge_bps
                 ) AS avg_net_edge_error_bps,
                 AVG(ABS(
-                    realized_return_bps - realized_risk_bps
+                    realized_return_bps - (realized_risk_bps * 0.10)
                     - COALESCE(trading_cost_bps, 0)
                     - COALESCE(slippage_cost_bps, 0)
                     - net_edge_bps
@@ -534,29 +591,30 @@ def get_edge_training_sample_summary(
                 SUM(CASE WHEN realized_return_bps > 0 THEN 1 ELSE 0 END) AS win_count,
                 SUM(CASE WHEN realized_return_bps <= 0 THEN 1 ELSE 0 END) AS loss_count,
                 AVG(
-                    realized_return_bps - realized_risk_bps
+                    realized_return_bps - (realized_risk_bps * 0.10)
                     - COALESCE(trading_cost_bps, 0)
                     - COALESCE(slippage_cost_bps, 0)
                 ) AS avg_realized_net_edge_bps,
                 SUM(CASE
                     WHEN (
-                        realized_return_bps - realized_risk_bps
+                        realized_return_bps - (realized_risk_bps * 0.10)
                         - COALESCE(trading_cost_bps, 0)
                         - COALESCE(slippage_cost_bps, 0)
                     ) > 0 THEN 1 ELSE 0
                 END) AS net_edge_win_count,
                 SUM(CASE
                     WHEN (
-                        realized_return_bps - realized_risk_bps
+                        realized_return_bps - (realized_risk_bps * 0.10)
                         - COALESCE(trading_cost_bps, 0)
                         - COALESCE(slippage_cost_bps, 0)
                     ) <= 0 THEN 1 ELSE 0
                 END) AS net_edge_loss_count
             FROM edge_training_samples
+            WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
             """
         ).fetchone()
         recent = conn.execute(
-            """
+            f"""
             SELECT
                 id, symbol, scan_time, observed_at, entry_price, observed_price,
                 realized_return_bps, realized_risk_bps, label_observation_span_seconds,
@@ -564,13 +622,14 @@ def get_edge_training_sample_summary(
                 expected_return_bps, expected_risk_bps, trading_cost_bps,
                 slippage_cost_bps, net_edge_bps, composite_score, rank, status
             FROM edge_training_samples
+            WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
             ORDER BY observed_at DESC, id DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
         symbols = conn.execute(
-            """
+            f"""
             SELECT
                 symbol,
                 COUNT(*) AS sample_count,
@@ -582,6 +641,7 @@ def get_edge_training_sample_summary(
                 AVG(net_edge_bps) AS avg_predicted_net_edge_bps,
                 SUM(CASE WHEN realized_return_bps > 0 THEN 1 ELSE 0 END) AS win_count
             FROM edge_training_samples
+            WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
             GROUP BY symbol
             ORDER BY sample_count DESC, avg_return_bps DESC
             LIMIT ?
@@ -625,14 +685,16 @@ def get_edge_data_diagnostics(
         "auto_trading_db_exists": auto_path.exists(),
         "edge_training_sample_count": _safe_sqlite_scalar(
             calibration_path,
-            "SELECT COUNT(*) FROM edge_training_samples",
+            f"SELECT COUNT(*) FROM edge_training_samples WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}",
         ),
         "edge_top10_sample_count": _safe_sqlite_scalar(
             calibration_path,
-            """
+            f"""
             SELECT COUNT(*)
             FROM edge_training_samples
-            WHERE rank IS NOT NULL AND rank <= 10
+            WHERE rank IS NOT NULL
+              AND rank <= 10
+              AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
             """,
         ),
         "invalid_label_sample_count": _safe_sqlite_scalar(
@@ -642,6 +704,7 @@ def get_edge_data_diagnostics(
             FROM edge_training_samples
             WHERE label_observation_span_seconds IS NOT NULL
               AND label_observation_span_seconds < {int(settings.edge_calibration_horizon_seconds or 0)}
+              AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
             """,
         ),
         "last_training_sample_at": _safe_sqlite_scalar(
@@ -814,10 +877,10 @@ def edge_entry_gate(
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         stored_sample_count = conn.execute(
-            "SELECT COUNT(*) FROM edge_training_samples"
+            f"SELECT COUNT(*) FROM edge_training_samples WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}"
         ).fetchone()[0]
         run = conn.execute(
-            """
+            f"""
             SELECT *
             FROM edge_calibration_runs
             ORDER BY id DESC
@@ -933,7 +996,7 @@ def _iter_calibration_samples(
     with sqlite3.connect(universe_path) as conn:
         conn.row_factory = sqlite3.Row
         candidate_cursor = conn.execute(
-            """
+            f"""
             SELECT *
             FROM scanner_candidate_history
             WHERE current_price IS NOT NULL
@@ -1028,7 +1091,7 @@ def label_policy_summary() -> dict[str, Any]:
             else "Use the first eligible snapshots after scan time"
         ),
         "realized_net_edge_formula": (
-            "realized_return_bps - realized_risk_bps - trading_cost_bps - slippage_cost_bps"
+            REALIZED_NET_EDGE_FORMULA
         ),
     }
 
@@ -1152,7 +1215,7 @@ def _iter_label_candidates(
         if max_rows is not None and yielded >= max_rows:
             return
         rows = source_conn.execute(
-            """
+            f"""
             SELECT *
             FROM scanner_candidate_history
             WHERE id > ?
@@ -1202,7 +1265,7 @@ def _append_labeling_price_snapshots(
     with sqlite3.connect(universe_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            """
+            f"""
             SELECT id, symbol, scan_id, scan_time
             FROM scanner_candidate_history
             WHERE scan_time >= ?
@@ -1311,6 +1374,10 @@ def _training_payload_from_candidate_row(
     row: sqlite3.Row,
     horizon_seconds: int,
 ) -> dict[str, Any] | None:
+    status = _row_value(row, "status")
+    if not _is_edge_training_sample_status_allowed(status):
+        return None
+
     entry_price = _to_float(row["current_price"])
     if entry_price is None or entry_price <= 0:
         return None
@@ -1530,11 +1597,12 @@ def _iter_training_samples_from_store(
     with sqlite3.connect(calibration_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            """
+            f"""
             SELECT features_json, realized_return_bps, realized_risk_bps
             FROM (
                 SELECT *
                 FROM edge_training_samples
+                WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
                 ORDER BY observed_at DESC, id DESC
                 LIMIT ?
             )
@@ -1640,14 +1708,14 @@ def _top10_performance_from_store(
     _purge_invalid_label_samples_by_path(calibration_path)
     with sqlite3.connect(calibration_path) as conn:
         conn.row_factory = sqlite3.Row
-        query = """
+        query = f"""
             SELECT
                 COUNT(*) AS sample_count,
                 COUNT(expected_return_bps) AS metric_sample_count,
                 COALESCE(SUM(realized_return_bps), 0) AS total_return_bps,
                 COALESCE(SUM(realized_risk_bps), 0) AS total_risk_bps,
                 COALESCE(SUM(
-                    realized_return_bps - realized_risk_bps
+                    realized_return_bps - (realized_risk_bps * 0.10)
                     - COALESCE(trading_cost_bps, 0)
                     - COALESCE(slippage_cost_bps, 0)
                 ), 0) AS total_realized_net_edge_bps,
@@ -1668,13 +1736,13 @@ def _top10_performance_from_store(
                 AVG(realized_risk_bps - expected_risk_bps) AS avg_risk_error_bps,
                 AVG(ABS(realized_risk_bps - expected_risk_bps)) AS mae_risk_error_bps,
                 AVG(
-                    realized_return_bps - realized_risk_bps
+                    realized_return_bps - (realized_risk_bps * 0.10)
                     - COALESCE(trading_cost_bps, 0)
                     - COALESCE(slippage_cost_bps, 0)
                     - net_edge_bps
                 ) AS avg_net_edge_error_bps,
                 AVG(ABS(
-                    realized_return_bps - realized_risk_bps
+                    realized_return_bps - (realized_risk_bps * 0.10)
                     - COALESCE(trading_cost_bps, 0)
                     - COALESCE(slippage_cost_bps, 0)
                     - net_edge_bps
@@ -1686,17 +1754,18 @@ def _top10_performance_from_store(
             FROM edge_training_samples
             WHERE rank IS NOT NULL
               AND rank <= 10
+              AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
         """
         params: tuple[Any, ...] = ()
         if limit is not None:
-            query = """
+            query = f"""
                 SELECT
                     COUNT(*) AS sample_count,
                     COUNT(expected_return_bps) AS metric_sample_count,
                     COALESCE(SUM(realized_return_bps), 0) AS total_return_bps,
                     COALESCE(SUM(realized_risk_bps), 0) AS total_risk_bps,
                     COALESCE(SUM(
-                        realized_return_bps - realized_risk_bps
+                        realized_return_bps - (realized_risk_bps * 0.10)
                         - COALESCE(trading_cost_bps, 0)
                         - COALESCE(slippage_cost_bps, 0)
                     ), 0) AS total_realized_net_edge_bps,
@@ -1717,13 +1786,13 @@ def _top10_performance_from_store(
                     AVG(realized_risk_bps - expected_risk_bps) AS avg_risk_error_bps,
                     AVG(ABS(realized_risk_bps - expected_risk_bps)) AS mae_risk_error_bps,
                     AVG(
-                        realized_return_bps - realized_risk_bps
+                        realized_return_bps - (realized_risk_bps * 0.10)
                         - COALESCE(trading_cost_bps, 0)
                         - COALESCE(slippage_cost_bps, 0)
                         - net_edge_bps
                     ) AS avg_net_edge_error_bps,
                     AVG(ABS(
-                        realized_return_bps - realized_risk_bps
+                        realized_return_bps - (realized_risk_bps * 0.10)
                         - COALESCE(trading_cost_bps, 0)
                         - COALESCE(slippage_cost_bps, 0)
                         - net_edge_bps
@@ -1737,6 +1806,7 @@ def _top10_performance_from_store(
                     FROM edge_training_samples
                     WHERE rank IS NOT NULL
                       AND rank <= 10
+                      AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
                     ORDER BY observed_at DESC, id DESC
                     LIMIT ?
                 )
@@ -1791,8 +1861,8 @@ def _top10_performance_from_store(
         "expectancy_bps": round(expectancy, 4),
         "expectancy_formula": "E = (win_rate * avg_win_bps) - (loss_rate * avg_loss_bps)",
         "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
-        "realized_net_edge_formula": "realized_return_bps - realized_risk_bps - trading_cost_bps - slippage_cost_bps",
-        "composite_score_formula": "raw_score * 0.25 + expected_return_score * 0.30 + net_edge_score * 0.35 - expected_risk_score * 0.10",
+        "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
+        "composite_score_formula": COMPOSITE_SCORE_FORMULA,
     }
 
 
@@ -1833,7 +1903,7 @@ def _empty_top10_performance(limit: int | None = None) -> dict[str, Any]:
         "reward_risk_ratio": None,
         "expectancy_bps": None,
         "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
-        "realized_net_edge_formula": "realized_return_bps - realized_risk_bps - trading_cost_bps - slippage_cost_bps",
+        "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
     }
 
 
@@ -1842,7 +1912,7 @@ def _latest_top10_performance_from_store(path: Path) -> dict[str, Any] | None:
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            """
+            f"""
             SELECT raw_json
             FROM top_candidate_performance
             ORDER BY id DESC
@@ -1885,7 +1955,7 @@ def _stored_sample_count(path: Path) -> int:
     initialize_edge_calibration_db(path)
     with sqlite3.connect(path) as conn:
         return int(
-            conn.execute("SELECT COUNT(*) FROM edge_training_samples").fetchone()[0]
+            conn.execute(f"SELECT COUNT(*) FROM edge_training_samples WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}").fetchone()[0]
             or 0
         )
 
@@ -1954,7 +2024,7 @@ def _empty_sample_summary() -> dict[str, Any]:
         "net_edge_loss_count": 0,
         "net_edge_win_rate": None,
         "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
-        "realized_net_edge_formula": "realized_return_bps - realized_risk_bps - trading_cost_bps - slippage_cost_bps",
+        "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
     }
 
 
@@ -2007,8 +2077,8 @@ def _sample_summary_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "net_edge_loss_count": net_edge_loss_count,
         "net_edge_win_rate": round(net_edge_win_count / sample_count, 4),
         "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
-        "realized_net_edge_formula": "realized_return_bps - realized_risk_bps - trading_cost_bps - slippage_cost_bps",
-        "composite_score_formula": "raw_score * 0.25 + expected_return_score * 0.30 + net_edge_score * 0.35 - expected_risk_score * 0.10",
+        "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
+        "composite_score_formula": COMPOSITE_SCORE_FORMULA,
     }
 
 
@@ -2028,7 +2098,7 @@ def _sample_row(row: sqlite3.Row) -> dict[str, Any]:
         item[key] = _round_optional(item.get(key))
     item["realized_net_edge_bps"] = _round_optional(
         (_to_float(item.get("realized_return_bps")) or 0.0)
-        - (_to_float(item.get("realized_risk_bps")) or 0.0)
+        - ((_to_float(item.get("realized_risk_bps")) or 0.0) * REALIZED_RISK_WEIGHT)
         - (_to_float(item.get("trading_cost_bps")) or 0.0)
         - (_to_float(item.get("slippage_cost_bps")) or 0.0)
     )
@@ -2293,6 +2363,9 @@ def _gate_from_metrics(
             float(candidate.get("net_edge") or 0.0) * multiplier
             for candidate in candidates
             if candidate.get("net_edge") is not None
+            and _is_edge_training_sample_status_allowed(
+                candidate.get("status") or candidate.get("decision")
+            )
         ]
         if candidate_edges:
             best_fill_adjusted_edge = max(candidate_edges)
@@ -2438,7 +2511,7 @@ def _latest_raw_json(path: Path, key: str) -> Any:
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            """
+            f"""
             SELECT raw_json
             FROM edge_calibration_runs
             ORDER BY id DESC
@@ -2534,7 +2607,7 @@ def _backfill_training_sample_metrics(conn: sqlite3.Connection) -> None:
     last_id = 0
     while True:
         rows = conn.execute(
-            """
+            f"""
             SELECT id, raw_json
             FROM edge_training_samples
             WHERE id > ?
@@ -2595,7 +2668,7 @@ def _backfill_training_sample_label_spans(conn: sqlite3.Connection) -> None:
     last_id = 0
     while True:
         rows = conn.execute(
-            """
+            f"""
             SELECT id, raw_json
             FROM edge_training_samples
             WHERE id > ?
@@ -2743,3 +2816,4 @@ def _now() -> str:
 
 def _db_path(db_path: Path | str | None = None) -> Path:
     return settings.storage_path(db_path or settings.edge_calibration_db_path)
+
