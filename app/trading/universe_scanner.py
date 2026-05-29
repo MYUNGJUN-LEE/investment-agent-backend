@@ -22,6 +22,7 @@ from app.trading.edge_calibration import (
 from app.trading.atr_exits import atr_exit_levels_from_price_data
 from app.trading import paper_trading
 
+EDGE_RISK_WEIGHT = 0.10
 
 DEFAULT_UNIVERSE = {
     "035900": "JYP Entertainment",
@@ -1359,10 +1360,12 @@ def _with_expected_value_scores(
         _estimate_slippage_cost_bps(candidate)
         - float(quality["slippage_discount_bps"]),
     )
-net_edge = expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS
+    net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)
+
     expected_return_score = _score_bps(expected_return, cap_bps=350)
     net_edge_score = _score_bps(net_edge, cap_bps=250)
     expected_risk_score = _score_bps(expected_risk, cap_bps=350)
+
     executable_status_bonus = _execution_status_bonus(
         candidate,
         net_edge=net_edge,

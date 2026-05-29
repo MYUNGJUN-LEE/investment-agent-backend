@@ -14,6 +14,121 @@ from app.brokers.kis_client import (
 )
 from app.config import settings
 
+KIS_TOKEN_EXPIRED_CODE = "EGW00123"
+
+
+def _is_kis_token_expired_error(exc: Exception) -> bool:
+    """Return True when KIS says the access token has expired."""
+    error_code = str(getattr(exc, "error_code", "") or "")
+    error_description = str(getattr(exc, "error_description", "") or "")
+    message = str(exc)
+
+    return (
+        KIS_TOKEN_EXPIRED_CODE in error_code
+        or KIS_TOKEN_EXPIRED_CODE in error_description
+        or KIS_TOKEN_EXPIRED_CODE in message
+        or "기간이 만료된 token" in error_description
+        or "기간이 만료된 token" in message
+        or "만료된 token" in message
+    )
+
+
+def _invalidate_kis_client_token(client: KisClient) -> None:
+    """
+    Best-effort token invalidation.
+
+    The real token cache usually lives inside app.brokers.kis_client.KisClient.
+    This helper tries common invalidation method/attribute names without
+    requiring broker_sync.py to know the exact KisClient implementation.
+    """
+    for method_name in (
+        "invalidate_access_token",
+        "invalidate_token",
+        "clear_access_token",
+        "clear_token",
+        "clear_token_cache",
+        "reset_token",
+    ):
+        method = getattr(client, method_name, None)
+        if callable(method):
+            try:
+                method()
+                return
+            except Exception:
+                pass
+
+    for attr_name in (
+        "_access_token",
+        "access_token",
+        "_token",
+        "token",
+    ):
+        if hasattr(client, attr_name):
+            try:
+                setattr(client, attr_name, None)
+            except Exception:
+                pass
+
+    for attr_name in (
+        "_access_token_expires_at",
+        "access_token_expires_at",
+        "_token_expires_at",
+        "token_expires_at",
+        "_expires_at",
+        "expires_at",
+    ):
+        if hasattr(client, attr_name):
+            try:
+                setattr(client, attr_name, None)
+            except Exception:
+                pass
+
+
+def _new_kis_client_like(client: KisClient) -> KisClient:
+    """
+    Create a fresh KisClient after token expiry.
+
+    This assumes KisClient can be constructed with no args, which is already
+    how sync_kis_account() creates it in this file.
+    """
+    return KisClient()
+
+
+def _fetch_kis_balance_and_executions(
+    *,
+    client: KisClient,
+    lookback_days: int,
+) -> tuple[KisClient, dict[str, Any], dict[str, Any]]:
+    """
+    Fetch KIS balance and executions.
+
+    If KIS returns EGW00123 token expired error, invalidate token, create a
+    fresh client, and retry exactly once.
+    """
+    end = datetime.now()
+    start = end - timedelta(days=max(0, lookback_days))
+
+    try:
+        balance = client.get_balance()
+        executions = client.get_daily_order_executions(
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+        return client, balance, executions
+
+    except KisApiError as exc:
+        if not _is_kis_token_expired_error(exc):
+            raise
+
+        _invalidate_kis_client_token(client)
+        refreshed_client = _new_kis_client_like(client)
+
+        balance = refreshed_client.get_balance()
+        executions = refreshed_client.get_daily_order_executions(
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+        return refreshed_client, balance, executions
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS broker_balance_snapshots (
@@ -69,20 +184,21 @@ def sync_kis_account(
 ) -> dict[str, Any]:
     """Synchronize KIS balance, positions, and recent order executions."""
     client = client or KisClient()
+
     try:
-        balance = client.get_balance()
-        end = datetime.now()
-        start = end - timedelta(days=max(0, lookback_days))
-        executions = client.get_daily_order_executions(
-            start_date=start.strftime("%Y%m%d"),
-            end_date=end.strftime("%Y%m%d"),
+        client, balance, executions = _fetch_kis_balance_and_executions(
+            client=client,
+            lookback_days=lookback_days,
         )
+
     except KisConfigError as exc:
         return _kis_config_error_result(client=client, exc=exc)
+
     except KisApiError as exc:
         if is_invalid_account_error(exc):
             return _kis_config_error_result(client=client, exc=exc)
         raise
+
     return record_kis_sync(
         balance=balance,
         executions=executions,

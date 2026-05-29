@@ -21,6 +21,7 @@ _TOKEN_CACHE_LOCK = threading.RLock()
 _REQUEST_THROTTLE_LOCK = threading.RLock()
 _LAST_REQUEST_AT = 0.0
 _INVALID_ACCOUNT_ERROR_CODES = {"OPSQ2000"}
+_TOKEN_EXPIRED_ERROR_CODES = {"EGW00123"}
 
 
 class KisConfigError(ValueError):
@@ -525,6 +526,86 @@ class KisClient:
         )
         return headers
 
+    def invalidate_access_token(self) -> None:
+        """
+        Clear in-memory and shared token cache.
+        Used when KIS returns EGW00123: expired access token.
+        """
+        self._access_token = None
+        self._access_token_expires_at = None
+
+        if not self._shared_token_cache_enabled():
+            return
+
+        with _TOKEN_CACHE_LOCK:
+            cache = _read_token_cache(self._token_cache_path)
+            key = self._token_cache_key()
+            row = cache.get(key)
+
+            if isinstance(row, dict):
+                row["access_token"] = None
+                row["expires_at"] = None
+                row["last_error_code"] = "EGW00123"
+                row["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                cache[key] = row
+            else:
+                cache.pop(key, None)
+
+            _write_token_cache(self._token_cache_path, cache)
+
+    def _is_token_expired_error(self, exc: KisApiError) -> bool:
+        """Return True when KIS says the access token has expired."""
+        text = " ".join(
+            str(value or "")
+            for value in (
+                exc.error_code,
+                exc.error_description,
+                exc.response_text,
+                exc,
+            )
+        )
+
+        return (
+            str(exc.error_code or "") in _TOKEN_EXPIRED_ERROR_CODES
+            or "EGW00123" in text
+            or "기간이 만료된 token" in text
+            or "만료된 token" in text
+        )
+
+    def _refreshed_auth_headers_for_retry(
+        self,
+        *,
+        path: str,
+        headers: dict[str, str],
+        exc: KisApiError,
+    ) -> dict[str, str] | None:
+        """
+        Return headers with a freshly issued token when a request failed because
+        the previous token expired.
+
+        Do not retry token issuance itself.
+        Do not retry unauthenticated calls such as hashkey.
+        """
+        if path == "/oauth2/tokenP":
+            return None
+
+        if not self._is_token_expired_error(exc):
+            return None
+
+        auth_header_key = next(
+            (key for key in headers if key.lower() == "authorization"),
+            None,
+        )
+        if not auth_header_key:
+            return None
+
+        self.invalidate_access_token()
+        new_token = self.issue_access_token(force_refresh=True)
+
+        refreshed_headers = dict(headers)
+        refreshed_headers[auth_header_key] = f"Bearer {new_token}"
+        return refreshed_headers
+
     def _send_with_throttle(self, send: Callable[[], httpx.Response]) -> httpx.Response:
         if self.transport is not None:
             return send()
@@ -556,7 +637,22 @@ class KisClient:
             response = self._send_with_throttle(
                 lambda: client.get(path, params=params, headers=headers)
             )
-        return self._parse_response(response)
+
+            try:
+                return self._parse_response(response)
+            except KisApiError as exc:
+                retry_headers = self._refreshed_auth_headers_for_retry(
+                    path=path,
+                    headers=headers,
+                    exc=exc,
+                )
+                if retry_headers is None:
+                    raise
+
+                retry_response = self._send_with_throttle(
+                    lambda: client.get(path, params=params, headers=retry_headers)
+                )
+                return self._parse_response(retry_response)
 
     def _get_with_headers(
         self,
@@ -572,7 +668,22 @@ class KisClient:
             response = self._send_with_throttle(
                 lambda: client.get(path, params=params, headers=headers)
             )
-        return self._parse_response(response), response.headers
+
+            try:
+                return self._parse_response(response), response.headers
+            except KisApiError as exc:
+                retry_headers = self._refreshed_auth_headers_for_retry(
+                    path=path,
+                    headers=headers,
+                    exc=exc,
+                )
+                if retry_headers is None:
+                    raise
+
+                retry_response = self._send_with_throttle(
+                    lambda: client.get(path, params=params, headers=retry_headers)
+                )
+                return self._parse_response(retry_response), retry_response.headers
 
     def _post(
         self,
@@ -589,7 +700,25 @@ class KisClient:
             response = self._send_with_throttle(
                 lambda: client.post(path, json=json, headers=headers)
             )
-        return self._parse_response(response, check_rt_cd=check_rt_cd)
+
+            try:
+                return self._parse_response(response, check_rt_cd=check_rt_cd)
+            except KisApiError as exc:
+                retry_headers = self._refreshed_auth_headers_for_retry(
+                    path=path,
+                    headers=headers,
+                    exc=exc,
+                )
+                if retry_headers is None:
+                    raise
+
+                retry_response = self._send_with_throttle(
+                    lambda: client.post(path, json=json, headers=retry_headers)
+                )
+                return self._parse_response(
+                    retry_response,
+                    check_rt_cd=check_rt_cd,
+                )
 
     def _parse_response(
         self,
