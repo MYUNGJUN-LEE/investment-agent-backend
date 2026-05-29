@@ -1438,12 +1438,12 @@ def _execution_status_for_candidate(
         return "SKIPPED", _join_reasons(reasons)
     reward_risk = candidate.get("edge_reward_risk") or {}
     expected_value = _to_float(reward_risk.get("expected_value_after_cost_bps"))
-    if expected_value is not None and expected_value <= 0:
+    if expected_value is not None and expected_value <= -10:
         reasons.append(f"expected value {expected_value:.2f}bps is not positive")
         return "SKIPPED", _join_reasons(reasons)
     reward_risk_ratio = _to_float(reward_risk.get("reward_risk_ratio"))
-    if reward_risk_ratio is not None and reward_risk_ratio < 1.5:
-        reasons.append(f"reward/risk {reward_risk_ratio:.2f} is below 1.5")
+    if reward_risk_ratio is not None and reward_risk_ratio < 0.5:
+        reasons.append(f"reward/risk {reward_risk_ratio:.2f} is below 0.5")
         return "SKIPPED", _join_reasons(reasons)
     net_edge = float(candidate.get("net_edge") or 0)
     if net_edge <= hurdle_rate:
@@ -1454,6 +1454,27 @@ def _execution_status_for_candidate(
     if not entry_gate.get("approved", False):
         reasons.append(str(entry_gate.get("message") or "entry gate blocked"))
         return "SKIPPED", _join_reasons(reasons)
+    return "READY", _join_reasons(reasons)
+     # Loosened: allow candidates down to -20bps.
+    min_bootstrap_edge = min(float(hurdle_rate or 0.0), -20.0)
+    if net_edge < min_bootstrap_edge:
+        reasons.append(
+            f"net_edge {net_edge:.2f}bps is below bootstrap threshold {min_bootstrap_edge:.2f}bps"
+        )
+        return "SKIPPED", _join_reasons(reasons)
+
+    # Keep entry gate, but allow paper bootstrap when gate is collecting.
+    if not entry_gate.get("approved", False):
+        gate_status = str(entry_gate.get("status") or "")
+        gate_message = str(entry_gate.get("message") or "entry gate blocked")
+
+        if gate_status in {"collecting", "empty"}:
+            reasons.append(f"entry gate soft-passed during bootstrap: {gate_message}")
+        else:
+            reasons.append(gate_message)
+            return "SKIPPED", _join_reasons(reasons)
+
+    reasons.append("bootstrap executable")
     return "READY", _join_reasons(reasons)
 
 
@@ -2294,16 +2315,23 @@ def _plus_seconds(value: str, seconds: int | float) -> str:
 
 
 def _worker_hurdle_rate_bps(execution_mode: str = "paper") -> float:
-    configured = max(
-        0.0,
-        float(settings.universe_scanner_worker_hurdle_rate_bps or 0.0),
-    )
+    configured = float(settings.universe_scanner_worker_hurdle_rate_bps or 0.0)
+
+    # Paper bootstrap can allow slightly negative net edge to create samples.
+    if execution_mode == "paper":
+        configured = max(-20.0, configured)
+    else:
+        configured = max(0.0, configured)
+
     if execution_mode != "paper":
         return configured
+
     achieved = _paper_average_realized_return_bps()
     if achieved is None:
         return configured
-    return max(configured, achieved)
+
+    # During bootstrap, do not let old paper realized average raise hurdle too much.
+    return min(max(configured, achieved), 20.0)
 
 
 def _paper_average_realized_return_bps(limit: int = 20) -> float | None:
