@@ -108,7 +108,7 @@ class Settings(BaseSettings):
     edge_calibration_paper_min_top10_avg_return_bps: float = 5.0
     edge_calibration_gate_min_top10_win_rate: float = 0.50
     edge_calibration_gate_min_top10_expectancy_bps: float = 0.0
-    edge_calibration_gate_min_fill_adjusted_edge_bps: float = 30.0
+    edge_calibration_gate_min_fill_adjusted_edge_bps: float = 60.0
     broker_sync_db_path: str = "data/broker_sync.sqlite3"
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120

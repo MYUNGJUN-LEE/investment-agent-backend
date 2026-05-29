@@ -24,6 +24,18 @@ FEATURE_NAMES = [
     "overheated",
     "latest_close",
     "low_turnover",
+
+     # v2 features for 1~2 day swing trading
+    "market_regime",
+    "market_breadth",
+    "index_return_1d",
+    "relative_strength_3d",
+    "relative_strength_5d",
+    "atr_pct",
+    "volatility_10d",
+    "close_position",
+    "intraday_recovery",
+    "overheat_score",
 ]
 
 DEFAULT_RETURN_COEFFICIENTS = {
@@ -37,6 +49,18 @@ DEFAULT_RETURN_COEFFICIENTS = {
     "overheated": -120.0,
     "latest_close": -100.0,
     "low_turnover": -20.0,
+
+     # v2 return priors
+    "market_regime": 60.0,
+    "market_breadth": 40.0,
+    "index_return_1d": 30.0,
+    "relative_strength_3d": 70.0,
+    "relative_strength_5d": 50.0,
+    "atr_pct": -20.0,
+    "volatility_10d": -25.0,
+    "close_position": 45.0,
+    "intraday_recovery": 50.0,
+    "overheat_score": -100.0,
 }
 
 DEFAULT_RISK_COEFFICIENTS = {
@@ -50,10 +74,166 @@ DEFAULT_RISK_COEFFICIENTS = {
     "overheated": 90.0,
     "latest_close": 35.0,
     "low_turnover": 20.0,
+
+     # v2 risk priors
+    "market_regime": -30.0,
+    "market_breadth": -20.0,
+    "index_return_1d": -10.0,
+    "relative_strength_3d": -20.0,
+    "relative_strength_5d": -10.0,
+    "atr_pct": 80.0,
+    "volatility_10d": 90.0,
+    "close_position": -20.0,
+    "intraday_recovery": -20.0,
+    "overheat_score": 120.0,
 }
 
 
 REALIZED_RISK_WEIGHT = 0.10
+
+# ---------------------------------------------------------------------
+# Trading cost / slippage policy
+# ---------------------------------------------------------------------
+# Unit convention:
+# - percent: 0.147 means 0.147%
+# - bps: 1% = 100 bps, 0.147% = 14.7 bps
+#
+# Current policy:
+# - Buy fee: 0.147%
+# - Sell fee: 0.147%
+# - Max allowed slippage: 0.10%
+# - Sell tax is not included here. Add it to SELL_TAX_PCT if needed.
+# ---------------------------------------------------------------------
+
+EXPECTED_RISK_WEIGHT = REALIZED_RISK_WEIGHT
+
+BUY_FEE_PCT = 0.147
+SELL_FEE_PCT = 0.147
+SELL_TAX_PCT = 0.2
+
+MAX_ALLOWED_SLIPPAGE_PCT = 0.10
+
+
+def percent_to_bps(percent: float) -> float:
+    """Convert percent value to bps. Example: 0.147% -> 14.7 bps."""
+    return float(percent) * 100.0
+
+
+def estimate_round_trip_trading_cost_bps(
+    *,
+    buy_fee_pct: float = BUY_FEE_PCT,
+    sell_fee_pct: float = SELL_FEE_PCT,
+    sell_tax_pct: float = SELL_TAX_PCT,
+) -> float:
+    """Return round-trip trading cost in bps."""
+    return percent_to_bps(buy_fee_pct + sell_fee_pct + sell_tax_pct)
+
+
+DEFAULT_ROUND_TRIP_TRADING_COST_BPS = estimate_round_trip_trading_cost_bps()
+MAX_ALLOWED_SLIPPAGE_BPS = percent_to_bps(MAX_ALLOWED_SLIPPAGE_PCT)
+
+
+EXPECTED_NET_EDGE_FORMULA = (
+    f"expected_return_bps - expected_risk_bps * {EXPECTED_RISK_WEIGHT:.2f} "
+    "- trading_cost_bps - slippage_cost_bps - liquidity_drag_bps"
+)
+
+
+def estimate_slippage_cost_bps(
+    candidate: dict[str, Any],
+    *,
+    default_slippage_bps: float = MAX_ALLOWED_SLIPPAGE_BPS,
+) -> float:
+    """
+    Estimate slippage cost in bps.
+
+    If candidate already has slippage_cost or slippage_cost_bps, use it.
+    Otherwise use the max allowed slippage policy: 0.10% = 10 bps.
+    """
+    raw_slippage = (
+        _to_float(candidate.get("slippage_cost"))
+        if candidate.get("slippage_cost") is not None
+        else _to_float(candidate.get("slippage_cost_bps"))
+    )
+
+    if raw_slippage is None:
+        return float(default_slippage_bps)
+
+    return max(0.0, float(raw_slippage))
+
+
+def is_slippage_allowed(
+    slippage_cost_bps: float,
+    *,
+    max_allowed_slippage_bps: float = MAX_ALLOWED_SLIPPAGE_BPS,
+) -> bool:
+    """Return whether estimated slippage is within the allowed limit."""
+    return float(slippage_cost_bps) <= float(max_allowed_slippage_bps)
+
+
+def estimate_liquidity_drag_bps(
+    candidate: dict[str, Any],
+    *,
+    default_order_value: float | None = None,
+    impact_k_bps: float = 50.0,
+) -> float:
+    """
+    Estimate liquidity/market-impact drag in bps.
+
+    Formula:
+        participation_rate = order_value / turnover_value
+        liquidity_drag_bps = impact_k_bps * sqrt(participation_rate)
+
+    If order_value or turnover_value is missing, return 0.
+    """
+    turnover = _to_float(candidate.get("turnover_value"))
+    order_value = (
+        _to_float(candidate.get("order_value"))
+        or _to_float(candidate.get("position_value"))
+        or default_order_value
+        or 0.0
+    )
+
+    if turnover is None or turnover <= 0 or order_value <= 0:
+        return 0.0
+
+    participation = max(0.0, min(0.05, order_value / turnover))
+    return impact_k_bps * (participation ** 0.5)
+
+
+def estimate_expected_net_edge_bps(
+    *,
+    expected_return_bps: float,
+    expected_risk_bps: float,
+    trading_cost_bps: float = DEFAULT_ROUND_TRIP_TRADING_COST_BPS,
+    slippage_cost_bps: float = MAX_ALLOWED_SLIPPAGE_BPS,
+    liquidity_drag_bps: float = 0.0,
+) -> float:
+    """
+    Estimate net edge after risk penalty, trading cost, slippage, and liquidity drag.
+
+    Formula:
+        expected_net_edge
+        = expected_return
+        - expected_risk * EXPECTED_RISK_WEIGHT
+        - trading_cost
+        - slippage_cost
+        - liquidity_drag
+    """
+    return (
+        float(expected_return_bps)
+        - float(expected_risk_bps) * EXPECTED_RISK_WEIGHT
+        - float(trading_cost_bps)
+        - float(slippage_cost_bps)
+        - float(liquidity_drag_bps)
+    )
+
+EXPECTED_RISK_WEIGHT = 0.10
+
+EXPECTED_NET_EDGE_FORMULA = (
+    f"expected_return_bps - expected_risk_bps * {EXPECTED_RISK_WEIGHT:.2f} "
+    "- trading_cost_bps - slippage_cost_bps - liquidity_drag_bps"
+)
 
 ELIGIBLE_EDGE_SAMPLE_STATUSES = {
     "BUY",
@@ -165,6 +345,78 @@ CREATE TABLE IF NOT EXISTS top_candidate_performance (
 );
 """
 
+def estimate_expected_edges(
+    candidate: dict[str, Any],
+    raw_score: float,
+    *,
+    model: dict[str, dict[str, float]] | None = None,
+) -> dict[str, Any] | None:
+    model = model or load_edge_model()
+    return_coefficients = model.get("expected_return")
+    risk_coefficients = model.get("expected_risk")
+    if not return_coefficients or not risk_coefficients:
+        return None
+
+    feature_map = candidate_feature_map(candidate, raw_score)
+    fill_adjustment = load_fill_adjustment()
+
+    expected_return = _predict(return_coefficients, feature_map) * fill_adjustment
+    expected_risk = _predict(risk_coefficients, feature_map)
+
+    # Fixed round-trip trading cost:
+    # Buy fee 0.147% + sell fee 0.147% = 0.294% = 29.4 bps
+    trading_cost_bps = DEFAULT_ROUND_TRIP_TRADING_COST_BPS
+
+    # Slippage policy:
+    # Default/worst allowed slippage = 0.10% = 10 bps.
+    # If candidate already has slippage estimate, use that estimate.
+    slippage_cost_bps = estimate_slippage_cost_bps(candidate)
+    slippage_allowed = is_slippage_allowed(slippage_cost_bps)
+
+    # Optional liquidity drag.
+    # If candidate has order_value/position_value and turnover_value,
+    # this adds market-impact cost.
+    liquidity_drag_bps = estimate_liquidity_drag_bps(candidate)
+
+    expected_return = max(0.0, min(500.0, expected_return))
+    expected_risk = max(0.0, min(500.0, expected_risk))
+
+    expected_net_edge = estimate_expected_net_edge_bps(
+        expected_return_bps=expected_return,
+        expected_risk_bps=expected_risk,
+        trading_cost_bps=trading_cost_bps,
+        slippage_cost_bps=slippage_cost_bps,
+        liquidity_drag_bps=liquidity_drag_bps,
+    )
+
+    total_cost_bps = trading_cost_bps + slippage_cost_bps + liquidity_drag_bps
+
+    return {
+        "expected_return": round(expected_return, 4),
+        "expected_risk": round(expected_risk, 4),
+
+        # Net edge after cost/risk adjustment
+        "expected_net_edge": round(expected_net_edge, 4),
+
+        # Cost breakdown
+        "trading_cost_bps": round(trading_cost_bps, 4),
+        "buy_fee_pct": BUY_FEE_PCT,
+        "sell_fee_pct": SELL_FEE_PCT,
+        "sell_tax_pct": SELL_TAX_PCT,
+        "round_trip_fee_pct": round(BUY_FEE_PCT + SELL_FEE_PCT + SELL_TAX_PCT, 6),
+
+        "slippage_cost_bps": round(slippage_cost_bps, 4),
+        "max_allowed_slippage_bps": round(MAX_ALLOWED_SLIPPAGE_BPS, 4),
+        "max_allowed_slippage_pct": MAX_ALLOWED_SLIPPAGE_PCT,
+        "slippage_allowed": slippage_allowed,
+
+        "liquidity_drag_bps": round(liquidity_drag_bps, 4),
+        "total_cost_bps": round(total_cost_bps, 4),
+
+        "expected_net_edge_formula": EXPECTED_NET_EDGE_FORMULA,
+        "edge_model": "calibrated_ridge_v2_cost_adjusted",
+        "fill_adjustment": round(fill_adjustment, 4),
+    }
 
 def _normalize_sample_status(value: Any) -> str:
     return str(value or "").strip().upper()
@@ -804,28 +1056,200 @@ def load_edge_model(
             model["expected_risk"] = dict(DEFAULT_RISK_COEFFICIENTS)
     return model
 
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, float(value)))
 
-def estimate_expected_edges(
-    candidate: dict[str, Any],
-    raw_score: float,
-    *,
-    model: dict[str, dict[str, float]] | None = None,
-) -> dict[str, Any] | None:
-    model = model or load_edge_model()
-    return_coefficients = model.get("expected_return")
-    risk_coefficients = model.get("expected_risk")
-    if not return_coefficients or not risk_coefficients:
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "ok", "bull", "bullish", "positive"}
+
+
+def _clip_bps(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, float(value)))
+
+
+def estimate_overheat_score(candidate: dict[str, Any]) -> float:
+    """
+    Continuous overheat score.
+
+    Formula:
+        overheat_score =
+            max(0, (change_rate - 7) / 8)
+          + max(0, (rsi - 70) / 30)
+          + max(0, gap_up_pct / 5)
+
+    0 = not overheated
+    1~2 = increasingly overheated
+    """
+    change_rate = _to_float(candidate.get("change_rate")) or 0.0
+    rsi = _to_float(candidate.get("rsi_14")) or 50.0
+    gap_up_pct = _to_float(candidate.get("gap_up_pct")) or 0.0
+
+    score = 0.0
+    score += max(0.0, (change_rate - 7.0) / 8.0)
+    score += max(0.0, (rsi - 70.0) / 30.0)
+    score += max(0.0, gap_up_pct / 5.0)
+
+    return _clamp(score, 0.0, 2.0)
+
+
+def estimate_profit_factor_from_top10(
+    top10_performance: dict[str, Any],
+) -> float | None:
+    """
+    Estimate Profit Factor from existing top10 performance fields.
+
+    Formula:
+        profit_factor = gross_profit / gross_loss
+
+    Because _top10_performance_from_store already returns:
+        win_rate, loss_rate, avg_win_bps, avg_loss_bps
+
+    We can estimate:
+        gross_profit_per_sample = win_rate * avg_win_bps
+        gross_loss_per_sample = loss_rate * avg_loss_bps
+    """
+    win_rate = _to_float(top10_performance.get("win_rate"))
+    loss_rate = _to_float(top10_performance.get("loss_rate"))
+    avg_win = _to_float(top10_performance.get("avg_win_bps"))
+    avg_loss = _to_float(top10_performance.get("avg_loss_bps"))
+
+    if win_rate is None or loss_rate is None or avg_win is None or avg_loss is None:
         return None
-    feature_map = candidate_feature_map(candidate, raw_score)
-    fill_adjustment = load_fill_adjustment()
-    expected_return = _predict(return_coefficients, feature_map) * fill_adjustment
-    expected_risk = _predict(risk_coefficients, feature_map)
+
+    gross_profit = win_rate * avg_win
+    gross_loss = loss_rate * avg_loss
+
+    if gross_loss <= 0:
+        return None
+
+    return gross_profit / gross_loss
+
+
+def _pearson_corr(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) < 3 or len(xs) != len(ys):
+        return None
+
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+
+    if var_x <= 0 or var_y <= 0:
+        return None
+
+    return cov / ((var_x ** 0.5) * (var_y ** 0.5))
+
+
+def _recent_ic_from_store(
+    *,
+    calibration_path: Path,
+    limit: int = 300,
+) -> dict[str, Any]:
+    """
+    Information Coefficient.
+
+    Formula:
+        IC = corr(predicted_net_edge_bps, realized_net_edge_bps)
+
+    If IC is below 0, the model's ranking may be working backwards.
+    """
+    initialize_edge_calibration_db(calibration_path)
+
+    with sqlite3.connect(calibration_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT
+                net_edge_bps,
+                realized_return_bps,
+                realized_risk_bps,
+                trading_cost_bps,
+                slippage_cost_bps
+            FROM edge_training_samples
+            WHERE net_edge_bps IS NOT NULL
+              AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+            ORDER BY observed_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(10, int(limit)),),
+        ).fetchall()
+
+    predicted: list[float] = []
+    realized: list[float] = []
+
+    for row in rows:
+        pred = _to_float(row["net_edge_bps"])
+        if pred is None:
+            continue
+
+        realized_return = _to_float(row["realized_return_bps"]) or 0.0
+        realized_risk = _to_float(row["realized_risk_bps"]) or 0.0
+        trading_cost = _to_float(row["trading_cost_bps"]) or 0.0
+        slippage_cost = _to_float(row["slippage_cost_bps"]) or 0.0
+
+        realized_net = (
+            realized_return
+            - realized_risk * REALIZED_RISK_WEIGHT
+            - trading_cost
+            - slippage_cost
+        )
+
+        predicted.append(pred)
+        realized.append(realized_net)
+
+    ic = _pearson_corr(predicted, realized)
+
     return {
-        "expected_return": round(max(0.0, min(500.0, expected_return)), 4),
-        "expected_risk": round(max(0.0, min(500.0, expected_risk)), 4),
-        "edge_model": "calibrated_ridge_v1",
-        "fill_adjustment": round(fill_adjustment, 4),
+        "sample_count": len(predicted),
+        "ic": round(ic, 6) if ic is not None else None,
+        "ic_formula": "corr(predicted_net_edge_bps, realized_net_edge_bps)",
     }
+
+
+def candidate_cost_coverage(candidate: dict[str, Any]) -> float | None:
+    """
+    Cost coverage ratio.
+
+    Formula:
+        cost_coverage = expected_return_bps / total_cost_bps
+
+    This version uses default policy costs when candidate does not provide costs.
+    """
+    expected_return = _to_float(
+        candidate.get("expected_return")
+        or candidate.get("expected_return_bps")
+    )
+
+    trading_cost = _to_float(
+        candidate.get("trading_cost")
+        or candidate.get("trading_cost_bps")
+    )
+    if trading_cost is None:
+        trading_cost = DEFAULT_ROUND_TRIP_TRADING_COST_BPS
+
+    slippage_cost = _to_float(
+        candidate.get("slippage_cost")
+        or candidate.get("slippage_cost_bps")
+    )
+    if slippage_cost is None:
+        slippage_cost = estimate_slippage_cost_bps(candidate)
+
+    liquidity_drag = _to_float(candidate.get("liquidity_drag_bps"))
+    if liquidity_drag is None:
+        liquidity_drag = estimate_liquidity_drag_bps(candidate)
+
+    total_cost = trading_cost + slippage_cost + liquidity_drag
+
+    if expected_return is None or total_cost <= 0:
+        return None
+
+    return expected_return / total_cost
 
 
 def candidate_feature_map(
@@ -833,20 +1257,100 @@ def candidate_feature_map(
     raw_score: float,
 ) -> dict[str, float]:
     intraday = candidate.get("intraday") or {}
+    market = candidate.get("market") or candidate.get("market_context") or {}
+
     volume_ratio = _to_float(candidate.get("volume_ratio")) or 0.0
     minute_volume_ratio = _to_float(intraday.get("minute_volume_ratio")) or 0.0
     turnover = _to_float(candidate.get("turnover_value"))
+
+    market_regime_raw = (
+        market.get("regime_ok")
+        if isinstance(market, dict) and "regime_ok" in market
+        else candidate.get("market_regime_ok")
+    )
+    market_regime = 1.0 if _to_bool(market_regime_raw) else 0.0
+
+    market_breadth = (
+        _to_float(market.get("breadth"))
+        if isinstance(market, dict)
+        else None
+    )
+    if market_breadth is None:
+        market_breadth = _to_float(candidate.get("market_breadth"))
+    if market_breadth is None:
+        market_breadth = 0.5
+
+    index_return_1d = (
+        _to_float(market.get("index_return_1d"))
+        if isinstance(market, dict)
+        else None
+    )
+    if index_return_1d is None:
+        index_return_1d = _to_float(candidate.get("index_return_1d")) or 0.0
+
+    relative_strength_3d = _to_float(candidate.get("relative_strength_3d")) or 0.0
+    relative_strength_5d = _to_float(candidate.get("relative_strength_5d")) or 0.0
+
+    atr_pct = _to_float(candidate.get("atr_pct")) or 0.0
+    volatility_10d = _to_float(candidate.get("volatility_10d")) or 0.0
+
+    high = _to_float(intraday.get("high") or candidate.get("high_price"))
+    low = _to_float(intraday.get("low") or candidate.get("low_price"))
+    close = _to_float(
+        candidate.get("current_price")
+        or candidate.get("close")
+        or candidate.get("last_price")
+    )
+    open_price = _to_float(intraday.get("open") or candidate.get("open_price"))
+
+    if high is not None and low is not None and close is not None and high > low:
+        close_position = (close - low) / (high - low)
+    else:
+        close_position = _to_float(candidate.get("close_position"))
+        if close_position is None:
+            close_position = 0.5
+
+    if open_price is not None and open_price > 0 and close is not None:
+        intraday_recovery = (close - open_price) / open_price * 100.0
+    else:
+        intraday_recovery = _to_float(candidate.get("intraday_recovery")) or 0.0
+
+    overheat_score = estimate_overheat_score(candidate)
+
     return {
         "bias": 1.0,
-        "raw_score": max(0.0, min(1.0, float(raw_score) / 100.0)),
-        "change_rate": max(-1.0, min(1.5, (_to_float(candidate.get("change_rate")) or 0.0) / 10.0)),
-        "volume_ratio": max(0.0, min(2.0, volume_ratio / 5.0)),
-        "minute_volume_ratio": max(0.0, min(2.0, minute_volume_ratio / 5.0)),
-        "news_count": max(0.0, min(1.0, float(_to_int(candidate.get("news_count")) or 0) / 5.0)),
-        "disclosure_count": max(0.0, min(1.0, float(_to_int(candidate.get("disclosure_count")) or 0) / 3.0)),
+        "raw_score": _clamp(float(raw_score) / 100.0, 0.0, 1.0),
+        "change_rate": _clamp(
+            (_to_float(candidate.get("change_rate")) or 0.0) / 10.0,
+            -1.0,
+            1.5,
+        ),
+        "volume_ratio": _clamp(volume_ratio / 5.0, 0.0, 2.0),
+        "minute_volume_ratio": _clamp(minute_volume_ratio / 5.0, 0.0, 2.0),
+        "news_count": _clamp(
+            float(_to_int(candidate.get("news_count")) or 0) / 5.0,
+            0.0,
+            1.0,
+        ),
+        "disclosure_count": _clamp(
+            float(_to_int(candidate.get("disclosure_count")) or 0) / 3.0,
+            0.0,
+            1.0,
+        ),
         "overheated": 1.0 if bool(candidate.get("overheated")) else 0.0,
         "latest_close": 1.0 if candidate.get("price_source") == "latest_close" else 0.0,
         "low_turnover": 1.0 if turnover is not None and turnover < 20_000_000_000 else 0.0,
+
+        "market_regime": market_regime,
+        "market_breadth": _clamp(market_breadth, 0.0, 1.0),
+        "index_return_1d": _clamp(index_return_1d / 3.0, -1.0, 1.0),
+        "relative_strength_3d": _clamp(relative_strength_3d / 5.0, -1.0, 1.0),
+        "relative_strength_5d": _clamp(relative_strength_5d / 8.0, -1.0, 1.0),
+        "atr_pct": _clamp(atr_pct / 5.0, 0.0, 2.0),
+        "volatility_10d": _clamp(volatility_10d / 5.0, 0.0, 2.0),
+        "close_position": _clamp(close_position, 0.0, 1.0),
+        "intraday_recovery": _clamp(intraday_recovery / 5.0, -1.0, 1.0),
+        "overheat_score": overheat_score,
     }
 
 
@@ -873,20 +1377,27 @@ def edge_entry_gate(
             message="No edge calibration DB has been created yet",
             execution_mode=execution_mode,
         )
+
     initialize_edge_calibration_db(path)
+
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
         stored_sample_count = conn.execute(
-            f"SELECT COUNT(*) FROM edge_training_samples WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}"
+            f"""
+            SELECT COUNT(*)
+            FROM edge_training_samples
+            WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+            """
         ).fetchone()[0]
         run = conn.execute(
-            f"""
+            """
             SELECT *
             FROM edge_calibration_runs
             ORDER BY id DESC
             LIMIT 1
             """
         ).fetchone()
+
     if not run:
         return _default_gate(
             status="collecting",
@@ -898,15 +1409,23 @@ def edge_entry_gate(
 
     raw = _parse_json(run["raw_json"], {})
     refresh = refresh_top10_performance_if_due(calibration_db_path=path)
+
     top10_performance = (
         refresh.get("top10_performance")
         or _latest_top10_performance_from_store(path)
         or raw.get("top10_performance")
         or _top10_performance_from_store(calibration_path=path)
     )
+
     fill_adjustment = raw.get("fill_adjustment") or {
         "multiplier": load_fill_adjustment(calibration_db_path=path),
     }
+
+    ic_metrics = _recent_ic_from_store(
+        calibration_path=path,
+        limit=300,
+    )
+
     return _gate_from_metrics(
         sample_count=int(stored_sample_count or run["sample_count"] or 0),
         oos_sample_count=int(raw.get("oos_sample_count") or run["oos_sample_count"] or 0),
@@ -914,6 +1433,7 @@ def edge_entry_gate(
         mae_risk_bps=_to_float(run["mae_risk_bps"]),
         top10_performance=top10_performance,
         fill_adjustment=fill_adjustment,
+        ic_metrics=ic_metrics,
         candidates=candidates,
         execution_mode=execution_mode,
     )
@@ -1417,6 +1937,29 @@ def _training_payload_from_candidate_row(
         "disclosure_count": row["disclosure_count"],
     }
     feature_map = candidate_feature_map(candidate, raw_score)
+    
+    expected_return_bps = _to_float(row["expected_return"])
+    expected_risk_bps = _to_float(row["expected_risk"])
+
+    trading_cost_bps = _to_float(row["trading_cost"])
+    if trading_cost_bps is None:
+        trading_cost_bps = DEFAULT_ROUND_TRIP_TRADING_COST_BPS
+
+    slippage_cost_bps = _to_float(row["slippage_cost"])
+    if slippage_cost_bps is None:
+        slippage_cost_bps = estimate_slippage_cost_bps(candidate)
+
+    liquidity_drag_bps = estimate_liquidity_drag_bps(candidate)
+
+    net_edge_bps = _to_float(row["net_edge"])
+    if expected_return_bps is not None and expected_risk_bps is not None:
+        net_edge_bps = estimate_expected_net_edge_bps(
+            expected_return_bps=expected_return_bps,
+            expected_risk_bps=expected_risk_bps,
+            trading_cost_bps=trading_cost_bps,
+            slippage_cost_bps=slippage_cost_bps,
+            liquidity_drag_bps=liquidity_drag_bps,
+        )
     return {
         "source_candidate_id": int(row["id"]),
         "symbol": str(row["symbol"]),
@@ -1429,11 +1972,12 @@ def _training_payload_from_candidate_row(
         "realized_risk_bps": realized_risk_bps,
         "label_observation_span_seconds": label_observation_span,
         "raw_score": raw_score,
-        "expected_return_bps": _to_float(row["expected_return"]),
-        "expected_risk_bps": _to_float(row["expected_risk"]),
-        "trading_cost_bps": _to_float(row["trading_cost"]),
-        "slippage_cost_bps": _to_float(row["slippage_cost"]),
-        "net_edge_bps": _to_float(row["net_edge"]),
+        "expected_return_bps": expected_return_bps,
+        "expected_risk_bps": expected_risk_bps,
+        "trading_cost_bps": trading_cost_bps,
+        "slippage_cost_bps": slippage_cost_bps,
+        "liquidity_drag_bps": liquidity_drag_bps,
+        "net_edge_bps": net_edge_bps,
         "composite_score": _to_float(row["composite_score"]),
         "rank": _to_int(row["rank"]),
         "status": row["status"],
@@ -1444,11 +1988,12 @@ def _training_payload_from_candidate_row(
             "label_observation_span_seconds": label_observation_span,
             "sample_metrics": {
                 "raw_score": raw_score,
-                "expected_return_bps": _to_float(row["expected_return"]),
-                "expected_risk_bps": _to_float(row["expected_risk"]),
-                "trading_cost_bps": _to_float(row["trading_cost"]),
-                "slippage_cost_bps": _to_float(row["slippage_cost"]),
-                "net_edge_bps": _to_float(row["net_edge"]),
+                "expected_return_bps": expected_return_bps,
+                "expected_risk_bps": expected_risk_bps,
+                "trading_cost_bps": trading_cost_bps,
+                "slippage_cost_bps": slippage_cost_bps,
+                "liquidity_drag_bps": liquidity_drag_bps,
+                "net_edge_bps": net_edge_bps,
                 "composite_score": _to_float(row["composite_score"]),
             },
             "source": "scanner_candidate_history",
@@ -1627,10 +2172,20 @@ def _training_sample_from_row(
     if not isinstance(features, list) or len(features) != len(FEATURE_NAMES):
         return None
     try:
+        realized_return_bps = _clip_bps(
+            float(row["realized_return_bps"]),
+            -800.0,
+            800.0,
+        )
+        realized_risk_bps = _clip_bps(
+            float(row["realized_risk_bps"]),
+            0.0,
+            800.0,
+        )
         return (
             [float(value) for value in features],
-            float(row["realized_return_bps"]),
-            float(row["realized_risk_bps"]),
+            realized_return_bps,
+            realized_risk_bps,
         )
     except (TypeError, ValueError):
         return None
@@ -1860,7 +2415,7 @@ def _top10_performance_from_store(
         "reward_risk_ratio": round(avg_win / avg_loss, 4) if avg_loss else None,
         "expectancy_bps": round(expectancy, 4),
         "expectancy_formula": "E = (win_rate * avg_win_bps) - (loss_rate * avg_loss_bps)",
-        "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
+        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
         "composite_score_formula": COMPOSITE_SCORE_FORMULA,
     }
@@ -1902,7 +2457,7 @@ def _empty_top10_performance(limit: int | None = None) -> dict[str, Any]:
         "avg_loss_bps": None,
         "reward_risk_ratio": None,
         "expectancy_bps": None,
-        "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
+        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
     }
 
@@ -2023,7 +2578,7 @@ def _empty_sample_summary() -> dict[str, Any]:
         "net_edge_win_count": 0,
         "net_edge_loss_count": 0,
         "net_edge_win_rate": None,
-        "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
+        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
     }
 
@@ -2076,7 +2631,7 @@ def _sample_summary_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "net_edge_win_count": net_edge_win_count,
         "net_edge_loss_count": net_edge_loss_count,
         "net_edge_win_rate": round(net_edge_win_count / sample_count, 4),
-        "net_edge_formula": "net_edge = expected_return - expected_risk - trading_cost - slippage_cost",
+        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
         "composite_score_formula": COMPOSITE_SCORE_FORMULA,
     }
@@ -2308,14 +2863,17 @@ def _gate_from_metrics(
     mae_risk_bps: float | None,
     top10_performance: dict[str, Any],
     fill_adjustment: dict[str, Any],
+    ic_metrics: dict[str, Any] | None = None,
     candidates: list[dict[str, Any]] | None = None,
     execution_mode: str | None = None,
 ) -> dict[str, Any]:
     failures: list[str] = []
+
     min_samples = int(settings.edge_calibration_gate_min_samples or 1000)
     min_oos = int(settings.edge_calibration_gate_min_oos_samples or 200)
     max_return_mae = float(settings.edge_calibration_gate_max_mae_return_bps or 180.0)
     max_risk_mae = float(settings.edge_calibration_gate_max_mae_risk_bps or 180.0)
+
     configured_min_top10_return = float(
         settings.edge_calibration_gate_min_top10_avg_return_bps
         if settings.edge_calibration_gate_min_top10_avg_return_bps is not None
@@ -2324,49 +2882,104 @@ def _gate_from_metrics(
     min_top10_return = _effective_min_top10_avg_return_bps(
         execution_mode=execution_mode,
     )
+
     target_top10_win_rate = float(
         settings.edge_calibration_gate_min_top10_win_rate
         if settings.edge_calibration_gate_min_top10_win_rate is not None
         else 0.50
     )
+
     min_top10_expectancy = float(
         settings.edge_calibration_gate_min_top10_expectancy_bps
         if settings.edge_calibration_gate_min_top10_expectancy_bps is not None
         else 0.0
     )
+
     min_fill_adjusted_edge = float(
-        settings.edge_calibration_gate_min_fill_adjusted_edge_bps or 30.0
+        settings.edge_calibration_gate_min_fill_adjusted_edge_bps or 60.0
     )
+
+    min_profit_factor = float(
+        getattr(settings, "edge_calibration_gate_min_profit_factor", 1.10) or 1.10
+    )
+
+    min_recent_ic = float(
+        getattr(settings, "edge_calibration_gate_min_ic", 0.02) or 0.02
+    )
+
+    min_cost_coverage = float(
+        getattr(settings, "edge_calibration_gate_min_cost_coverage", 2.0) or 2.0
+    )
+
     multiplier = _to_float(fill_adjustment.get("multiplier")) or 1.0
     best_fill_adjusted_edge: float | None = None
+    best_cost_coverage: float | None = None
 
     if sample_count < min_samples:
         failures.append(f"sample_count {sample_count}/{min_samples}")
+
     if oos_sample_count < min_oos:
         failures.append(f"oos_sample_count {oos_sample_count}/{min_oos}")
+
     if mae_return_bps is None or mae_return_bps > max_return_mae:
         failures.append(f"mae_return_bps {mae_return_bps} > {max_return_mae}")
+
     if mae_risk_bps is None or mae_risk_bps > max_risk_mae:
         failures.append(f"mae_risk_bps {mae_risk_bps} > {max_risk_mae}")
 
     top10_avg_return = _to_float(top10_performance.get("avg_return_bps"))
     top10_expectancy = _to_float(top10_performance.get("expectancy_bps"))
+    top10_win_rate = _to_float(top10_performance.get("win_rate"))
+    top10_profit_factor = estimate_profit_factor_from_top10(top10_performance)
+
     if top10_avg_return is None or top10_avg_return < min_top10_return:
-        failures.append(f"top10_avg_return_bps {top10_avg_return} < {min_top10_return}")
+        failures.append(
+            f"top10_avg_return_bps {top10_avg_return} < {min_top10_return}"
+        )
+
     if top10_expectancy is None or top10_expectancy <= min_top10_expectancy:
         failures.append(
             f"top10_expectancy_bps {top10_expectancy} <= {min_top10_expectancy}"
         )
 
+    if top10_win_rate is None or top10_win_rate < target_top10_win_rate:
+        failures.append(
+            f"top10_win_rate {top10_win_rate} < {target_top10_win_rate}"
+        )
+
+    if top10_profit_factor is None or top10_profit_factor < min_profit_factor:
+        failures.append(
+            f"top10_profit_factor {top10_profit_factor} < {min_profit_factor}"
+        )
+
+    recent_ic = _to_float((ic_metrics or {}).get("ic"))
+
+    if recent_ic is None or recent_ic < min_recent_ic:
+        failures.append(f"recent_ic {recent_ic} < {min_recent_ic}")
+
     if candidates:
-        candidate_edges = [
-            float(candidate.get("net_edge") or 0.0) * multiplier
-            for candidate in candidates
-            if candidate.get("net_edge") is not None
-            and _is_edge_training_sample_status_allowed(
+        candidate_edges: list[float] = []
+        cost_coverages: list[float] = []
+
+        for candidate in candidates:
+            if not _is_edge_training_sample_status_allowed(
                 candidate.get("status") or candidate.get("decision")
+            ):
+                continue
+
+            edge_value = _to_float(
+                candidate.get("expected_net_edge")
+                or candidate.get("net_edge_bps")
+                or candidate.get("net_edge")
             )
-        ]
+
+            if edge_value is not None:
+                candidate_edges.append(edge_value * multiplier)
+
+            coverage = candidate_cost_coverage(candidate)
+            if coverage is not None:
+                cost_coverages.append(coverage)
+
         if candidate_edges:
             best_fill_adjusted_edge = max(candidate_edges)
             if best_fill_adjusted_edge < min_fill_adjusted_edge:
@@ -2375,7 +2988,15 @@ def _gate_from_metrics(
                     f"{best_fill_adjusted_edge:.2f} < {min_fill_adjusted_edge:.2f}"
                 )
 
+        if cost_coverages:
+            best_cost_coverage = max(cost_coverages)
+            if best_cost_coverage < min_cost_coverage:
+                failures.append(
+                    f"best_cost_coverage {best_cost_coverage:.2f} < {min_cost_coverage:.2f}"
+                )
+
     approved = not failures
+
     return {
         "status": "approved" if approved else "blocked",
         "approved": approved,
@@ -2388,11 +3009,25 @@ def _gate_from_metrics(
         "oos_sample_count": oos_sample_count,
         "mae_return_bps": mae_return_bps,
         "mae_risk_bps": mae_risk_bps,
-        "top10_performance": top10_performance,
+        "top10_performance": {
+            **top10_performance,
+            "profit_factor": (
+                round(top10_profit_factor, 4)
+                if top10_profit_factor is not None
+                else None
+            ),
+            "profit_factor_formula": "profit_factor = gross_profit_bps / gross_loss_bps",
+        },
         "fill_adjustment": fill_adjustment,
+        "ic_metrics": ic_metrics,
         "best_fill_adjusted_edge_bps": (
             round(best_fill_adjusted_edge, 4)
             if best_fill_adjusted_edge is not None
+            else None
+        ),
+        "best_cost_coverage": (
+            round(best_cost_coverage, 4)
+            if best_cost_coverage is not None
             else None
         ),
         "required": {
@@ -2405,6 +3040,9 @@ def _gate_from_metrics(
             "target_top10_win_rate": target_top10_win_rate,
             "min_top10_expectancy_bps": min_top10_expectancy,
             "min_fill_adjusted_edge_bps": min_fill_adjusted_edge,
+            "min_profit_factor": min_profit_factor,
+            "min_recent_ic": min_recent_ic,
+            "min_cost_coverage": min_cost_coverage,
         },
     }
 

@@ -104,7 +104,7 @@ services:
       - key: EDGE_CALIBRATION_GATE_MIN_TOP10_EXPECTANCY_BPS
         value: "0"
       - key: EDGE_CALIBRATION_GATE_MIN_FILL_ADJUSTED_EDGE_BPS
-        value: "30"
+        value: "60"
       - key: MONITOR_PRICE_INTERVAL_SECONDS
         value: "60"
       - key: MONITOR_DISCLOSURE_INTERVAL_SECONDS

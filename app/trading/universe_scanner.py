@@ -588,7 +588,7 @@ def _legacy_candidate_row_to_scanner_item(
         slippage_cost = 8.0
         expected_return = max(0.0, min(500.0, score * 1.8))
         expected_risk = 140.0
-        net_edge = expected_return - expected_risk - trading_cost - slippage_cost
+        net_edge = expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS
         return {
             **candidate,
             "raw_score": round(score, 4),
@@ -1359,7 +1359,7 @@ def _with_expected_value_scores(
         _estimate_slippage_cost_bps(candidate)
         - float(quality["slippage_discount_bps"]),
     )
-    net_edge = expected_return - expected_risk - trading_cost - slippage_cost
+net_edge = expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS
     expected_return_score = _score_bps(expected_return, cap_bps=350)
     net_edge_score = _score_bps(net_edge, cap_bps=250)
     expected_risk_score = _score_bps(expected_risk, cap_bps=350)

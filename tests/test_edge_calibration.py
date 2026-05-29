@@ -218,7 +218,7 @@ def test_edge_entry_gate_passes_after_oos_and_top10_thresholds(tmp_path, monkeyp
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_risk_bps", 10_000)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 0)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_win_rate", 0.0)
-    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 30)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 60)
 
     universe_scanner.initialize_universe_db(universe_db)
     with sqlite3.connect(universe_db) as conn:
@@ -266,7 +266,7 @@ def test_edge_gate_uses_expectancy_instead_of_direct_win_rate(monkeypatch):
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 10)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_win_rate", 0.50)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_expectancy_bps", 0)
-    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 30)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 60)
 
     gate = edge_calibration._gate_from_metrics(
         sample_count=5,
@@ -322,7 +322,7 @@ def test_edge_gate_uses_configured_top10_return_threshold(monkeypatch):
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_risk_bps", 10_000)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 20)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_expectancy_bps", 0)
-    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 30)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 60)
 
     gate = edge_calibration._gate_from_metrics(
         sample_count=10,
