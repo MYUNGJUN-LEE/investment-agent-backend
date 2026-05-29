@@ -589,7 +589,7 @@ def _legacy_candidate_row_to_scanner_item(
         slippage_cost = 8.0
         expected_return = max(0.0, min(500.0, score * 1.8))
         expected_risk = 140.0
-        net_edge = expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS
+        net_edge = expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost
         return {
             **candidate,
             "raw_score": round(score, 4),
@@ -1188,6 +1188,7 @@ def _rank_execution_candidates(
             execution_limit=final_limit,
             hurdle_rate=hurdle_rate,
             entry_gate=entry_gate,
+            execution_mode=execution_mode,
         )
         prepared.append(
             {
@@ -1360,7 +1361,7 @@ def _with_expected_value_scores(
         _estimate_slippage_cost_bps(candidate)
         - float(quality["slippage_discount_bps"]),
     )
-    net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)
+    net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)
 
     expected_return_score = _score_bps(expected_return, cap_bps=350)
     net_edge_score = _score_bps(net_edge, cap_bps=250)
@@ -1372,13 +1373,19 @@ def _with_expected_value_scores(
         expected_risk=expected_risk,
         reward_risk=reward_risk,
     )
+
+    decision = str(candidate.get("decision") or "").lower()
+    watch_penalty = 35.0 if decision == "watch" else 0.0
+
     composite_score = (
         raw_score * 0.10
         + expected_return_score * 0.20
         + net_edge_score * 0.45
         - expected_risk_score * 0.20
         + executable_status_bonus
+        - watch_penalty
     )
+
     large_cap_gate = _large_cap_top10_gate(
         {
             **candidate,
@@ -1397,8 +1404,9 @@ def _with_expected_value_scores(
         "composite_score_formula": (
             "raw_score * 0.10 + expected_return_score * 0.20 "
             "+ net_edge_score * 0.45 - expected_risk_score * 0.20 "
-            "+ executable_status_bonus"
+            "+ executable_status_bonus - watch_penalty"
         ),
+        "watch_penalty": round(watch_penalty, 4),
         "executable_status_bonus": round(executable_status_bonus, 4),
         "expires_at": expires_at,
         "edge_model": edge_model_name,
@@ -1416,8 +1424,11 @@ def _execution_status_for_candidate(
     execution_limit: int,
     hurdle_rate: float,
     entry_gate: dict[str, Any],
+    execution_mode: str = "paper",
 ) -> tuple[str, str]:
     reasons = [str(candidate.get("reason") or "")]
+    paper_bootstrap = execution_mode == "paper"
+
     large_cap_gate = candidate.get("large_cap_top10_gate") or _large_cap_top10_gate(candidate)
     if not large_cap_gate.get("passed", True):
         reasons.append(str(large_cap_gate.get("reason") or "large-cap top10 gate blocked"))
@@ -1427,54 +1438,83 @@ def _execution_status_for_candidate(
             f"< required {_to_float(large_cap_gate.get('required_3d_return_bps')) or 0.0:.2f}bps"
         )
         return "ARCHIVED", _join_reasons(reasons)
+
     if rank > execution_limit:
         reasons.append("archived below execution top 10")
         return "ARCHIVED", _join_reasons(reasons)
+
     if candidate.get("decision") == "exclude" or not candidate.get("current_price"):
         reasons.append("not executable")
         return "EXCLUDED", _join_reasons(reasons)
-    if candidate.get("decision") != "buy_candidate":
-        reasons.append("not a buy candidate")
-        return "SKIPPED", _join_reasons(reasons)
+
+    decision = str(candidate.get("decision") or "").lower()
+
+    if paper_bootstrap:
+        if decision not in {"buy_candidate", "watch"}:
+            reasons.append("not a buy/watch candidate")
+            return "SKIPPED", _join_reasons(reasons)
+
+        if decision == "watch":
+            reasons.append("watch candidate allowed as lower-priority paper sub-candidate")
+    else:
+        if decision != "buy_candidate":
+            reasons.append("not a buy candidate")
+            return "SKIPPED", _join_reasons(reasons)
+
     reward_risk = candidate.get("edge_reward_risk") or {}
     expected_value = _to_float(reward_risk.get("expected_value_after_cost_bps"))
-    if expected_value is not None and expected_value <= -10:
-        reasons.append(f"expected value {expected_value:.2f}bps is not positive")
-        return "SKIPPED", _join_reasons(reasons)
-    reward_risk_ratio = _to_float(reward_risk.get("reward_risk_ratio"))
-    if reward_risk_ratio is not None and reward_risk_ratio < 0.5:
-        reasons.append(f"reward/risk {reward_risk_ratio:.2f} is below 0.5")
-        return "SKIPPED", _join_reasons(reasons)
-    net_edge = float(candidate.get("net_edge") or 0)
-    if net_edge <= hurdle_rate:
-        reasons.append(
-            f"net_edge {net_edge:.2f}bps is below worker hurdle {hurdle_rate:.2f}bps"
-        )
-        return "SKIPPED", _join_reasons(reasons)
-    if not entry_gate.get("approved", False):
-        reasons.append(str(entry_gate.get("message") or "entry gate blocked"))
-        return "SKIPPED", _join_reasons(reasons)
-    return "READY", _join_reasons(reasons)
-     # Loosened: allow candidates down to -20bps.
-    min_bootstrap_edge = min(float(hurdle_rate or 0.0), -20.0)
-    if net_edge < min_bootstrap_edge:
-        reasons.append(
-            f"net_edge {net_edge:.2f}bps is below bootstrap threshold {min_bootstrap_edge:.2f}bps"
-        )
-        return "SKIPPED", _join_reasons(reasons)
 
-    # Keep entry gate, but allow paper bootstrap when gate is collecting.
+    if paper_bootstrap:
+        if expected_value is not None and expected_value < -20.0:
+            reasons.append(f"expected value {expected_value:.2f}bps is below -20bps")
+            return "SKIPPED", _join_reasons(reasons)
+    else:
+        if expected_value is not None and expected_value <= 0:
+            reasons.append(f"expected value {expected_value:.2f}bps is not positive")
+            return "SKIPPED", _join_reasons(reasons)
+
+    reward_risk_ratio = _to_float(reward_risk.get("reward_risk_ratio"))
+
+    if paper_bootstrap:
+        if reward_risk_ratio is not None and reward_risk_ratio < 0.5:
+            reasons.append(f"reward/risk {reward_risk_ratio:.2f} is below 0.5")
+            return "SKIPPED", _join_reasons(reasons)
+    else:
+        if reward_risk_ratio is not None and reward_risk_ratio < 1.5:
+            reasons.append(f"reward/risk {reward_risk_ratio:.2f} is below 1.5")
+            return "SKIPPED", _join_reasons(reasons)
+
+    net_edge = float(candidate.get("net_edge") or 0.0)
+
+    if paper_bootstrap:
+        min_bootstrap_edge = min(float(hurdle_rate or 0.0), -20.0)
+        if net_edge < min_bootstrap_edge:
+            reasons.append(
+                f"net_edge {net_edge:.2f}bps is below bootstrap threshold {min_bootstrap_edge:.2f}bps"
+            )
+            return "SKIPPED", _join_reasons(reasons)
+    else:
+        if net_edge <= hurdle_rate:
+            reasons.append(
+                f"net_edge {net_edge:.2f}bps is below worker hurdle {hurdle_rate:.2f}bps"
+            )
+            return "SKIPPED", _join_reasons(reasons)
+
     if not entry_gate.get("approved", False):
         gate_status = str(entry_gate.get("status") or "")
         gate_message = str(entry_gate.get("message") or "entry gate blocked")
 
-        if gate_status in {"collecting", "empty"}:
-            reasons.append(f"entry gate soft-passed during bootstrap: {gate_message}")
+        if paper_bootstrap and gate_status in {"collecting", "empty"}:
+            reasons.append(f"entry gate soft-passed during paper bootstrap: {gate_message}")
         else:
             reasons.append(gate_message)
             return "SKIPPED", _join_reasons(reasons)
 
-    reasons.append("bootstrap executable")
+    reasons.append(
+        "paper bootstrap executable"
+        if paper_bootstrap
+        else "executable"
+    )
     return "READY", _join_reasons(reasons)
 
 
