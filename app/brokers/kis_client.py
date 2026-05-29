@@ -400,6 +400,7 @@ class KisClient:
         complete_snapshot = True
 
         for page_index in range(20):
+            token = self.issue_access_token()
             headers = self._auth_headers(
                 token=token,
                 tr_id=tr_id,
