@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 import re
+import sqlite3
 from typing import Any
 
 from fastapi import Body, FastAPI, Header, HTTPException, Depends, Query, Request
@@ -678,6 +679,96 @@ def scan_universe_and_refresh_samples(
 def latest_trading_universe():
     return get_latest_universe_scan()
 
+@app.post(
+    "/edge-calibration/reset",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="resetEdgeCalibrationData",
+    summary="Reset only edge calibration samples, coefficients, runs, and top10 performance",
+)
+def reset_edge_calibration_data(payload: dict[str, Any] = Body(...)):
+    confirm = str(payload.get("confirm") or "")
+    dry_run = bool(payload.get("dry_run", True))
+
+    if confirm != "RESET_EDGE_CALIBRATION":
+        raise HTTPException(
+            status_code=400,
+            detail="confirm must be exactly RESET_EDGE_CALIBRATION",
+        )
+
+    db_path = settings.storage_path(settings.edge_calibration_db_path)
+
+    tables = [
+        "edge_training_samples",
+        "edge_coefficients",
+        "edge_calibration_runs",
+        "top_candidate_performance",
+        "edge_calibration_meta",
+    ]
+
+    if not db_path.exists():
+        return {
+            "status": "empty",
+            "message": "Edge calibration DB does not exist.",
+            "db_path": str(db_path),
+            "dry_run": dry_run,
+            "tables": [],
+        }
+
+    result_tables = []
+
+    with sqlite3.connect(db_path) as conn:
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        for table in tables:
+            if table not in existing_tables:
+                result_tables.append(
+                    {
+                        "table": table,
+                        "exists": False,
+                        "before_count": None,
+                        "deleted": 0,
+                    }
+                )
+                continue
+
+            before_count = conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+
+            deleted = 0
+            if not dry_run:
+                conn.execute(f"DELETE FROM {table}")
+                deleted = int(before_count or 0)
+
+            result_tables.append(
+                {
+                    "table": table,
+                    "exists": True,
+                    "before_count": int(before_count or 0),
+                    "deleted": deleted,
+                }
+            )
+
+        if not dry_run:
+            conn.commit()
+            conn.execute("VACUUM")
+
+    return {
+        "status": "success",
+        "message": (
+            "Dry run completed. No data was deleted."
+            if dry_run
+            else "Edge calibration DB reset completed."
+        ),
+        "db_path": str(db_path),
+        "dry_run": dry_run,
+        "tables": result_tables,
+    }
 
 @app.get(
     "/edge-calibration/status",
@@ -929,6 +1020,96 @@ def reset_generated_trading_data(payload: dict[str, Any] = Body(...)):
         dry_run=bool(payload.get("dry_run", False)),
     )
 
+@app.post(
+    "/edge-calibration/reset",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="resetEdgeCalibrationData",
+    summary="Reset only edge calibration samples, coefficients, runs, and top10 performance",
+)
+def reset_edge_calibration_data(payload: dict[str, Any] = Body(...)):
+    confirm = str(payload.get("confirm") or "")
+    dry_run = bool(payload.get("dry_run", True))
+
+    if confirm != "RESET_EDGE_CALIBRATION":
+        raise HTTPException(
+            status_code=400,
+            detail="confirm must be exactly RESET_EDGE_CALIBRATION",
+        )
+
+    db_path = settings.storage_path(settings.edge_calibration_db_path)
+
+    tables = [
+        "edge_training_samples",
+        "edge_coefficients",
+        "edge_calibration_runs",
+        "top_candidate_performance",
+        "edge_calibration_meta",
+    ]
+
+    if not db_path.exists():
+        return {
+            "status": "empty",
+            "message": "Edge calibration DB does not exist.",
+            "db_path": str(db_path),
+            "dry_run": dry_run,
+            "tables": [],
+        }
+
+    result_tables = []
+
+    with sqlite3.connect(db_path) as conn:
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        for table in tables:
+            if table not in existing_tables:
+                result_tables.append(
+                    {
+                        "table": table,
+                        "exists": False,
+                        "before_count": None,
+                        "deleted": 0,
+                    }
+                )
+                continue
+
+            before_count = conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+
+            deleted = 0
+            if not dry_run:
+                conn.execute(f"DELETE FROM {table}")
+                deleted = int(before_count or 0)
+
+            result_tables.append(
+                {
+                    "table": table,
+                    "exists": True,
+                    "before_count": int(before_count or 0),
+                    "deleted": deleted,
+                }
+            )
+
+        if not dry_run:
+            conn.commit()
+            conn.execute("VACUUM")
+
+    return {
+        "status": "success",
+        "message": (
+            "Dry run completed. No data was deleted."
+            if dry_run
+            else "Edge calibration DB reset completed."
+        ),
+        "db_path": str(db_path),
+        "dry_run": dry_run,
+        "tables": result_tables,
+    }
 
 @app.get(
     "/edge-calibration/gate",
