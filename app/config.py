@@ -128,7 +128,7 @@ class Settings(BaseSettings):
     monitor_market_keywords: str = "코스피,코스닥,환율,금리,반도체,AI"
     monitor_price_interval_seconds: int = 60
     monitor_disclosure_interval_seconds: int = 300
-    monitor_news_interval_seconds: int = 600
+    monitor_news_interval_seconds: int = 1800
     monitor_surge_change_pct: float = 5.0
     monitor_drop_change_pct: float = -5.0
     monitor_volume_spike_ratio: float = 3.0

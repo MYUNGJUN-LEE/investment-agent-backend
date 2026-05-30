@@ -2415,7 +2415,7 @@ def _top10_performance_from_store(
         "reward_risk_ratio": round(avg_win / avg_loss, 4) if avg_loss else None,
         "expectancy_bps": round(expectancy, 4),
         "expectancy_formula": "E = (win_rate * avg_win_bps) - (loss_rate * avg_loss_bps)",
-        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)",
+        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
         "composite_score_formula": COMPOSITE_SCORE_FORMULA,
     }
@@ -2457,7 +2457,7 @@ def _empty_top10_performance(limit: int | None = None) -> dict[str, Any]:
         "avg_loss_bps": None,
         "reward_risk_ratio": None,
         "expectancy_bps": None,
-        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)",
+        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
     }
 
@@ -2578,7 +2578,7 @@ def _empty_sample_summary() -> dict[str, Any]:
         "net_edge_win_count": 0,
         "net_edge_loss_count": 0,
         "net_edge_win_rate": None,
-        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)",
+        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
     }
 
@@ -2631,7 +2631,7 @@ def _sample_summary_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "net_edge_win_count": net_edge_win_count,
         "net_edge_loss_count": net_edge_loss_count,
         "net_edge_win_rate": round(net_edge_win_count / sample_count, 4),
-        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - TRADING_COST_BPS - SLIPPAGE_COST_BPS)",
+        "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
         "composite_score_formula": COMPOSITE_SCORE_FORMULA,
     }
