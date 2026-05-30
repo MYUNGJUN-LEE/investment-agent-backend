@@ -30,7 +30,7 @@ services:
       - key: TRADE_ORCHESTRATOR_ENABLED
         value: "true"
       - key: TRADE_ORCHESTRATOR_INTERVAL_SECONDS
-        value: "60"
+        value: "300"
       - key: TRADE_ORCHESTRATOR_EXECUTE_ENTRIES
         value: "true"
       - key: TRADE_ORCHESTRATOR_BASE_POSITION_WEIGHT
@@ -106,11 +106,11 @@ services:
       - key: EDGE_CALIBRATION_GATE_MIN_FILL_ADJUSTED_EDGE_BPS
         value: "60"
       - key: MONITOR_PRICE_INTERVAL_SECONDS
-        value: "60"
+        value: "300"
       - key: MONITOR_DISCLOSURE_INTERVAL_SECONDS
         value: "300"
       - key: MONITOR_NEWS_INTERVAL_SECONDS
-        value: "600"
+        value: "7200"
       - key: BROKER_SYNC_INTERVAL_SECONDS
         value: "60"
       - key: BROKER_SYNC_CONFIG_ERROR_BACKOFF_SECONDS

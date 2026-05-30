@@ -338,7 +338,7 @@ def test_opendart_watch_filters_watchlist_and_dedupes(tmp_path, monkeypatch):
 def test_process_due_monitor_jobs_uses_configured_intervals(tmp_path, monkeypatch):
     db_path = tmp_path / "monitor.sqlite3"
     monkeypatch.setattr(settings, "market_monitor_enabled", True)
-    monkeypatch.setattr(settings, "monitor_price_interval_seconds", 60)
+    monkeypatch.setattr(settings, "monitor_price_interval_seconds", 300)
     monkeypatch.setattr(settings, "monitor_disclosure_interval_seconds", 300)
     monkeypatch.setattr(settings, "monitor_news_interval_seconds", 600)
     calls = []
