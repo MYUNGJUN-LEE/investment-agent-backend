@@ -340,7 +340,7 @@ def test_process_due_monitor_jobs_uses_configured_intervals(tmp_path, monkeypatc
     monkeypatch.setattr(settings, "market_monitor_enabled", True)
     monkeypatch.setattr(settings, "monitor_price_interval_seconds", 300)
     monkeypatch.setattr(settings, "monitor_disclosure_interval_seconds", 300)
-    monkeypatch.setattr(settings, "monitor_news_interval_seconds", 600)
+    monkeypatch.setattr(settings, "monitor_news_interval_seconds", 3600)
     calls = []
 
     def fake_run_monitor_job(name, db_path=None):

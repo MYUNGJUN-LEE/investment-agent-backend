@@ -774,7 +774,7 @@ def test_universe_scanner_collects_symbols_sequentially(monkeypatch):
 
 def test_universe_scanner_stops_collection_at_scan_deadline(monkeypatch):
     clock = {"value": 0.0}
-    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_scan_seconds", 60)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_scan_seconds", 300)
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_symbol_interval_seconds", 0)
     monkeypatch.setattr(universe_scanner.time_module, "monotonic", lambda: clock["value"])
 

@@ -1442,7 +1442,7 @@ def test_stale_worker_cannot_overwrite_recovered_cycle(tmp_path):
 
 
 def test_auto_trading_worker_lock_has_long_scan_floor(monkeypatch):
-    monkeypatch.setattr(settings, "auto_trading_worker_lock_seconds", 60)
+    monkeypatch.setattr(settings, "auto_trading_worker_lock_seconds", 600)
     monkeypatch.setattr(settings, "universe_scanner_max_source_symbols", 100)
     monkeypatch.setattr(settings, "universe_scanner_symbol_interval_seconds", 60)
     monkeypatch.setattr(settings, "universe_scanner_symbol_interval_cap_seconds", 2)

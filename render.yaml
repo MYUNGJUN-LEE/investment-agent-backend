@@ -18,9 +18,9 @@ services:
       - key: MARKET_MONITOR_ENABLED
         value: "true"
       - key: AUTO_TRADING_WORKER_POLL_SECONDS
-        value: "2"
+        value: "30"
       - key: AUTO_TRADING_WORKER_LOCK_SECONDS
-        value: "7200"
+        value: "600"
       - key: AUTO_TRADING_SYMBOL_WORKERS
         value: "1"
       - key: AUTO_TRADING_MAX_OPEN_POSITIONS
@@ -30,7 +30,7 @@ services:
       - key: TRADE_ORCHESTRATOR_ENABLED
         value: "true"
       - key: TRADE_ORCHESTRATOR_INTERVAL_SECONDS
-        value: "300"
+        value: "600"
       - key: TRADE_ORCHESTRATOR_EXECUTE_ENTRIES
         value: "true"
       - key: TRADE_ORCHESTRATOR_BASE_POSITION_WEIGHT
@@ -72,7 +72,7 @@ services:
       - key: EDGE_CALIBRATION_FUTURE_PRICE_LIMIT
         value: "1200"
       - key: EDGE_CALIBRATION_REFRESH_AFTER_SCAN
-        value: "true"
+        value: "false"
       - key: EDGE_CALIBRATION_MIN_LABEL_AGE_SECONDS
         value: "300"
       - key: EDGE_CALIBRATION_MIN_FUTURE_SNAPSHOTS
@@ -108,9 +108,9 @@ services:
       - key: MONITOR_PRICE_INTERVAL_SECONDS
         value: "300"
       - key: MONITOR_DISCLOSURE_INTERVAL_SECONDS
-        value: "300"
+        value: "3600"
       - key: MONITOR_NEWS_INTERVAL_SECONDS
-        value: "7200"
+        value: "3600"
       - key: BROKER_SYNC_INTERVAL_SECONDS
         value: "60"
       - key: BROKER_SYNC_CONFIG_ERROR_BACKOFF_SECONDS

@@ -630,7 +630,7 @@ def _collect_price_snapshots(
     snapshots: list[dict[str, Any]] = []
     symbol_interval_seconds = _scanner_symbol_interval_seconds()
     started = time_module.monotonic()
-    max_seconds = max(60.0, float(settings.universe_scanner_max_scan_seconds or 900))
+    max_seconds = max(60.0, float(settings.universe_scanner_max_scan_seconds or 300))
     timed_out = False
     message: str | None = None
     for index, (symbol, name) in enumerate(source_symbols.items()):
@@ -1361,7 +1361,8 @@ def _with_expected_value_scores(
         _estimate_slippage_cost_bps(candidate)
         - float(quality["slippage_discount_bps"]),
     )
-    net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)
+    liquidity_drag = float((calibrated or {}).get("liquidity_drag_bps") or 0.0)
+    net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost - liquidity_drag)
 
     expected_return_score = _score_bps(expected_return, cap_bps=350)
     net_edge_score = _score_bps(net_edge, cap_bps=250)
@@ -1414,6 +1415,7 @@ def _with_expected_value_scores(
         "edge_quality_reasons": quality["reasons"],
         "edge_reward_risk": reward_risk,
         "large_cap_top10_gate": large_cap_gate,
+        "liquidity_drag_bps": round(liquidity_drag, 4),
     }
 
 
@@ -1545,6 +1547,18 @@ def _estimate_expected_return_bps(candidate: dict[str, Any], raw_score: float) -
     minute_component = min(10.0, max(0.0, minute_volume_ratio - 1.0) * 4.0)
     news_component = min(25.0, news_count * 5.0)
     disclosure_component = min(24.0, disclosure_count * 8.0)
+    momentum_score = _to_float(candidate.get("momentum_score")) or 50.0
+    atr_pct = _to_float(technical.get("atr_14_pct"))
+    quality_breakout_bonus = 0.0
+
+    if (
+        momentum_score >= 65.0
+        and 1.3 <= volume_ratio <= 4.0
+        and atr_pct is not None
+        and 0.015 <= atr_pct <= 0.075
+        and 0.0 <= change_rate <= 5.0
+    ):
+        quality_breakout_bonus = 35.0
     expected = (
         35.0
         + score_component
@@ -1555,6 +1569,7 @@ def _estimate_expected_return_bps(candidate: dict[str, Any], raw_score: float) -
         + minute_component
         + news_component
         + disclosure_component
+        + quality_breakout_bonus
     )
     if candidate.get("price_source") == "latest_close":
         expected *= 0.55
@@ -1648,6 +1663,14 @@ def _swing_edge_quality(candidate: dict[str, Any], raw_score: float) -> dict[str
         reasons.append("20d high breakout")
     if technical.get("low_breakdown_20d"):
         score -= 28.0
+    
+    gap_up_pct = _to_float(candidate.get("gap_up_pct"))
+    if gap_up_pct is not None:
+        if gap_up_pct >= 5.0:
+            score -= 18.0
+            reasons.append("gap-up exhaustion risk")
+        elif gap_up_pct >= 3.0:
+            score -= 8.0
 
     ma20_slope = _to_float(technical.get("ma20_slope"))
     if ma20_slope is not None:
@@ -2357,20 +2380,19 @@ def _plus_seconds(value: str, seconds: int | float) -> str:
 def _worker_hurdle_rate_bps(execution_mode: str = "paper") -> float:
     configured = float(settings.universe_scanner_worker_hurdle_rate_bps or 0.0)
 
-    # Paper bootstrap can allow slightly negative net edge to create samples.
-    if execution_mode == "paper":
-        configured = max(-20.0, configured)
-    else:
-        configured = max(0.0, configured)
-
     if execution_mode != "paper":
-        return configured
+        return max(0.0, configured)
+
+    # Paper bootstrap: positive configured hurdle should not block sample collection.
+    if configured > 0:
+        configured = -20.0
+    else:
+        configured = max(-20.0, configured)
 
     achieved = _paper_average_realized_return_bps()
     if achieved is None:
         return configured
 
-    # During bootstrap, do not let old paper realized average raise hurdle too much.
     return min(max(configured, achieved), 20.0)
 
 

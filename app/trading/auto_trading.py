@@ -553,6 +553,15 @@ def _edge_entry_gate_for_mode(
             raise
         return edge_entry_gate(candidates)
 
+def _scanner_hurdle_rate_for_mode(execution_mode: str) -> float:
+    configured = float(settings.universe_scanner_worker_hurdle_rate_bps or 0.0)
+
+    if execution_mode == "paper":
+        if configured > 0:
+            return -20.0
+        return max(-20.0, configured)
+
+    return max(0.0, configured)
 
 def _entry_symbols_from_scanner_candidates(
     *,
@@ -561,7 +570,7 @@ def _entry_symbols_from_scanner_candidates(
     open_symbols: set[str],
 ) -> list[AutoTradeSymbolConfig]:
     now = _now()
-    hurdle_rate = float(settings.universe_scanner_worker_hurdle_rate_bps or 0.0)
+    hurdle_rate = _scanner_hurdle_rate_for_mode(req.execution_mode)
     rows = sorted(
         active_candidates,
         key=lambda item: (

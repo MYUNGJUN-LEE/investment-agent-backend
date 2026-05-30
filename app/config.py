@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     live_trading_confirm_token: str | None = None
 
     # Trading cost assumptions. Override these per broker/account in .env.
-    commission_rate: float = 0.00015
+    commission_rate: float = 0.00147
     kr_stock_sell_tax_rate: float = 0.002
     us_fx_spread_bps: float = 5.0
     default_fill_probability: float = 0.95
@@ -59,14 +59,14 @@ class Settings(BaseSettings):
     max_order_api_retries: int = 1
     max_order_price_deviation_bps: float = 300.0
     auto_trading_db_path: str = "data/auto_trading.sqlite3"
-    auto_trading_worker_poll_seconds: float = 2.0
-    auto_trading_worker_lock_seconds: int = 7200
+    auto_trading_worker_poll_seconds: float = 30
+    auto_trading_worker_lock_seconds: int = 600
     auto_trading_stale_lock_recover_seconds: int = 1200
     auto_trading_symbol_workers: int = 1
     auto_trading_max_open_positions: int = 5
     auto_trading_one_session_per_account: bool = True
     trade_orchestrator_enabled: bool = True
-    trade_orchestrator_interval_seconds: int = 60
+    trade_orchestrator_interval_seconds: int = 600
     trade_orchestrator_execute_entries: bool = True
     trade_orchestrator_base_position_weight: float = 0.10
     trade_orchestrator_min_position_weight: float = 0.05
@@ -90,7 +90,7 @@ class Settings(BaseSettings):
     edge_calibration_label_snapshots_enabled: bool = True
     edge_calibration_label_snapshot_max_symbols: int = 200
     edge_calibration_refresh_batch_size: int = 500
-    edge_calibration_refresh_after_scan: bool = True
+    edge_calibration_refresh_after_scan: bool = False
     edge_calibration_min_label_age_seconds: int = 300
     edge_calibration_min_future_snapshots: int = 2
     edge_calibration_label_at_horizon_end: bool = True
@@ -126,9 +126,9 @@ class Settings(BaseSettings):
     market_monitor_db_path: str = "data/market_monitor.sqlite3"
     monitor_watchlist_symbols: str = ""
     monitor_market_keywords: str = "코스피,코스닥,환율,금리,반도체,AI"
-    monitor_price_interval_seconds: int = 60
-    monitor_disclosure_interval_seconds: int = 300
-    monitor_news_interval_seconds: int = 1800
+    monitor_price_interval_seconds: int = 300
+    monitor_disclosure_interval_seconds: int = 3600
+    monitor_news_interval_seconds: int = 3600
     monitor_surge_change_pct: float = 5.0
     monitor_drop_change_pct: float = -5.0
     monitor_volume_spike_ratio: float = 3.0
@@ -151,7 +151,7 @@ class Settings(BaseSettings):
     universe_scanner_news_enrichment_enabled: bool = False
     universe_scanner_disclosure_enrichment_enabled: bool = False
     universe_scanner_min_scanned_symbols_for_trading: int = 15
-    universe_scanner_max_scan_seconds: int = 900
+    universe_scanner_max_scan_seconds: int = 300
     universe_scanner_candidate_ttl_seconds: int = 7200
     universe_scanner_worker_hurdle_rate_bps: float = 40.0
     universe_scanner_default_spread_bps: float = 5.0
