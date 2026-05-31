@@ -23,6 +23,49 @@ def stable_market_context(monkeypatch):
     )
 
 
+def test_kospi_csv_sources_keep_priority_and_bypass_normal_cap(tmp_path, monkeypatch):
+    csv_path = tmp_path / "kospi_symbols.csv"
+    csv_path.write_text(
+        "symbol,name,market\n"
+        "123456,KOSPI One,KOSPI\n"
+        "234567,KOSPI Two,KOSPI\n"
+        "KOSPI,Index,KOSPI\n"
+        "035900,KOSDAQ Duplicate,KOSDAQ\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(universe_scanner.settings, "universe_include_kospi", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_symbol_source", "csv")
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_scan_all", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_full_scan_enabled", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_full_scan_max_symbols", 0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_csv_path", str(csv_path))
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_kospi_cache_path",
+        str(tmp_path / "kospi.sqlite3"),
+    )
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 1)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_seed_symbols", "005930")
+    monkeypatch.setattr(universe_scanner.settings, "monitor_watchlist_symbols", "000660")
+
+    req = AutoTradeStartRequest(
+        symbols=[AutoTradeSymbolConfig(symbol="035900", name="Explicit JYP")],
+        universe_seed_symbols=["000660"],
+    )
+    source_symbols, diagnostics = universe_scanner._resolve_source_symbols_with_diagnostics(req)
+
+    assert list(source_symbols)[:5] == ["035900", "000660", "005930", "123456", "234567"]
+    assert diagnostics["max_source_cap_bypassed_for_full_kospi"] is True
+    assert diagnostics["source_symbol_count_after_caps"] > 1
+    assert diagnostics["kospi_count"] == 2
+    assert "KOSPI" not in source_symbols
+
+    legacy_sources = universe_scanner._resolve_source_symbols(req)
+    assert legacy_sources["035900"] == "Explicit JYP"
+    assert legacy_sources["123456"] == "KOSPI One"
+
+
 def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monkeypatch):
     db_path = tmp_path / "universe.sqlite3"
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_seed_symbols", "")

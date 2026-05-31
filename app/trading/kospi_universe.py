@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+from contextlib import closing
+from datetime import datetime
+import csv
+import json
+from pathlib import Path
+import sqlite3
+from typing import Any
+
+from app.config import settings
+
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS kospi_symbols (
+    symbol TEXT PRIMARY KEY,
+    name TEXT,
+    market TEXT NOT NULL DEFAULT 'KOSPI',
+    source TEXT,
+    updated_at TEXT NOT NULL,
+    raw_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kospi_symbols_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+def _now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def _db_path(db_path: Path | str | None = None) -> Path:
+    return settings.storage_path(db_path or settings.universe_kospi_cache_path)
+
+
+def _csv_path(csv_path: Path | str | None = None) -> Path:
+    return settings.storage_path(csv_path or settings.universe_kospi_csv_path)
+
+
+def _normalize_symbol(value: Any) -> str:
+    raw = str(value or "").strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits:
+        return digits.zfill(6)[-6:]
+    return raw
+
+
+def _normalize_item(item: Any, *, source: str) -> dict[str, Any] | None:
+    if isinstance(item, dict):
+        symbol = _normalize_symbol(
+            item.get("symbol")
+            or item.get("code")
+            or item.get("ticker")
+            or item.get("종목코드")
+        )
+        name = item.get("name") or item.get("종목명") or item.get("company_name")
+        market = item.get("market") or item.get("시장구분") or "KOSPI"
+        raw_json = item
+    else:
+        symbol = _normalize_symbol(item)
+        name = None
+        market = "KOSPI"
+        raw_json = {"symbol": item}
+
+    market_text = str(market or "KOSPI").strip().upper()
+    if "KOSDAQ" in market_text or (market_text and "KOSPI" not in market_text and market_text != "KS"):
+        return None
+
+    if not symbol or not symbol.isdigit() or len(symbol) != 6:
+        return None
+
+    return {
+        "symbol": symbol,
+        "name": str(name).strip() if name is not None and str(name).strip() else None,
+        "market": "KOSPI",
+        "source": source,
+        "raw_json": raw_json,
+    }
+
+
+def _apply_limit(items: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    if limit is None or int(limit or 0) <= 0:
+        return items
+    return items[: max(0, int(limit))]
+
+
+def initialize_kospi_universe_cache(db_path: Path | str | None = None) -> None:
+    path = _db_path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as conn:
+        conn.executescript(SCHEMA_SQL)
+        conn.commit()
+
+
+def upsert_kospi_symbols(
+    symbols: list[dict[str, Any]] | list[str],
+    *,
+    source: str = "manual",
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    initialize_kospi_universe_cache(db_path)
+    path = _db_path(db_path)
+    updated_at = _now()
+    inserted = 0
+    skipped = 0
+
+    with closing(sqlite3.connect(path)) as conn:
+        for item in symbols:
+            normalized = _normalize_item(item, source=source)
+            if normalized is None:
+                skipped += 1
+                continue
+
+            conn.execute(
+                """
+                INSERT INTO kospi_symbols (
+                    symbol, name, market, source, updated_at, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    name = excluded.name,
+                    market = excluded.market,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at,
+                    raw_json = excluded.raw_json
+                """,
+                (
+                    normalized["symbol"],
+                    normalized.get("name"),
+                    normalized.get("market") or "KOSPI",
+                    source,
+                    updated_at,
+                    json.dumps(normalized.get("raw_json") or normalized, ensure_ascii=False, default=str),
+                ),
+            )
+            inserted += 1
+
+        conn.execute(
+            """
+            INSERT INTO kospi_symbols_meta (key, value, updated_at)
+            VALUES ('last_refresh_at', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (updated_at, updated_at),
+        )
+        conn.commit()
+
+    return {
+        "status": "success",
+        "inserted": inserted,
+        "skipped": skipped,
+        "source": source,
+        "updated_at": updated_at,
+    }
+
+
+def load_cached_kospi_symbols(
+    *,
+    limit: int | None = None,
+    db_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    path = _db_path(db_path)
+    if not path.exists():
+        return []
+
+    sql = """
+        SELECT symbol, name, market, source, updated_at, raw_json
+        FROM kospi_symbols
+        ORDER BY symbol ASC
+    """
+    params: tuple[Any, ...] = ()
+    if limit is not None and int(limit or 0) > 0:
+        sql += " LIMIT ?"
+        params = (int(limit),)
+
+    try:
+        with closing(sqlite3.connect(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+    except sqlite3.Error:
+        return []
+
+    return [
+        {
+            "symbol": row["symbol"],
+            "name": row["name"],
+            "market": row["market"] or "KOSPI",
+            "source": "kospi",
+            "source_detail": row["source"] or "cache",
+        }
+        for row in rows
+        if row["symbol"]
+    ]
+
+
+def load_kospi_symbols_from_csv(
+    *,
+    limit: int | None = None,
+    csv_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    path = _csv_path(csv_path)
+    if not path.exists():
+        return []
+
+    items: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames:
+                return []
+            for row in reader:
+                normalized = _normalize_item(row, source="kospi")
+                if normalized is None:
+                    continue
+                normalized["source_detail"] = "csv"
+                items.append(
+                    {
+                        "symbol": normalized["symbol"],
+                        "name": normalized.get("name"),
+                        "market": "KOSPI",
+                        "source": "kospi",
+                        "source_detail": "csv",
+                    }
+                )
+                if limit is not None and int(limit or 0) > 0 and len(items) >= int(limit):
+                    break
+    except (OSError, csv.Error, UnicodeError):
+        return []
+
+    return items
+
+
+def kospi_universe_cache_status(
+    *,
+    db_path: Path | str | None = None,
+    csv_path: Path | str | None = None,
+) -> dict[str, Any]:
+    cache_path = _db_path(db_path)
+    csv_file = _csv_path(csv_path)
+    cache_status: dict[str, Any] = {
+        "enabled": bool(settings.universe_include_kospi),
+        "source": str(settings.universe_kospi_symbol_source or "csv"),
+        "cache_path": str(cache_path),
+        "csv_path": str(csv_file),
+        "csv_exists": csv_file.exists(),
+    }
+
+    if not cache_path.exists():
+        return {**cache_status, "status": "missing", "cached_count": 0}
+
+    try:
+        with closing(sqlite3.connect(cache_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            count = conn.execute("SELECT COUNT(*) FROM kospi_symbols").fetchone()[0]
+            row = conn.execute(
+                "SELECT value FROM kospi_symbols_meta WHERE key = 'last_refresh_at'"
+            ).fetchone()
+    except sqlite3.Error as exc:
+        return {**cache_status, "status": "error", "message": str(exc)}
+
+    last_refresh = str(row["value"]) if row else None
+    age_seconds = None
+    stale = True
+    if last_refresh:
+        try:
+            dt = datetime.fromisoformat(last_refresh.replace("Z", "+00:00")).replace(tzinfo=None)
+            age_seconds = (datetime.utcnow() - dt).total_seconds()
+            stale = age_seconds > float(settings.universe_kospi_cache_ttl_seconds or 86400)
+        except Exception:
+            stale = True
+
+    return {
+        **cache_status,
+        "status": "ready",
+        "cached_count": int(count or 0),
+        "last_refresh_at": last_refresh,
+        "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+        "stale": stale,
+    }
+
+
+def _load_from_existing_kis_helper(limit: int | None) -> list[dict[str, Any]]:
+    try:
+        from app.data_sources import kis as kis_source
+
+        fetcher = getattr(kis_source, "fetch_kospi_symbols", None)
+        if fetcher is None:
+            fetcher = getattr(kis_source, "fetch_kospi_stock_symbols", None)
+        if fetcher is None:
+            return []
+        data = fetcher()
+    except Exception:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+    for item in data:
+        normalized = _normalize_item(item, source="kospi")
+        if normalized is None:
+            continue
+        items.append(
+            {
+                "symbol": normalized["symbol"],
+                "name": normalized.get("name"),
+                "market": "KOSPI",
+                "source": "kospi",
+                "source_detail": "kis",
+            }
+        )
+        if limit is not None and int(limit or 0) > 0 and len(items) >= int(limit):
+            break
+    return items
+
+
+def load_kospi_symbols(
+    *,
+    limit: int | None = None,
+    scan_all: bool | None = None,
+) -> list[dict[str, Any]]:
+    if not bool(settings.universe_include_kospi):
+        return []
+
+    source = str(settings.universe_kospi_symbol_source or "csv").strip().lower()
+    if source == "disabled":
+        return []
+
+    scan_all = bool(settings.universe_kospi_scan_all) if scan_all is None else bool(scan_all)
+    if scan_all and (limit is None or int(limit or 0) <= 0):
+        effective_limit = None
+    else:
+        configured = int(limit if limit is not None else settings.universe_kospi_symbol_limit or 0)
+        effective_limit = configured if configured > 0 else None
+
+    if source == "cache":
+        return _apply_limit(load_cached_kospi_symbols(limit=effective_limit), effective_limit)
+    if source == "kis":
+        return _apply_limit(_load_from_existing_kis_helper(effective_limit), effective_limit)
+    if source == "csv":
+        return _apply_limit(load_kospi_symbols_from_csv(limit=effective_limit), effective_limit)
+
+    cached = load_cached_kospi_symbols(limit=effective_limit)
+    if cached:
+        return _apply_limit(cached, effective_limit)
+    return _apply_limit(load_kospi_symbols_from_csv(limit=effective_limit), effective_limit)

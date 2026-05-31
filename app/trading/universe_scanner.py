@@ -15,6 +15,10 @@ from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.services.naver_news import search_naver_news
 from app.storage.market_data import get_latest_market_context
 from app.trading.corporate_events import corporate_event_check
+from app.trading.kospi_universe import (
+    kospi_universe_cache_status,
+    load_kospi_symbols,
+)
 from app.trading.edge_calibration import (
     edge_entry_gate,
     estimate_expected_edges,
@@ -234,13 +238,32 @@ def scan_universe_for_auto_trade(
         int(settings.universe_scanner_final_limit or 10),
         candidate_limit,
     )
-    source_symbols = _resolve_source_symbols(req)
+    source_symbols, universe_sources = _resolve_source_symbols_with_diagnostics(req)
     scan_id = f"scan-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
     created_at = _now()
     path = _db_path(db_path)
     initialize_universe_db(path)
 
-    snapshots, collection = _collect_price_snapshots(source_symbols)
+    reuse = _reuse_recent_scan_if_fresh(
+        path=path,
+        req=req,
+        worker_id=worker_id,
+        final_limit=final_limit,
+        hurdle_rate=_worker_hurdle_rate_bps(req.execution_mode),
+        universe_sources=universe_sources,
+    )
+    if reuse is not None:
+        return reuse
+
+    snapshots, collection = _collect_price_snapshots_for_mode(
+        source_symbols,
+        full_scan=bool(universe_sources.get("full_kospi_scan")),
+    )
+    universe_sources["batch_count"] = collection.get("batch_count", 1)
+    universe_sources["batch_error_count"] = collection.get(
+        "batch_error_count",
+        collection.get("error_count", 0),
+    )
     snapshots, cleaning = _clean_universe_snapshots(snapshots)
     _record_snapshots(path, scan_id, created_at, snapshots)
 
@@ -286,6 +309,8 @@ def scan_universe_for_auto_trade(
         "status": "partial" if collection["timed_out"] else "success",
         "created_at": created_at,
         "source_symbol_count": len(source_symbols),
+        "universe_sources": universe_sources,
+        "kospi_universe": universe_sources.get("kospi_universe"),
         "snapshot_count": len(snapshots),
         "snapshot_error_count": collection["error_count"],
         "cleaning_excluded_count": cleaning["excluded_count"],
@@ -293,6 +318,7 @@ def scan_universe_for_auto_trade(
         "snapshot_collection_seconds": collection["elapsed_seconds"],
         "snapshot_collection_timed_out": collection["timed_out"],
         "snapshot_collection_message": collection.get("message"),
+        "snapshot_batch_diagnostics": collection.get("batch_diagnostics", []),
         "candidate_limit": candidate_limit,
         "final_limit": final_limit,
         "candidate_count": len(candidates),
@@ -345,6 +371,75 @@ def get_latest_universe_scan(db_path: Path | str | None = None) -> dict[str, Any
     raw = _parse_json(run["raw_json"], {})
     raw["candidates"] = [dict(row) for row in candidates]
     return raw
+
+
+def _reuse_recent_scan_if_fresh(
+    *,
+    path: Path,
+    req: AutoTradeStartRequest,
+    worker_id: str | None,
+    final_limit: int,
+    hurdle_rate: float,
+    universe_sources: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not bool(universe_sources.get("full_kospi_scan")):
+        return None
+    if req.symbols or req.universe_seed_symbols:
+        return None
+
+    min_interval = max(0, int(settings.universe_scanner_min_interval_seconds or 0))
+    if min_interval <= 0:
+        return None
+
+    latest = get_latest_universe_scan(path)
+    if latest.get("status") == "empty":
+        return None
+
+    created_at = _parse_snapshot_datetime(latest.get("created_at"))
+    if created_at is None:
+        return None
+
+    now = datetime.now(created_at.tzinfo) if created_at.tzinfo is not None else datetime.now()
+    age_seconds = max(0.0, (now - created_at).total_seconds())
+    if age_seconds > min_interval:
+        return None
+
+    active_candidates = [
+        item
+        for item in get_active_scanner_candidates(
+            db_path=path,
+            limit=final_limit,
+            include_expired=False,
+        )
+        if item.get("status") in {"READY", "CLAIMED"}
+        and float(item.get("net_edge") or 0.0) > hurdle_rate
+    ]
+    symbols = [
+        _to_symbol_config(req, candidate)
+        for candidate in active_candidates
+        if candidate.get("current_price")
+    ]
+
+    merged_sources = {
+        **(latest.get("universe_sources") or {}),
+        **universe_sources,
+        "reused_scan": True,
+        "reuse_age_seconds": round(age_seconds, 3),
+        "reuse_min_interval_seconds": min_interval,
+    }
+
+    latest = {
+        **latest,
+        "reused_scan": True,
+        "reuse_age_seconds": round(age_seconds, 3),
+        "worker_id": worker_id,
+        "universe_sources": merged_sources,
+        "kospi_universe": universe_sources.get("kospi_universe"),
+        "ready_candidates": _compact_candidates(active_candidates),
+        "symbols": symbols,
+        "executable_count": len(symbols),
+    }
+    return latest
 
 
 def get_ready_execution_candidates(
@@ -610,35 +705,295 @@ def _legacy_candidate_row_to_scanner_item(
 
 
 def _resolve_source_symbols(req: AutoTradeStartRequest) -> dict[str, str | None]:
-    symbols: dict[str, str | None] = {}
-    for item in req.symbols:
-        symbols[_normalize_symbol(item.symbol)] = item.name
-    for raw in req.universe_seed_symbols:
-        symbols.setdefault(_normalize_symbol(raw), None)
-    for raw in _comma_list(settings.universe_scanner_seed_symbols):
-        symbols.setdefault(_normalize_symbol(raw), None)
-    for raw in _comma_list(settings.monitor_watchlist_symbols):
-        symbols.setdefault(_normalize_symbol(raw), None)
-    for symbol, name in DEFAULT_UNIVERSE.items():
-        symbols.setdefault(symbol, name)
-    max_symbols = max(1, int(settings.universe_scanner_max_source_symbols or 15))
+    source_symbols, _ = _resolve_source_symbols_with_diagnostics(req)
     return {
-        symbol: name
-        for symbol, name in list(symbols.items())[:max_symbols]
-        if symbol
+        symbol: item.get("name")
+        for symbol, item in source_symbols.items()
+    }
+
+
+def _resolve_source_symbols_with_diagnostics(
+    req: AutoTradeStartRequest,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    raw_items: list[dict[str, Any]] = []
+
+    raw_items.extend(
+        _source_item(
+            item.symbol,
+            name=item.name,
+            source="explicit",
+            market=None,
+        )
+        for item in req.symbols
+    )
+    raw_items.extend(
+        _source_item(raw, source="seed")
+        for raw in req.universe_seed_symbols
+    )
+    raw_items.extend(
+        _source_item(raw, source="seed")
+        for raw in _comma_list(settings.universe_scanner_seed_symbols)
+    )
+    raw_items.extend(
+        _source_item(raw, source="watchlist")
+        for raw in _comma_list(settings.monitor_watchlist_symbols)
+    )
+
+    kospi_items: list[dict[str, Any]] = []
+    kospi_status = kospi_universe_cache_status()
+    if _kospi_source_enabled():
+        kospi_limit: int | None = None
+        if not bool(settings.universe_kospi_scan_all):
+            configured_limit = int(settings.universe_kospi_symbol_limit or 0)
+            kospi_limit = configured_limit if configured_limit > 0 else None
+        try:
+            kospi_items = load_kospi_symbols(
+                limit=kospi_limit,
+                scan_all=bool(settings.universe_kospi_scan_all),
+            )
+        except Exception:
+            kospi_items = []
+        raw_items.extend(
+            _source_item(
+                item.get("symbol"),
+                name=item.get("name"),
+                source=item.get("source") or "kospi",
+                market=item.get("market") or "KOSPI",
+                source_detail=item.get("source_detail"),
+            )
+            for item in kospi_items
+            if isinstance(item, dict)
+        )
+
+    raw_items.extend(
+        _source_item(
+            symbol,
+            name=name,
+            source="default",
+            market=DEFAULT_UNIVERSE_MARKETS.get(symbol, "KOSDAQ"),
+            universe_profile=DEFAULT_UNIVERSE_PROFILE.get(symbol),
+        )
+        for symbol, name in DEFAULT_UNIVERSE.items()
+    )
+
+    raw_items = [item for item in raw_items if item.get("symbol")]
+    before_dedupe = len(raw_items)
+
+    if bool(settings.universe_prioritize_kospi):
+        indexed = list(enumerate(raw_items))
+        indexed.sort(key=lambda pair: (_source_priority(pair[1]), pair[0]))
+        raw_items = [item for _, item in indexed]
+
+    source_symbols = _dedupe_source_symbols(raw_items)
+    after_dedupe = len(source_symbols)
+
+    full_kospi_scan = _full_kospi_scan_enabled() and bool(kospi_items)
+    normal_cap = max(1, int(settings.universe_scanner_max_source_symbols or 15))
+    max_full = int(settings.universe_full_scan_max_symbols or 0)
+    max_source_cap_bypassed = False
+    max_source_cap_applied_after_priority_sort: int | None = None
+
+    if full_kospi_scan:
+        max_source_cap_bypassed = True
+        if max_full > 0:
+            source_symbols = dict(list(source_symbols.items())[:max_full])
+            max_source_cap_applied_after_priority_sort = max_full
+    else:
+        source_symbols = dict(list(source_symbols.items())[:normal_cap])
+        max_source_cap_applied_after_priority_sort = normal_cap
+
+    diagnostics = _source_diagnostics(
+        raw_items=raw_items,
+        source_symbols=source_symbols,
+        before_dedupe=before_dedupe,
+        after_dedupe=after_dedupe,
+        full_kospi_scan=full_kospi_scan,
+        max_source_cap_bypassed=max_source_cap_bypassed,
+        max_source_cap_applied_after_priority_sort=max_source_cap_applied_after_priority_sort,
+        kospi_status=kospi_status,
+        kospi_loaded_count=len(kospi_items),
+    )
+
+    return source_symbols, diagnostics
+
+
+def _source_item(
+    symbol: Any,
+    *,
+    name: Any = None,
+    source: str,
+    market: Any = None,
+    source_detail: Any = None,
+    universe_profile: Any = None,
+) -> dict[str, Any]:
+    normalized = _normalize_symbol(symbol)
+    return {
+        "symbol": normalized,
+        "name": str(name).strip() if name is not None and str(name).strip() else None,
+        "source": str(source or "").strip().lower(),
+        "market": str(market).strip().upper() if market is not None and str(market).strip() else None,
+        "source_detail": source_detail,
+        "universe_profile": universe_profile,
+    }
+
+
+def _kospi_source_enabled() -> bool:
+    return (
+        bool(settings.universe_include_kospi)
+        and str(settings.universe_kospi_symbol_source or "csv").strip().lower() != "disabled"
+    )
+
+
+def _full_kospi_scan_enabled() -> bool:
+    return (
+        _kospi_source_enabled()
+        and bool(settings.universe_kospi_scan_all)
+        and bool(settings.universe_full_scan_enabled)
+    )
+
+
+def _source_priority(item: Any) -> int:
+    symbol, market, source = _extract_symbol_market_source(item)
+    del symbol
+
+    source_text = str(source or "").lower()
+    market_text = str(market or "").upper()
+
+    if source_text in {"explicit", "request"}:
+        return 0
+    if source_text in {"seed", "universe_seed"}:
+        return 1
+    if source_text in {"watchlist", "manual_watchlist"}:
+        return 2
+    if market_text == "KOSPI" or source_text == "kospi":
+        return 3
+    if market_text == "KOSDAQ" or source_text == "kosdaq":
+        return 4
+
+    return 5
+
+
+def _extract_symbol_market_source(item: Any) -> tuple[str, str | None, str | None]:
+    if isinstance(item, dict):
+        symbol = str(item.get("symbol") or item.get("code") or item.get("ticker") or "")
+        market = item.get("market") or item.get("market_segment")
+        source = item.get("source")
+        return (
+            symbol,
+            str(market) if market is not None else None,
+            str(source) if source is not None else None,
+        )
+
+    return str(item or ""), None, None
+
+
+def _dedupe_source_symbols(symbols: list[Any]) -> dict[str, dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in symbols:
+        symbol, market, source = _extract_symbol_market_source(item)
+        normalized = _normalize_symbol(symbol)
+        if not normalized or normalized in deduped:
+            continue
+        if isinstance(item, dict):
+            payload = dict(item)
+        else:
+            payload = _source_item(normalized, source=source or "unknown", market=market)
+        payload["symbol"] = normalized
+        if market and not payload.get("market"):
+            payload["market"] = market
+        if source and not payload.get("source"):
+            payload["source"] = source
+        deduped[normalized] = payload
+    return deduped
+
+
+def _source_diagnostics(
+    *,
+    raw_items: list[dict[str, Any]],
+    source_symbols: dict[str, dict[str, Any]],
+    before_dedupe: int,
+    after_dedupe: int,
+    full_kospi_scan: bool,
+    max_source_cap_bypassed: bool,
+    max_source_cap_applied_after_priority_sort: int | None,
+    kospi_status: dict[str, Any],
+    kospi_loaded_count: int,
+) -> dict[str, Any]:
+    final_items = list(source_symbols.values())
+
+    def count_source(source: str) -> int:
+        return sum(
+            1
+            for item in final_items
+            if str(item.get("source") or "").lower() == source
+        )
+
+    def count_market(market: str) -> int:
+        return sum(
+            1
+            for item in final_items
+            if str(item.get("market") or item.get("market_segment") or "").upper() == market
+        )
+
+    return {
+        "priority_order": [
+            "explicit",
+            "seed",
+            "watchlist",
+            "kospi",
+            "kosdaq",
+            "default",
+        ],
+        "kospi_priority_enabled": bool(settings.universe_prioritize_kospi),
+        "explicit_count": count_source("explicit"),
+        "seed_count": count_source("seed"),
+        "watchlist_count": count_source("watchlist"),
+        "default_count": count_source("default"),
+        "kospi_count": count_source("kospi"),
+        "kosdaq_count": count_market("KOSDAQ"),
+        "source_symbol_count_before_dedupe": before_dedupe,
+        "source_symbol_count_after_dedupe": after_dedupe,
+        "source_symbol_count_after_caps": len(source_symbols),
+        "deduped_count": max(0, before_dedupe - after_dedupe),
+        "kospi_scan_all": bool(settings.universe_kospi_scan_all),
+        "kospi_symbols_loaded": kospi_loaded_count,
+        "kospi_source_enabled": _kospi_source_enabled(),
+        "full_kospi_scan": full_kospi_scan,
+        "full_scan_enabled": bool(settings.universe_full_scan_enabled),
+        "full_scan_batch_size": int(settings.universe_full_scan_batch_size or 50),
+        "full_scan_intraday_enrichment_disabled": full_kospi_scan,
+        "news_enrichment_enabled": bool(settings.universe_scanner_news_enrichment_enabled),
+        "disclosure_enrichment_enabled": bool(settings.universe_scanner_disclosure_enrichment_enabled),
+        "batch_count": 0,
+        "batch_error_count": 0,
+        "max_source_cap_bypassed_for_full_kospi": max_source_cap_bypassed,
+        "max_source_cap_applied_after_priority_sort": max_source_cap_applied_after_priority_sort,
+        "normal_max_source_symbols": int(settings.universe_scanner_max_source_symbols or 0),
+        "full_scan_max_symbols": int(settings.universe_full_scan_max_symbols or 0),
+        "raw_source_count": len(raw_items),
+        "kospi_universe": kospi_status,
     }
 
 
 def _collect_price_snapshots(
-    source_symbols: dict[str, str | None],
+    source_symbols: dict[str, Any],
+    *,
+    max_seconds: float | None = None,
+    include_intraday: bool | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     snapshots: list[dict[str, Any]] = []
     symbol_interval_seconds = _scanner_symbol_interval_seconds()
     started = time_module.monotonic()
-    max_seconds = max(60.0, float(settings.universe_scanner_max_scan_seconds or 300))
+    max_seconds = (
+        max(1.0, float(max_seconds))
+        if max_seconds is not None
+        else max(60.0, float(settings.universe_scanner_max_scan_seconds or 300))
+    )
     timed_out = False
     message: str | None = None
-    for index, (symbol, name) in enumerate(source_symbols.items()):
+    for index, (symbol, metadata) in enumerate(source_symbols.items()):
+        meta = metadata if isinstance(metadata, dict) else {"name": metadata}
+        name = meta.get("name")
         elapsed = time_module.monotonic() - started
         if index and elapsed >= max_seconds:
             timed_out = True
@@ -658,7 +1013,10 @@ def _collect_price_snapshots(
                 break
             time_module.sleep(min(symbol_interval_seconds, remaining))
         try:
-            price_data = _fetch_scanner_price_data(symbol)
+            price_data = _fetch_scanner_price_data(
+                symbol,
+                include_intraday=include_intraday,
+            )
         except Exception as exc:
             price_data = {
                 "status": "error",
@@ -667,6 +1025,14 @@ def _collect_price_snapshots(
             }
         price_data["symbol"] = _normalize_symbol(price_data.get("symbol") or symbol)
         price_data["name"] = name or DEFAULT_UNIVERSE.get(symbol)
+        if meta.get("market") and not price_data.get("market_segment"):
+            price_data["market_segment"] = meta.get("market")
+        if meta.get("source") and not price_data.get("source"):
+            price_data["source"] = meta.get("source")
+        if meta.get("universe_profile") and not price_data.get("universe_profile"):
+            price_data["universe_profile"] = meta.get("universe_profile")
+        if meta.get("source_detail"):
+            price_data["source_detail"] = meta.get("source_detail")
         price_data = _with_static_universe_metadata(price_data)
         snapshots.append(price_data)
     elapsed = round(time_module.monotonic() - started, 3)
@@ -676,6 +1042,105 @@ def _collect_price_snapshots(
         "error_count": sum(1 for item in snapshots if item.get("status") == "error"),
         "message": message,
     }
+
+
+def _collect_price_snapshots_for_mode(
+    source_symbols: dict[str, dict[str, Any]],
+    *,
+    full_scan: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    batch_size = max(1, int(settings.universe_full_scan_batch_size or 50))
+    if not full_scan or len(source_symbols) <= batch_size:
+        snapshots, collection = _collect_price_snapshots(
+            source_symbols,
+            include_intraday=False if full_scan else None,
+        )
+        collection["batch_count"] = 1 if source_symbols else 0
+        collection["batch_error_count"] = collection.get("error_count", 0)
+        collection["batch_diagnostics"] = []
+        return snapshots, collection
+
+    snapshots: list[dict[str, Any]] = []
+    batch_diagnostics: list[dict[str, Any]] = []
+    started = time_module.monotonic()
+    max_seconds = max(60.0, float(settings.universe_scanner_max_scan_seconds or 300))
+    pause_seconds = max(0.0, float(settings.universe_full_scan_batch_pause_seconds or 0.0))
+    timed_out = False
+    message: str | None = None
+
+    for batch_index, batch in enumerate(_batched_source_symbols(source_symbols, batch_size), start=1):
+        elapsed = time_module.monotonic() - started
+        remaining = max_seconds - elapsed
+        if remaining <= 0:
+            timed_out = True
+            message = (
+                f"Full universe scan stopped before batch {batch_index}; "
+                f"stored {len(snapshots)}/{len(source_symbols)} snapshots."
+            )
+            break
+
+        try:
+            batch_snapshots, batch_collection = _collect_price_snapshots(
+                batch,
+                max_seconds=remaining,
+                include_intraday=False,
+            )
+        except Exception as exc:
+            batch_snapshots = []
+            batch_collection = {
+                "timed_out": False,
+                "elapsed_seconds": 0.0,
+                "error_count": len(batch),
+                "message": f"batch {batch_index} failed: {exc}",
+            }
+
+        snapshots.extend(batch_snapshots)
+        batch_diagnostics.append(
+            {
+                "batch": batch_index,
+                "source_count": len(batch),
+                "snapshot_count": len(batch_snapshots),
+                "error_count": batch_collection.get("error_count", 0),
+                "timed_out": bool(batch_collection.get("timed_out")),
+                "message": batch_collection.get("message"),
+            }
+        )
+
+        if batch_collection.get("timed_out"):
+            timed_out = True
+            message = str(batch_collection.get("message") or "full scan batch timed out")
+            break
+
+        if pause_seconds > 0 and len(snapshots) < len(source_symbols):
+            remaining = max_seconds - (time_module.monotonic() - started)
+            if remaining <= 0:
+                timed_out = True
+                message = "Full universe scan stopped before batch pause"
+                break
+            time_module.sleep(min(pause_seconds, remaining))
+
+    elapsed = round(time_module.monotonic() - started, 3)
+    return snapshots, {
+        "timed_out": timed_out,
+        "elapsed_seconds": elapsed,
+        "error_count": sum(1 for item in snapshots if item.get("status") == "error"),
+        "batch_error_count": sum(
+            int(item.get("error_count") or 0)
+            for item in batch_diagnostics
+        ),
+        "batch_count": len(batch_diagnostics),
+        "batch_diagnostics": batch_diagnostics[:20],
+        "message": message,
+    }
+
+
+def _batched_source_symbols(
+    source_symbols: dict[str, dict[str, Any]],
+    batch_size: int,
+):
+    items = list(source_symbols.items())
+    for index in range(0, len(items), batch_size):
+        yield dict(items[index:index + batch_size])
 
 
 def _clean_universe_snapshots(
@@ -913,11 +1378,20 @@ def _scanner_symbol_interval_seconds() -> float:
     return min(configured, cap)
 
 
-def _fetch_scanner_price_data(symbol: str) -> dict[str, Any]:
+def _fetch_scanner_price_data(
+    symbol: str,
+    *,
+    include_intraday: bool | None = None,
+) -> dict[str, Any]:
+    include_intraday = (
+        bool(settings.universe_scanner_intraday_enrichment_enabled)
+        if include_intraday is None
+        else bool(include_intraday)
+    )
     try:
         return fetch_price_data(
             symbol,
-            include_intraday=bool(settings.universe_scanner_intraday_enrichment_enabled),
+            include_intraday=include_intraday,
         )
     except TypeError as exc:
         if "include_intraday" not in str(exc):
