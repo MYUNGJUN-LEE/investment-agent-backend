@@ -76,7 +76,14 @@ from app.trading.order_approval import (
     confirm_order_preview,
     create_order_preview,
 )
+from app.trading.overfit_guard import overfit_guard_summary
 from app.trading.paper_trading import run_paper_once
+from app.trading.tuning_review import (
+    export_approved_tuning_env_lines,
+    latest_approved_tuning_decisions,
+    list_latest_tuning_recommendations,
+    record_tuning_decision,
+)
 from app.trading.universe_scanner import (
     get_latest_universe_scan,
     initialize_universe_db,
@@ -872,6 +879,71 @@ def admin_auto_tuning_latest():
 )
 def admin_auto_tuning_refresh():
     return generate_auto_tuning_recommendations(persist=True)
+
+
+@app.get(
+    "/admin/overfit-guard/summary",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getOverfitGuardSummary",
+    summary="Run a manual overfitting guard diagnostic report",
+)
+def admin_overfit_guard_summary(execution_mode: str = "paper"):
+    return overfit_guard_summary(
+        execution_mode=execution_mode,
+        persist=True,
+    )
+
+
+@app.get(
+    "/admin/tuning/recommendations/latest",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getLatestTuningReviewRecommendations",
+    summary="Get allowlisted tuning recommendations ready for manual review",
+)
+def admin_tuning_recommendations_latest():
+    return list_latest_tuning_recommendations()
+
+
+@app.post(
+    "/admin/tuning/review",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="recordTuningReviewDecision",
+    summary="Record a manual approve/reject/defer decision for a tuning recommendation",
+)
+def admin_tuning_review(payload: dict[str, Any] = Body(...)):
+    return record_tuning_decision(
+        recommendation_key=str(
+            payload.get("recommendation_key")
+            or payload.get("key")
+            or ""
+        ),
+        decision=str(payload.get("decision") or "deferred"),
+        current_setting=payload.get("current_setting"),
+        suggested_setting=payload.get("suggested_setting"),
+        reason=payload.get("reason"),
+        reviewer=payload.get("reviewer"),
+        raw_json=payload,
+    )
+
+
+@app.get(
+    "/admin/tuning/approved",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getApprovedTuningDecisions",
+    summary="Get latest approved tuning decisions",
+)
+def admin_tuning_approved():
+    return latest_approved_tuning_decisions()
+
+
+@app.get(
+    "/admin/tuning/export-env",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="exportApprovedTuningEnvLines",
+    summary="Export approved tuning decisions as manual Render environment lines",
+)
+def admin_tuning_export_env():
+    return export_approved_tuning_env_lines()
 
 
 def _admin_runtime_summary(

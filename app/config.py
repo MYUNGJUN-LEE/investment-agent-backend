@@ -142,6 +142,18 @@ class Settings(BaseSettings):
     auto_tuning_hurdle_step_bps: float = 10.0
     auto_tuning_position_scale_step: float = 0.10
     auto_tuning_signal_decay_scale_step: float = 0.20
+    tuning_review_enabled: bool = True
+    tuning_review_db_path: str = "data/tuning_review.sqlite3"
+    tuning_review_max_records: int = 1000
+    tuning_review_allowed_keys: str = (
+        "UNIVERSE_SCANNER_DEFAULT_SLIPPAGE_BPS,"
+        "SIGNAL_DECAY_HALF_LIFE_SECONDS,"
+        "SIGNAL_DECAY_LIVE_MAX_CANDIDATE_AGE_SECONDS,"
+        "REGIME_GATE_BEAR_HURDLE_ADD_BPS,"
+        "POSITION_SIZING_MAX_MULTIPLIER,"
+        "POSITION_SIZING_MAX_SYMBOL_WEIGHT,"
+        "UNIVERSE_SCANNER_WORKER_HURDLE_RATE_BPS"
+    )
     auto_trading_one_session_per_account: bool = True
     trade_orchestrator_enabled: bool = True
     trade_orchestrator_interval_seconds: int = 600
@@ -195,6 +207,16 @@ class Settings(BaseSettings):
     quant_validation_min_positive_fold_rate: float = 0.60
     quant_validation_min_median_net_edge_bps: float = 0.0
     quant_validation_num_trials: int = 20
+    overfit_guard_enabled: bool = False
+    overfit_guard_db_path: str = "data/overfit_guard.sqlite3"
+    overfit_guard_min_samples: int = 1000
+    overfit_guard_max_samples: int = 3000
+    overfit_guard_folds: int = 5
+    overfit_guard_top_n: int = 10
+    overfit_guard_embargo_seconds: int = 86400
+    overfit_guard_min_positive_fold_rate: float = 0.60
+    overfit_guard_min_median_oos_net_edge_bps: float = 0.0
+    overfit_guard_live_block_enabled: bool = False
     broker_sync_db_path: str = "data/broker_sync.sqlite3"
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120
@@ -244,6 +266,15 @@ class Settings(BaseSettings):
     universe_scanner_default_slippage_bps: float = 10.0
     universe_scanner_min_turnover_value: float = 20_000_000_000.0
     universe_scanner_min_volume: int = 300_000
+    universe_cleaning_enabled: bool = True
+    universe_cleaning_min_price: float = 1000.0
+    universe_cleaning_min_turnover_value: float = 20_000_000_000.0
+    universe_cleaning_min_volume: int = 300_000
+    universe_cleaning_max_abs_change_rate: float = 18.0
+    universe_cleaning_upper_limit_guard_pct: float = 27.0
+    universe_cleaning_lower_limit_guard_pct: float = -27.0
+    universe_cleaning_max_snapshot_age_seconds: int = 900
+    universe_cleaning_exclude_warning_symbols: bool = True
     universe_scanner_macro_min_risk_on_score: float = 35.0
     universe_scanner_min_market_cap: float = 300_000_000_000.0
     universe_scanner_max_market_cap: float = 2_000_000_000_000.0

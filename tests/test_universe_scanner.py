@@ -537,7 +537,7 @@ def test_auto_trading_blocks_when_universe_scan_has_too_few_symbols(monkeypatch)
     assert run_calls == []
 
 
-def test_universe_scanner_uses_latest_close_as_watch_when_market_closed(
+def test_universe_scanner_excludes_missing_current_price_before_scoring(
     tmp_path,
     monkeypatch,
 ):
@@ -585,10 +585,12 @@ def test_universe_scanner_uses_latest_close_as_watch_when_market_closed(
         db_path=db_path,
     )
 
-    assert result["final_count"] == 1
-    assert result["final_candidates"][0]["decision"] == "watch"
-    assert result["final_candidates"][0]["current_price"] == 70000
-    assert "market closed" in result["final_candidates"][0]["reason"]
+    assert result["final_count"] == 0
+    assert result["cleaning_excluded_count"] == 1
+    assert result["cleaning_excluded"][0]["symbol"] == "035900"
+    assert result["cleaning_excluded"][0]["reasons"] == [
+        "current_price missing or non-positive"
+    ]
 
 
 def test_universe_scanner_keeps_only_top_ten_execution_candidates(

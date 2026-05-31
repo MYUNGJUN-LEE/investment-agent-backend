@@ -239,10 +239,11 @@ def scan_universe_for_auto_trade(
     initialize_universe_db(path)
 
     snapshots, collection = _collect_price_snapshots(source_symbols)
+    snapshots, cleaning = _clean_universe_snapshots(snapshots)
     _record_snapshots(path, scan_id, created_at, snapshots)
 
     ranked = sorted(
-        (_score_snapshot(item) for item in snapshots),
+        (_score_snapshot(item) for item in snapshots if item.get("universe_cleaning_passed")),
         key=lambda item: item["score"],
         reverse=True,
     )
@@ -285,6 +286,8 @@ def scan_universe_for_auto_trade(
         "source_symbol_count": len(source_symbols),
         "snapshot_count": len(snapshots),
         "snapshot_error_count": collection["error_count"],
+        "cleaning_excluded_count": cleaning["excluded_count"],
+        "cleaning_excluded": cleaning["excluded"],
         "snapshot_collection_seconds": collection["elapsed_seconds"],
         "snapshot_collection_timed_out": collection["timed_out"],
         "snapshot_collection_message": collection.get("message"),
@@ -671,6 +674,217 @@ def _collect_price_snapshots(
         "error_count": sum(1 for item in snapshots if item.get("status") == "error"),
         "message": message,
     }
+
+
+def _clean_universe_snapshots(
+    snapshots: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+
+    for snapshot in snapshots:
+        accepted, reasons = clean_universe_snapshot(snapshot)
+        annotated = {
+            **snapshot,
+            "universe_cleaning_passed": accepted,
+            "universe_cleaning_reasons": reasons,
+        }
+        if reasons:
+            previous = str(annotated.get("reason") or annotated.get("message") or "")
+            cleaning_reason = "; ".join(reasons)
+            annotated["reason"] = (
+                f"{previous}; universe_cleaning: {cleaning_reason}".strip("; ")
+                if previous
+                else f"universe_cleaning: {cleaning_reason}"
+            )
+        cleaned.append(annotated)
+
+        if not accepted:
+            excluded.append(
+                {
+                    "symbol": annotated.get("symbol"),
+                    "name": annotated.get("name"),
+                    "reasons": reasons,
+                }
+            )
+
+    return cleaned, {
+        "excluded_count": len(excluded),
+        "excluded": excluded[:100],
+    }
+
+
+def clean_universe_snapshot(snapshot: dict[str, Any]) -> tuple[bool, list[str]]:
+    if not bool(settings.universe_cleaning_enabled):
+        return True, ["universe cleaning disabled"]
+
+    reasons: list[str] = []
+    accepted = True
+
+    price = _to_float(snapshot.get("current_price"))
+    if price is None or price <= 0:
+        return False, ["current_price missing or non-positive"]
+
+    min_price = float(settings.universe_cleaning_min_price or 0.0)
+    if min_price > 0 and price < min_price:
+        accepted = False
+        reasons.append(f"current_price {price:.4f} below min {min_price:.4f}")
+
+    volume = _to_int(snapshot.get("volume"))
+    min_volume = int(settings.universe_cleaning_min_volume or 0)
+    if volume is None:
+        reasons.append("volume unavailable; cleaning neutral")
+    elif min_volume > 0 and volume < min_volume:
+        accepted = False
+        reasons.append(f"volume {volume} below min {min_volume}")
+
+    turnover = _to_float(snapshot.get("turnover_value"))
+    if turnover is None and volume is not None and price > 0:
+        turnover = price * volume
+    min_turnover = float(settings.universe_cleaning_min_turnover_value or 0.0)
+    if turnover is None:
+        reasons.append("turnover_value unavailable; cleaning neutral")
+    elif min_turnover > 0 and turnover < min_turnover:
+        accepted = False
+        reasons.append(f"turnover_value {turnover:.0f} below min {min_turnover:.0f}")
+
+    change_rate = _to_float(snapshot.get("change_rate"))
+    if change_rate is None:
+        reasons.append("change_rate unavailable; cleaning neutral")
+    else:
+        max_abs_change = float(settings.universe_cleaning_max_abs_change_rate or 0.0)
+        if max_abs_change > 0 and abs(change_rate) > max_abs_change:
+            accepted = False
+            reasons.append(
+                f"abs(change_rate) {abs(change_rate):.4f}% above max {max_abs_change:.4f}%"
+            )
+
+        upper_limit = float(settings.universe_cleaning_upper_limit_guard_pct or 0.0)
+        if upper_limit and change_rate >= upper_limit:
+            accepted = False
+            reasons.append(
+                f"change_rate {change_rate:.4f}% near/above upper guard {upper_limit:.4f}%"
+            )
+
+        lower_limit = float(settings.universe_cleaning_lower_limit_guard_pct or 0.0)
+        if lower_limit and change_rate <= lower_limit:
+            accepted = False
+            reasons.append(
+                f"change_rate {change_rate:.4f}% near/below lower guard {lower_limit:.4f}%"
+            )
+
+    age_seconds = _snapshot_age_seconds(snapshot)
+    max_age = int(settings.universe_cleaning_max_snapshot_age_seconds or 0)
+    if age_seconds is None:
+        reasons.append("snapshot age unavailable; cleaning neutral")
+    elif max_age > 0 and age_seconds > max_age:
+        accepted = False
+        reasons.append(f"snapshot age {age_seconds:.0f}s above max {max_age}s")
+
+    flag_reasons = _universe_cleaning_flag_reasons(snapshot)
+    if flag_reasons:
+        accepted = False
+        reasons.extend(flag_reasons)
+
+    if accepted and not reasons:
+        reasons.append("cleaning passed")
+
+    return accepted, reasons
+
+
+def _snapshot_age_seconds(snapshot: dict[str, Any]) -> float | None:
+    for key in (
+        "snapshot_time",
+        "quote_time",
+        "price_time",
+        "timestamp",
+        "created_at",
+        "updated_at",
+        "fetched_at",
+        "as_of",
+        "last_updated",
+    ):
+        dt = _parse_snapshot_datetime(snapshot.get(key))
+        if dt is None:
+            continue
+        now = datetime.now(dt.tzinfo) if dt.tzinfo is not None else datetime.now()
+        return max(0.0, (now - dt).total_seconds())
+    return None
+
+
+def _parse_snapshot_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _universe_cleaning_flag_reasons(snapshot: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    for key in (
+        "halted",
+        "is_halted",
+        "trading_halt",
+        "suspended",
+        "is_suspended",
+        "managed",
+        "is_managed",
+        "investment_risk",
+        "delisting",
+        "delisting_risk",
+        "liquidation",
+    ):
+        if _truthy_flag(snapshot.get(key)):
+            reasons.append(f"{key} flag present")
+
+    warning_keys = (
+        "investment_warning",
+        "is_investment_warning",
+        "warning",
+        "investment_caution",
+    )
+    if bool(settings.universe_cleaning_exclude_warning_symbols):
+        for key in warning_keys:
+            if _truthy_flag(snapshot.get(key)):
+                reasons.append(f"{key} flag present")
+    status_text = " ".join(
+        str(snapshot.get(key) or "").lower()
+        for key in ("status", "market_status", "issue_status", "warning_status")
+    )
+    for token in (
+        "halt",
+        "suspend",
+        "managed",
+        "investment_warning",
+        "investment risk",
+        "delisting",
+        "liquidation",
+        "거래정지",
+        "관리종목",
+        "투자경고",
+        "투자위험",
+        "상장폐지",
+        "정리매매",
+    ):
+        if token in status_text:
+            reasons.append(f"status contains {token}")
+            break
+
+    return reasons
+
+
+def _truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    raw = str(value or "").strip().lower()
+    return raw in {"1", "true", "t", "yes", "y", "on", "halted", "suspended"}
 
 
 def _with_static_universe_metadata(price_data: dict[str, Any]) -> dict[str, Any]:
