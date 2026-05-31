@@ -14,6 +14,7 @@ from app.data_sources.opendart import fetch_opendart_disclosures
 from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.services.naver_news import search_naver_news
 from app.storage.market_data import get_latest_market_context
+from app.trading.corporate_events import corporate_event_check
 from app.trading.edge_calibration import (
     edge_entry_gate,
     estimate_expected_edges,
@@ -1376,11 +1377,14 @@ def _rank_execution_candidates(
     )
     edge_model = load_edge_model()
     scored = [
-        _apply_market_safety_to_candidate(
-            _with_expected_value_scores(
-                item,
-                expires_at=expires_at,
-                edge_model=edge_model,
+        _apply_corporate_event_to_candidate(
+            _apply_market_safety_to_candidate(
+                _with_expected_value_scores(
+                    item,
+                    expires_at=expires_at,
+                    edge_model=edge_model,
+                ),
+                execution_mode=execution_mode,
             ),
             execution_mode=execution_mode,
         )
@@ -1452,6 +1456,40 @@ def _apply_market_safety_to_candidate(
         reason = str(candidate.get("reason") or "")
         message = str(safety.get("message") or "market safety blocked")
         candidate["reason"] = f"{reason}; market_safety: {message}".strip("; ")
+
+    return candidate
+
+
+def _apply_corporate_event_to_candidate(
+    candidate: dict[str, Any],
+    *,
+    execution_mode: str = "paper",
+) -> dict[str, Any]:
+    symbol = str(candidate.get("symbol") or "")
+    event_check = corporate_event_check(symbol, execution_mode=execution_mode)
+
+    candidate = {
+        **candidate,
+        "corporate_event_check": event_check,
+    }
+
+    penalty = _to_float(event_check.get("penalty_bps")) or 0.0
+
+    if penalty > 0:
+        if candidate.get("net_edge") is not None:
+            candidate["net_edge"] = round(float(candidate.get("net_edge") or 0.0) - penalty, 4)
+        if candidate.get("composite_score") is not None:
+            candidate["composite_score"] = round(
+                float(candidate.get("composite_score") or 0.0) - min(50.0, penalty),
+                4,
+            )
+
+    if event_check.get("block") is True:
+        candidate["decision"] = "exclude"
+        candidate["status"] = "EXCLUDED"
+        reason = str(candidate.get("reason") or "")
+        message = str(event_check.get("message") or "corporate event blocked")
+        candidate["reason"] = f"{reason}; corporate_event: {message}".strip("; ")
 
     return candidate
 
@@ -2334,6 +2372,7 @@ def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
                 "universe_filters": item.get("universe_filters"),
                 "failed_universe_filters": item.get("failed_universe_filters"),
                 "market_safety": item.get("market_safety"),
+                "corporate_event_check": item.get("corporate_event_check"),
                 "claimed_by_worker": item.get("claimed_by_worker"),
                 "expires_at": item.get("expires_at"),
             }

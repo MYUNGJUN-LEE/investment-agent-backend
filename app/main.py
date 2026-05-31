@@ -56,6 +56,11 @@ from app.trading.auto_tuning import (
     latest_auto_tuning_recommendation,
 )
 from app.trading.broker_sync import sync_kis_account
+from app.trading.corporate_events import (
+    corporate_event_cache_status,
+    get_relevant_corporate_events,
+    upsert_corporate_events,
+)
 from app.trading.edge_calibration import (
     calibrate_edge_model,
     edge_entry_gate,
@@ -937,6 +942,47 @@ def admin_market_safety_symbol(symbol: str):
         "symbol": symbol,
         "cache": market_safety_cache_status(),
         "flags": get_market_safety_flags(symbol),
+    }
+
+
+@app.post(
+    "/admin/corporate-events/upsert",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="upsertCorporateEvents",
+    summary="Manually upsert cached corporate events",
+)
+def admin_corporate_events_upsert(payload: dict[str, Any] = Body(...)):
+    events = payload.get("events") or []
+    if not isinstance(events, list):
+        raise HTTPException(status_code=400, detail="events must be a list")
+    return upsert_corporate_events(
+        events,
+        source=str(payload.get("source") or "manual"),
+    )
+
+
+@app.get(
+    "/admin/corporate-events/status",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getCorporateEventCacheStatus",
+    summary="Get corporate event cache status",
+)
+def admin_corporate_events_status():
+    return corporate_event_cache_status()
+
+
+@app.get(
+    "/admin/corporate-events/{symbol}",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getCorporateEventsForSymbol",
+    summary="Get relevant cached corporate events for a symbol",
+)
+def admin_corporate_events_symbol(symbol: str):
+    return {
+        "status": "success",
+        "symbol": symbol,
+        "cache": corporate_event_cache_status(),
+        "events": get_relevant_corporate_events(symbol),
     }
 
 
