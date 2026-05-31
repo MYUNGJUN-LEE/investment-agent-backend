@@ -19,6 +19,7 @@ from app.trading.edge_calibration import (
     estimate_expected_edges,
     load_edge_model,
 )
+from app.trading.market_safety import market_safety_check
 from app.trading.atr_exits import atr_exit_levels_from_price_data
 from app.trading import paper_trading
 
@@ -1375,10 +1376,13 @@ def _rank_execution_candidates(
     )
     edge_model = load_edge_model()
     scored = [
-        _with_expected_value_scores(
-            item,
-            expires_at=expires_at,
-            edge_model=edge_model,
+        _apply_market_safety_to_candidate(
+            _with_expected_value_scores(
+                item,
+                expires_at=expires_at,
+                edge_model=edge_model,
+            ),
+            execution_mode=execution_mode,
         )
         for item in candidates
     ]
@@ -1416,6 +1420,40 @@ def _rank_execution_candidates(
             }
         )
     return prepared
+
+
+def _apply_market_safety_to_candidate(
+    candidate: dict[str, Any],
+    *,
+    execution_mode: str = "paper",
+) -> dict[str, Any]:
+    symbol = str(candidate.get("symbol") or "")
+    safety = market_safety_check(symbol, execution_mode=execution_mode)
+
+    candidate = {
+        **candidate,
+        "market_safety": safety,
+    }
+
+    penalty = _to_float(safety.get("penalty_bps")) or 0.0
+
+    if penalty > 0:
+        if candidate.get("net_edge") is not None:
+            candidate["net_edge"] = round(float(candidate.get("net_edge") or 0.0) - penalty, 4)
+        if candidate.get("composite_score") is not None:
+            candidate["composite_score"] = round(
+                float(candidate.get("composite_score") or 0.0) - min(40.0, penalty),
+                4,
+            )
+
+    if safety.get("block") is True:
+        candidate["decision"] = "exclude"
+        candidate["status"] = "EXCLUDED"
+        reason = str(candidate.get("reason") or "")
+        message = str(safety.get("message") or "market safety blocked")
+        candidate["reason"] = f"{reason}; market_safety: {message}".strip("; ")
+
+    return candidate
 
 
 def _edge_entry_gate_for_mode(
@@ -2295,6 +2333,7 @@ def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
                 "large_cap_top10_gate": item.get("large_cap_top10_gate"),
                 "universe_filters": item.get("universe_filters"),
                 "failed_universe_filters": item.get("failed_universe_filters"),
+                "market_safety": item.get("market_safety"),
                 "claimed_by_worker": item.get("claimed_by_worker"),
                 "expires_at": item.get("expires_at"),
             }

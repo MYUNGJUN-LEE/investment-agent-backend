@@ -71,6 +71,11 @@ from app.trading.market_monitor import (
     process_due_monitor_jobs,
     run_monitor_job,
 )
+from app.trading.market_safety import (
+    get_market_safety_flags,
+    market_safety_cache_status,
+    upsert_market_safety_flags,
+)
 from app.trading.order_approval import (
     OrderApprovalError,
     confirm_order_preview,
@@ -892,6 +897,47 @@ def admin_overfit_guard_summary(execution_mode: str = "paper"):
         execution_mode=execution_mode,
         persist=True,
     )
+
+
+@app.post(
+    "/admin/market-safety/upsert",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="upsertMarketSafetyFlags",
+    summary="Manually upsert cached official market safety flags",
+)
+def admin_market_safety_upsert(payload: dict[str, Any] = Body(...)):
+    flags = payload.get("flags") or []
+    if not isinstance(flags, list):
+        raise HTTPException(status_code=400, detail="flags must be a list")
+    return upsert_market_safety_flags(
+        flags,
+        source=str(payload.get("source") or "manual"),
+    )
+
+
+@app.get(
+    "/admin/market-safety/status",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getMarketSafetyCacheStatus",
+    summary="Get market safety cache status",
+)
+def admin_market_safety_status():
+    return market_safety_cache_status()
+
+
+@app.get(
+    "/admin/market-safety/{symbol}",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getMarketSafetyFlagsForSymbol",
+    summary="Get cached market safety flags for a symbol",
+)
+def admin_market_safety_symbol(symbol: str):
+    return {
+        "status": "success",
+        "symbol": symbol,
+        "cache": market_safety_cache_status(),
+        "flags": get_market_safety_flags(symbol),
+    }
 
 
 @app.get(
