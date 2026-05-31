@@ -361,6 +361,10 @@ class AutoTradeSymbolConfig(BaseModel):
     fill_probability: float | None = Field(None, ge=0, le=1)
     is_short: bool = False
     market_beta: float | None = None
+    fill_quality: dict[str, Any] | None = None
+    regime_gate: dict[str, Any] | None = None
+    signal_decay: dict[str, Any] | None = None
+    final_entry_edge: float | None = None
 
 
 class AutoTradeStartRequest(BaseModel):

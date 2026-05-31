@@ -785,9 +785,23 @@ def test_universe_scanner_stops_collection_at_scan_deadline(monkeypatch):
     monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
 
     snapshots, collection = universe_scanner._collect_price_snapshots(
-        {"005930": "Samsung Electronics", "000660": "SK hynix"}
+        {
+            "000001": "One",
+            "000002": "Two",
+            "000003": "Three",
+            "000004": "Four",
+            "000005": "Five",
+            "000006": "Six",
+        }
     )
 
-    assert [item["symbol"] for item in snapshots] == ["005930"]
+    assert [item["symbol"] for item in snapshots] == [
+        "000001",
+        "000002",
+        "000003",
+        "000004",
+        "000005",
+    ]
     assert collection["timed_out"] is True
-    assert "stored 1/2 snapshots" in collection["message"]
+    assert "before symbol 000006" in collection["message"]
+    assert "stored 5/6 snapshots" in collection["message"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+import math
 import sqlite3
 import time
 from typing import Any
@@ -31,6 +32,12 @@ from app.trading import paper_trading
 from app.trading import risk_manager
 from app.trading.atr_exits import atr_exit_levels_from_price_data
 from app.trading.edge_calibration import refresh_edge_training_samples
+from app.trading.fill_quality import (
+    fill_quality_adjustment_for_candidate,
+    record_fill_quality_event,
+)
+from app.trading.outcome_attribution import record_outcome_attribution
+from app.trading.regime_gate import regime_gate_for_mode
 from app.trading.universe_scanner import (
     scan_universe_for_auto_trade,
     scanner_candidate_to_symbol_config,
@@ -495,6 +502,10 @@ def _orchestrated_result_payload(
                 "signal_score": item.signal_score,
                 "position_size": item.position_size,
                 "cash_available": item.cash_available,
+                "fill_quality": item.fill_quality,
+                "regime_gate": item.regime_gate,
+                "signal_decay": item.signal_decay,
+                "final_entry_edge": item.final_entry_edge,
             }
             for item in plan["entry_symbols"]
         ],
@@ -563,6 +574,704 @@ def _scanner_hurdle_rate_for_mode(execution_mode: str) -> float:
 
     return max(0.0, configured)
 
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+
+    try:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _candidate_age_seconds(candidate: dict[str, Any]) -> float | None:
+    for key in ("scan_time", "created_at", "observed_at", "updated_at"):
+        dt = _parse_iso_datetime(candidate.get(key))
+        if dt is None:
+            continue
+        now = datetime.now(dt.tzinfo) if dt.tzinfo is not None else datetime.now()
+        return max(0.0, (now - dt).total_seconds())
+    return None
+
+
+def _final_edge_before_signal_decay(candidate: dict[str, Any]) -> float:
+    for key in (
+        "fill_quality_adjusted_edge",
+        "portfolio_adjusted_net_edge",
+        "net_edge",
+    ):
+        value = candidate.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _signal_decay_for_candidate(
+    candidate: dict[str, Any],
+    *,
+    execution_mode: str,
+) -> dict[str, Any]:
+    base_edge = _final_edge_before_signal_decay(candidate)
+
+    if not bool(settings.signal_decay_enabled):
+        return {
+            "enabled": False,
+            "approved": True,
+            "candidate_age_seconds": None,
+            "signal_decay_multiplier": 1.0,
+            "pre_signal_decay_edge": round(base_edge, 4),
+            "signal_decay_adjusted_edge": round(base_edge, 4),
+            "signal_decay_penalty_bps": 0.0,
+            "message": "signal decay disabled",
+        }
+
+    age_seconds = _candidate_age_seconds(candidate)
+    paper = str(execution_mode or "paper").lower() == "paper"
+
+    if age_seconds is None:
+        penalty = (
+            0.0
+            if paper
+            else _safe_float(settings.signal_decay_missing_age_live_penalty_bps, 10.0)
+        )
+        adjusted = base_edge - penalty
+        return {
+            "enabled": True,
+            "approved": True,
+            "status": "missing_age",
+            "candidate_age_seconds": None,
+            "signal_decay_multiplier": 1.0,
+            "pre_signal_decay_edge": round(base_edge, 4),
+            "signal_decay_adjusted_edge": round(adjusted, 4),
+            "signal_decay_penalty_bps": round(penalty, 4),
+            "message": "candidate age missing; neutral in paper, mild penalty in live",
+        }
+
+    max_age = (
+        _safe_float(settings.signal_decay_paper_max_candidate_age_seconds, 7200.0)
+        if paper
+        else _safe_float(settings.signal_decay_live_max_candidate_age_seconds, 3600.0)
+    )
+
+    approved = True
+    message = "signal age acceptable"
+
+    if age_seconds > max_age:
+        if paper:
+            message = (
+                f"candidate age {age_seconds:.0f}s exceeds paper max age "
+                f"{max_age:.0f}s; decay only"
+            )
+        else:
+            approved = False
+            message = (
+                f"candidate age {age_seconds:.0f}s exceeds live max age "
+                f"{max_age:.0f}s"
+            )
+
+    half_life = max(
+        60.0,
+        _safe_float(settings.signal_decay_half_life_seconds, 1800.0),
+    )
+    min_multiplier = _clamp_float(
+        _safe_float(settings.signal_decay_min_multiplier, 0.35),
+        0.0,
+        1.0,
+    )
+
+    multiplier = math.exp(-age_seconds / half_life)
+    multiplier = max(min_multiplier, min(1.0, multiplier))
+
+    adjusted_edge = base_edge * multiplier
+    penalty = base_edge - adjusted_edge
+
+    return {
+        "enabled": True,
+        "approved": approved,
+        "status": "ready",
+        "candidate_age_seconds": round(age_seconds, 3),
+        "max_candidate_age_seconds": round(max_age, 3),
+        "signal_half_life_seconds": round(half_life, 3),
+        "signal_decay_multiplier": round(multiplier, 6),
+        "pre_signal_decay_edge": round(base_edge, 4),
+        "signal_decay_adjusted_edge": round(adjusted_edge, 4),
+        "signal_decay_penalty_bps": round(penalty, 4),
+        "message": message,
+    }
+
+
+def _recent_symbol_returns_from_universe_db(
+    symbol: str,
+    *,
+    lookback_prices: int | None = None,
+) -> list[float]:
+    """Load recent returns from universe_price_snapshots. No external API calls."""
+    if not symbol:
+        return []
+
+    lookback_prices = max(
+        6,
+        int(lookback_prices or settings.portfolio_corr_lookback_prices or 30),
+    )
+    path = settings.storage_path(settings.universe_scanner_db_path)
+
+    if not path.exists():
+        return []
+
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT current_price
+                FROM universe_price_snapshots
+                WHERE symbol = ?
+                  AND current_price IS NOT NULL
+                  AND current_price > 0
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (symbol, lookback_prices),
+            ).fetchall()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return []
+
+    prices: list[float] = []
+    for row in rows:
+        if not row or not row[0]:
+            continue
+        price = _safe_float(row[0])
+        if price > 0:
+            prices.append(price)
+    prices = list(reversed(prices))
+
+    if len(prices) < 2:
+        return []
+
+    returns: list[float] = []
+    for prev, cur in zip(prices, prices[1:]):
+        if prev and prev > 0:
+            returns.append((cur / prev) - 1.0)
+
+    return returns
+
+
+def _pearson_corr(xs: list[float], ys: list[float]) -> float | None:
+    min_len = min(len(xs), len(ys))
+    min_required = max(3, int(settings.portfolio_corr_min_returns or 5))
+
+    if min_len < min_required:
+        return None
+
+    xs = xs[-min_len:]
+    ys = ys[-min_len:]
+
+    mean_x = sum(xs) / min_len
+    mean_y = sum(ys) / min_len
+
+    dx = [x - mean_x for x in xs]
+    dy = [y - mean_y for y in ys]
+
+    var_x = sum(x * x for x in dx)
+    var_y = sum(y * y for y in dy)
+
+    if var_x <= 0 or var_y <= 0:
+        return None
+
+    cov = sum(x * y for x, y in zip(dx, dy))
+    return cov / ((var_x ** 0.5) * (var_y ** 0.5))
+
+
+def _correlation_penalty_bps(max_corr: float | None) -> float:
+    if max_corr is None:
+        return 0.0
+
+    threshold = float(settings.portfolio_corr_threshold or 0.65)
+    cap = float(settings.portfolio_corr_penalty_cap_bps or 35.0)
+
+    if max_corr <= threshold:
+        return 0.0
+
+    return cap * min(
+        1.0,
+        (max_corr - threshold) / max(0.0001, 1.0 - threshold),
+    )
+
+
+def _candidate_sector_key(candidate: dict[str, Any]) -> str | None:
+    raw = (
+        candidate.get("sector")
+        or candidate.get("industry")
+        or candidate.get("universe_profile")
+        or candidate.get("market_segment")
+    )
+    if not raw:
+        return None
+    return str(raw).strip().lower() or None
+
+
+def _open_position_sector_keys(execution_mode: str) -> list[str]:
+    sectors: list[str] = []
+
+    try:
+        positions = _open_positions(execution_mode)
+    except Exception:
+        return sectors
+
+    for position in positions.values():
+        raw = (
+            position.get("sector")
+            or position.get("industry")
+            or position.get("universe_profile")
+            or position.get("market_segment")
+            or position.get("market")
+        )
+        if raw:
+            sectors.append(str(raw).strip().lower())
+
+    return sectors
+
+
+def _sector_penalty_bps(
+    candidate: dict[str, Any],
+    *,
+    execution_mode: str,
+) -> float:
+    candidate_sector = _candidate_sector_key(candidate)
+    if not candidate_sector:
+        return 0.0
+
+    open_sectors = _open_position_sector_keys(execution_mode)
+    same_count = sum(1 for sector in open_sectors if sector == candidate_sector)
+
+    per_position = float(settings.portfolio_sector_penalty_bps or 10.0)
+    cap = float(settings.portfolio_sector_penalty_cap_bps or 30.0)
+
+    return min(cap, same_count * per_position)
+
+
+def _neutral_portfolio_penalty(*, enabled: bool) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "max_corr_with_open_positions": None,
+        "correlation_penalty_bps": 0.0,
+        "sector_penalty_bps": 0.0,
+        "total_penalty_bps": 0.0,
+    }
+
+
+def _portfolio_penalty_for_candidate(
+    *,
+    candidate: dict[str, Any],
+    open_symbols: set[str],
+    execution_mode: str,
+) -> dict[str, Any]:
+    if not bool(settings.portfolio_penalty_enabled):
+        return _neutral_portfolio_penalty(enabled=False)
+
+    candidate_symbol = str(candidate.get("symbol") or "")
+    candidate_returns = _recent_symbol_returns_from_universe_db(candidate_symbol)
+
+    correlations: list[float] = []
+    if candidate_returns:
+        for open_symbol in open_symbols:
+            open_returns = _recent_symbol_returns_from_universe_db(str(open_symbol))
+            corr = _pearson_corr(candidate_returns, open_returns)
+            if corr is not None:
+                correlations.append(corr)
+
+    max_corr = max(correlations) if correlations else None
+    corr_penalty = _correlation_penalty_bps(max_corr)
+    sector_penalty = _sector_penalty_bps(candidate, execution_mode=execution_mode)
+
+    total = corr_penalty + sector_penalty
+
+    return {
+        "enabled": True,
+        "max_corr_with_open_positions": round(max_corr, 6) if max_corr is not None else None,
+        "correlation_penalty_bps": round(corr_penalty, 4),
+        "sector_penalty_bps": round(sector_penalty, 4),
+        "total_penalty_bps": round(total, 4),
+    }
+
+
+def _orderbook_feature_summary(
+    orderbook: dict[str, Any],
+    *,
+    order_value: float | None = None,
+) -> dict[str, Any]:
+    bids = orderbook.get("bids") or []
+    asks = orderbook.get("asks") or []
+
+    if not bids or not asks:
+        return {
+            "status": "missing",
+            "spread_bps": None,
+            "order_book_imbalance": None,
+            "weighted_order_book_imbalance": None,
+            "microprice_edge_bps": None,
+            "depth_coverage": None,
+            "approved": True,
+            "message": "Orderbook data unavailable; neutral pass",
+        }
+
+    top_n = max(1, min(10, int(settings.pretrade_orderbook_top_n or 3)))
+
+    try:
+        best_bid = float(bids[0]["price"])
+        best_ask = float(asks[0]["price"])
+        bid_sizes = [float(item.get("size") or 0.0) for item in bids[:top_n]]
+        ask_sizes = [float(item.get("size") or 0.0) for item in asks[:top_n]]
+    except (TypeError, ValueError, KeyError):
+        return {
+            "status": "invalid",
+            "spread_bps": None,
+            "order_book_imbalance": None,
+            "weighted_order_book_imbalance": None,
+            "microprice_edge_bps": None,
+            "depth_coverage": None,
+            "approved": True,
+            "message": "Orderbook data invalid; neutral pass",
+        }
+
+    if best_bid <= 0 or best_ask <= 0 or best_ask < best_bid:
+        return {
+            "status": "invalid",
+            "spread_bps": None,
+            "order_book_imbalance": None,
+            "weighted_order_book_imbalance": None,
+            "microprice_edge_bps": None,
+            "depth_coverage": None,
+            "approved": True,
+            "message": "Orderbook quote invalid; neutral pass",
+        }
+
+    mid = (best_bid + best_ask) / 2.0
+    spread_bps = (best_ask - best_bid) / mid * 10_000.0
+
+    bid_sum = sum(bid_sizes)
+    ask_sum = sum(ask_sizes)
+    denom = bid_sum + ask_sum
+
+    imbalance = None
+    if denom > 0:
+        imbalance = (bid_sum - ask_sum) / denom
+
+    weighted_bid = sum(size / idx for idx, size in enumerate(bid_sizes, start=1))
+    weighted_ask = sum(size / idx for idx, size in enumerate(ask_sizes, start=1))
+    weighted_denom = weighted_bid + weighted_ask
+
+    weighted_imbalance = None
+    if weighted_denom > 0:
+        weighted_imbalance = (weighted_bid - weighted_ask) / weighted_denom
+
+    microprice_edge_bps = None
+    if bid_sizes and ask_sizes and (bid_sizes[0] + ask_sizes[0]) > 0:
+        microprice = (
+            best_ask * bid_sizes[0] + best_bid * ask_sizes[0]
+        ) / (bid_sizes[0] + ask_sizes[0])
+        microprice_edge_bps = (microprice - mid) / mid * 10_000.0
+
+    ask_depth_value = 0.0
+    for item in asks[:top_n]:
+        try:
+            ask_depth_value += float(item.get("price") or 0.0) * float(
+                item.get("size") or 0.0
+            )
+        except (TypeError, ValueError):
+            continue
+
+    depth_coverage = None
+    if order_value and order_value > 0:
+        depth_coverage = ask_depth_value / order_value
+
+    approved = True
+    reasons: list[str] = []
+
+    if spread_bps > float(settings.pretrade_orderbook_max_spread_bps or 25.0):
+        approved = False
+        reasons.append(f"spread {spread_bps:.2f}bps too wide")
+
+    min_imbalance = float(settings.pretrade_orderbook_min_imbalance or -0.20)
+    if weighted_imbalance is not None and weighted_imbalance < min_imbalance:
+        approved = False
+        reasons.append(
+            f"weighted imbalance {weighted_imbalance:.3f} below {min_imbalance:.3f}"
+        )
+
+    min_depth = float(settings.pretrade_orderbook_min_depth_coverage or 2.0)
+    if depth_coverage is not None and depth_coverage < min_depth:
+        approved = False
+        reasons.append(f"depth coverage {depth_coverage:.2f} below {min_depth:.2f}")
+
+    return {
+        "status": "ready",
+        "spread_bps": round(spread_bps, 4),
+        "order_book_imbalance": round(imbalance, 6) if imbalance is not None else None,
+        "weighted_order_book_imbalance": round(weighted_imbalance, 6)
+        if weighted_imbalance is not None
+        else None,
+        "microprice_edge_bps": round(microprice_edge_bps, 4)
+        if microprice_edge_bps is not None
+        else None,
+        "depth_coverage": round(depth_coverage, 4)
+        if depth_coverage is not None
+        else None,
+        "approved": approved,
+        "message": "; ".join(reasons) if reasons else "Orderbook check passed",
+    }
+
+
+def _fetch_orderbook_neutral(symbol: str) -> dict[str, Any]:
+    """
+    Try to fetch orderbook data if a KIS helper exists.
+    If unavailable, return empty dict.
+    This function must never raise.
+    """
+    try:
+        from app.data_sources import kis as kis_source
+
+        fetcher = getattr(kis_source, "fetch_orderbook_data", None)
+        if fetcher is None:
+            fetcher = getattr(kis_source, "fetch_order_book_data", None)
+
+        if fetcher is None:
+            return {}
+
+        data = fetcher(symbol)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _clamp_float(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, float(value)))
+
+
+def _candidate_edge_for_sizing(candidate: dict[str, Any]) -> float:
+    raw = (
+        candidate.get("portfolio_adjusted_net_edge")
+        if candidate.get("portfolio_adjusted_net_edge") is not None
+        else candidate.get("net_edge")
+    )
+    try:
+        return float(raw or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _candidate_has_edge_for_sizing(candidate: dict[str, Any]) -> bool:
+    return (
+        candidate.get("portfolio_adjusted_net_edge") is not None
+        or candidate.get("net_edge") is not None
+    )
+
+
+def _candidate_stop_risk_bps(candidate: dict[str, Any]) -> float:
+    for key in (
+        "net_stop_loss_bps",
+        "stop_loss_bps",
+        "expected_risk",
+        "expected_risk_bps",
+    ):
+        try:
+            value = candidate.get(key)
+            if value is not None and float(value) > 0:
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+
+    reward_risk = candidate.get("edge_reward_risk") or {}
+    try:
+        value = reward_risk.get("loss_risk_floor_bps")
+        if value is not None and float(value) > 0:
+            return float(value)
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+    return float(settings.position_sizing_default_stop_bps or 250.0)
+
+
+def _edge_position_multiplier(candidate: dict[str, Any]) -> float:
+    if not bool(settings.position_sizing_edge_enabled):
+        return 1.0
+
+    edge = _candidate_edge_for_sizing(candidate)
+
+    edge_floor = float(settings.position_sizing_edge_floor_bps or 0.0)
+    edge_cap = max(
+        edge_floor + 1.0,
+        float(settings.position_sizing_edge_cap_bps or 150.0),
+    )
+
+    min_multiplier = float(settings.position_sizing_min_multiplier or 0.35)
+    max_multiplier = float(settings.position_sizing_max_multiplier or 1.0)
+
+    if edge <= edge_floor:
+        return min_multiplier
+
+    raw = edge / edge_cap
+    return _clamp_float(raw, min_multiplier, max_multiplier)
+
+
+def _position_value_from_edge_and_risk(
+    *,
+    candidate: dict[str, Any],
+    account_equity: float,
+    risk_per_trade: float,
+    regime_position_multiplier: float = 1.0,
+) -> dict[str, Any]:
+    equity = max(0.0, float(account_equity or 0.0))
+    risk_fraction = max(0.0001, float(risk_per_trade or 0.005))
+
+    stop_bps = max(1.0, _candidate_stop_risk_bps(candidate))
+    stop_risk_pct = stop_bps / 10_000.0
+
+    risk_budget = equity * risk_fraction
+    raw_position_value = risk_budget / max(0.0001, stop_risk_pct)
+
+    edge_multiplier = _edge_position_multiplier(candidate)
+
+    max_symbol_weight = max(
+        0.001,
+        float(settings.position_sizing_max_symbol_weight or 0.10),
+    )
+    max_symbol_value = equity * max_symbol_weight
+
+    final_position_value = min(
+        raw_position_value * edge_multiplier,
+        max_symbol_value,
+    )
+    regime_multiplier = _clamp_float(regime_position_multiplier, 0.0, 1.25)
+    final_position_value = final_position_value * regime_multiplier
+
+    return {
+        "position_value": round(max(0.0, final_position_value), 4),
+        "risk_budget": round(risk_budget, 4),
+        "stop_risk_bps": round(stop_bps, 4),
+        "edge_for_sizing_bps": round(_candidate_edge_for_sizing(candidate), 4),
+        "edge_position_multiplier": round(edge_multiplier, 4),
+        "regime_position_multiplier": round(regime_multiplier, 4),
+        "max_symbol_value": round(max_symbol_value, 4),
+        "position_sizing_formula": (
+            "position_value = min((account_equity * risk_per_trade / stop_risk_pct) "
+            "* edge_multiplier, account_equity * max_symbol_weight) * regime_position_multiplier"
+        ),
+    }
+
+
+def _candidate_with_symbol_stop_risk(
+    candidate: dict[str, Any],
+    symbol_cfg: AutoTradeSymbolConfig,
+) -> dict[str, Any]:
+    for key in (
+        "net_stop_loss_bps",
+        "stop_loss_bps",
+        "expected_risk",
+        "expected_risk_bps",
+    ):
+        if _safe_float(candidate.get(key), 0.0) > 0:
+            return candidate
+
+    reward_risk = candidate.get("edge_reward_risk") or {}
+    if isinstance(reward_risk, dict):
+        if _safe_float(reward_risk.get("loss_risk_floor_bps"), 0.0) > 0:
+            return candidate
+
+    price = _safe_float(symbol_cfg.price or symbol_cfg.order_price, 0.0)
+    stop_loss = _safe_float(symbol_cfg.stop_loss, 0.0)
+    if price <= 0 or stop_loss <= 0 or stop_loss >= price:
+        return candidate
+
+    return {
+        **candidate,
+        "stop_loss_bps": (price - stop_loss) / price * 10_000.0,
+    }
+
+
+def _apply_candidate_position_sizing(
+    *,
+    symbol_cfg: AutoTradeSymbolConfig,
+    candidate: dict[str, Any],
+) -> AutoTradeSymbolConfig:
+    if not _candidate_has_edge_for_sizing(candidate):
+        return symbol_cfg
+
+    account_equity = _safe_float(symbol_cfg.account_equity, 0.0)
+    risk_per_trade = _safe_float(symbol_cfg.risk_per_trade, 0.0)
+    if account_equity <= 0 or risk_per_trade <= 0:
+        return symbol_cfg
+
+    sizing_candidate = _candidate_with_symbol_stop_risk(candidate, symbol_cfg)
+    regime_gate = candidate.get("regime_gate") or {}
+    regime_multiplier = 1.0
+    if isinstance(regime_gate, dict):
+        regime_multiplier = _safe_float(regime_gate.get("position_multiplier"), 1.0)
+    try:
+        sizing = _position_value_from_edge_and_risk(
+            candidate=sizing_candidate,
+            account_equity=account_equity,
+            risk_per_trade=risk_per_trade,
+            regime_position_multiplier=regime_multiplier,
+        )
+    except Exception:
+        return symbol_cfg
+
+    position_value = _safe_float(sizing.get("position_value"), 0.0)
+    if position_value <= 0:
+        if _safe_float(sizing.get("regime_position_multiplier"), 1.0) <= 0:
+            candidate["position_sizing"] = sizing
+            return symbol_cfg.model_copy(
+                update={
+                    "cash_available": 0.0,
+                    "position_size": 0.0,
+                }
+            )
+        return symbol_cfg
+
+    candidate["position_sizing"] = sizing
+
+    existing_cash = symbol_cfg.cash_available
+    cash_cap = position_value
+    if existing_cash is not None:
+        cash_cap = min(cash_cap, _safe_float(existing_cash, position_value))
+
+    return symbol_cfg.model_copy(
+        update={
+            "cash_available": round(cash_cap, 4),
+            "position_size": round(cash_cap / account_equity, 6),
+        }
+    )
+
+
 def _entry_symbols_from_scanner_candidates(
     *,
     req: AutoTradeStartRequest,
@@ -571,27 +1280,173 @@ def _entry_symbols_from_scanner_candidates(
 ) -> list[AutoTradeSymbolConfig]:
     now = _now()
     hurdle_rate = _scanner_hurdle_rate_for_mode(req.execution_mode)
-    rows = sorted(
-        active_candidates,
-        key=lambda item: (
-            float(item.get("net_edge") or 0),
-            float(item.get("composite_score") or 0),
-            -int(item.get("rank") or 999),
-        ),
-        reverse=True,
+    try:
+        regime_gate = regime_gate_for_mode(
+            execution_mode=req.execution_mode,
+            base_hurdle_bps=hurdle_rate,
+        )
+    except Exception:
+        if req.execution_mode == "live":
+            return []
+        regime_gate = {
+            "enabled": True,
+            "approved": True,
+            "status": "error",
+            "regime": "unknown",
+            "base_hurdle_bps": round(hurdle_rate, 4),
+            "hurdle_adjustment_bps": 0.0,
+            "regime_adjusted_hurdle_bps": round(hurdle_rate, 4),
+            "position_multiplier": 1.0,
+            "message": "regime gate unavailable; paper neutral pass",
+        }
+
+    effective_hurdle_rate = _safe_float(
+        regime_gate.get("regime_adjusted_hurdle_bps"),
+        hurdle_rate,
     )
-    symbols: list[AutoTradeSymbolConfig] = []
-    for candidate in rows:
+
+    if req.execution_mode != "paper" and regime_gate.get("approved") is False:
+        return []
+
+    adjusted_rows: list[dict[str, Any]] = []
+
+    for candidate in active_candidates:
         symbol = str(candidate.get("symbol") or "")
         if not symbol or symbol in open_symbols:
             continue
+
         if candidate.get("status") not in ("READY", "CLAIMED"):
             continue
+
         if str(candidate.get("expires_at") or "") <= now:
             continue
-        if float(candidate.get("net_edge") or 0.0) <= hurdle_rate:
+
+        base_net_edge = _safe_float(candidate.get("net_edge"), 0.0)
+
+        try:
+            portfolio_penalty = _portfolio_penalty_for_candidate(
+                candidate=candidate,
+                open_symbols=open_symbols,
+                execution_mode=req.execution_mode,
+            )
+        except Exception:
+            if req.execution_mode == "live":
+                continue
+            portfolio_penalty = _neutral_portfolio_penalty(
+                enabled=bool(settings.portfolio_penalty_enabled),
+            )
+
+        total_penalty = _safe_float(portfolio_penalty.get("total_penalty_bps"), 0.0)
+        adjusted_net_edge = base_net_edge - total_penalty
+
+        portfolio_adjusted_candidate = {
+            **candidate,
+            "base_net_edge": round(base_net_edge, 4),
+            "portfolio_adjusted_net_edge": round(adjusted_net_edge, 4),
+            "portfolio_penalty": portfolio_penalty,
+        }
+
+        try:
+            fill_quality = fill_quality_adjustment_for_candidate(
+                portfolio_adjusted_candidate,
+                execution_mode=req.execution_mode,
+            )
+        except Exception:
+            if req.execution_mode == "live":
+                continue
+            fill_quality = {
+                "status": "error",
+                "fill_probability": _safe_float(
+                    settings.fill_quality_default_probability,
+                    _safe_float(settings.default_fill_probability, 0.95),
+                ),
+                "fill_slippage_penalty_bps": 0.0,
+                "fill_delay_penalty_bps": 0.0,
+                "total_fill_quality_penalty_bps": 0.0,
+                "approved": True,
+                "message": "Fill-quality adjustment unavailable; neutral pass",
+            }
+
+        fill_probability = _safe_float(
+            fill_quality.get("fill_probability"),
+            _safe_float(settings.default_fill_probability, 0.95),
+        )
+        fill_penalty = _safe_float(
+            fill_quality.get("total_fill_quality_penalty_bps"),
+            0.0,
+        )
+        fill_quality_adjusted_edge = adjusted_net_edge * fill_probability - fill_penalty
+
+        if req.execution_mode != "paper" and fill_quality.get("approved") is False:
             continue
-        symbols.append(scanner_candidate_to_symbol_config(req, candidate))
+
+        candidate_with_adjustments = {
+            **portfolio_adjusted_candidate,
+            "pre_fill_quality_edge": round(adjusted_net_edge, 4),
+            "fill_quality_adjusted_edge": round(fill_quality_adjusted_edge, 4),
+            "fill_quality": fill_quality,
+            "regime_gate": regime_gate,
+            "effective_hurdle_rate_bps": round(effective_hurdle_rate, 4),
+        }
+
+        signal_decay = _signal_decay_for_candidate(
+            candidate_with_adjustments,
+            execution_mode=req.execution_mode,
+        )
+
+        if req.execution_mode != "paper" and signal_decay.get("approved") is False:
+            continue
+
+        final_entry_edge = _safe_float(
+            signal_decay.get("signal_decay_adjusted_edge"),
+            _final_edge_before_signal_decay(candidate_with_adjustments),
+        )
+
+        if final_entry_edge <= effective_hurdle_rate:
+            continue
+
+        adjusted_rows.append(
+            {
+                **candidate_with_adjustments,
+                "signal_decay": signal_decay,
+                "final_entry_edge": round(final_entry_edge, 4),
+            }
+        )
+
+    adjusted_rows = sorted(
+        adjusted_rows,
+        key=lambda item: (
+            _safe_float(item.get("final_entry_edge"), 0.0),
+            _safe_float(
+                item.get("fill_quality_adjusted_edge"),
+                _safe_float(
+                    item.get("portfolio_adjusted_net_edge"),
+                    _safe_float(item.get("net_edge"), 0.0),
+                ),
+            ),
+            _safe_float(item.get("composite_score"), 0.0),
+            -_safe_int(item.get("rank"), 999),
+        ),
+        reverse=True,
+    )
+
+    symbols: list[AutoTradeSymbolConfig] = []
+    for candidate in adjusted_rows:
+        symbol_cfg = scanner_candidate_to_symbol_config(req, candidate)
+        symbol_cfg = symbol_cfg.model_copy(
+            update={
+                "fill_quality": candidate.get("fill_quality"),
+                "regime_gate": candidate.get("regime_gate"),
+                "signal_decay": candidate.get("signal_decay"),
+                "final_entry_edge": candidate.get("final_entry_edge"),
+            }
+        )
+        symbol_cfg = _apply_candidate_position_sizing(
+            symbol_cfg=symbol_cfg,
+            candidate=candidate,
+        )
+        symbols.append(symbol_cfg)
+
     return symbols
 
 
@@ -1030,6 +1885,15 @@ def _allocate_cash_to_symbols(
         )
         target_weight = max(0.0, target_weight)
         max_allocation = min(remaining_cash, account_equity * target_weight)
+        symbol_position_size = _to_float(symbol_cfg.position_size)
+        if symbol_position_size is not None:
+            max_allocation = min(
+                max_allocation,
+                account_equity * max(0.0, float(symbol_position_size)),
+            )
+        symbol_cash_cap = _to_float(symbol_cfg.cash_available)
+        if symbol_cash_cap is not None:
+            max_allocation = min(max_allocation, max(0.0, float(symbol_cash_cap)))
         if max_allocation <= 0:
             blocked_by_index[index] = _insufficient_cash_result(
                 symbol_cfg=symbol_cfg,
@@ -1184,6 +2048,221 @@ def _strategy_circuit_breaker_for_symbol(
         }
 
 
+def _record_fill_quality_for_result(
+    *,
+    result: dict[str, Any],
+    req: AutoTradeStartRequest,
+    symbol_cfg: AutoTradeSymbolConfig,
+) -> dict[str, Any] | None:
+    try:
+        payload: dict[str, Any] = {
+            **result,
+            "symbol": symbol_cfg.symbol,
+            "side": "sell" if symbol_cfg.requested_action == "exit" else "buy",
+            "requested_action": symbol_cfg.requested_action,
+            "decision_price": getattr(symbol_cfg, "decision_price", None),
+            "order_price": getattr(symbol_cfg, "order_price", None),
+            "quantity": getattr(symbol_cfg, "quantity", None),
+            "requested_quantity": getattr(symbol_cfg, "quantity", None),
+            "execution_mode": req.execution_mode,
+            "source": "auto_trading",
+        }
+
+        execution = result.get("execution")
+        if isinstance(execution, dict):
+            paper_result = execution.get("paper_result")
+            if isinstance(paper_result, dict):
+                payload.update(
+                    {
+                        "filled_price": (
+                            paper_result.get("fill_price")
+                            or paper_result.get("effective_price")
+                        ),
+                        "filled_quantity": paper_result.get("quantity"),
+                        "slippage_bps": paper_result.get("slippage_bps"),
+                        "paper_result": paper_result,
+                    }
+                )
+            order_state_result = execution.get("order_state")
+            if isinstance(order_state_result, dict):
+                payload.update(
+                    {
+                        "filled_quantity": (
+                            order_state_result.get("filled_quantity")
+                            or payload.get("filled_quantity")
+                        ),
+                        "order_state": order_state_result,
+                    }
+                )
+
+        recording = record_fill_quality_event(payload)
+        result["fill_quality_recording"] = recording
+        return recording
+    except Exception:
+        return None
+
+
+def _exit_position_snapshot(
+    *,
+    req: AutoTradeStartRequest,
+    symbol_cfg: AutoTradeSymbolConfig,
+) -> dict[str, Any]:
+    if symbol_cfg.requested_action != "exit":
+        return {}
+    try:
+        return _open_positions(req.execution_mode).get(symbol_cfg.symbol) or {}
+    except Exception:
+        return {}
+
+
+def _order_result_indicates_realized_exit(
+    *,
+    req: AutoTradeStartRequest,
+    symbol_cfg: AutoTradeSymbolConfig,
+    result: dict[str, Any],
+) -> bool:
+    if symbol_cfg.requested_action != "exit":
+        return False
+
+    execution = result.get("execution")
+    if not isinstance(execution, dict):
+        return False
+
+    if req.execution_mode == "paper":
+        paper_result = execution.get("paper_result")
+        if not isinstance(paper_result, dict):
+            return False
+        return (
+            str(paper_result.get("order_status") or "").upper()
+            in {"FILLED", "PARTIALLY_FILLED"}
+            and _safe_float(paper_result.get("quantity"), 0.0) > 0
+        )
+
+    order_state_result = execution.get("order_state")
+    if not isinstance(order_state_result, dict):
+        return False
+    return (
+        str(order_state_result.get("state") or "").upper() == "FLAT"
+        and _safe_float(order_state_result.get("filled_quantity"), 0.0) > 0
+    )
+
+
+def _bps_from_amount(amount: Any, notional: float | None) -> float | None:
+    parsed = _safe_float(amount, 0.0)
+    if notional is None or notional <= 0:
+        return None
+    return abs(parsed) / notional * 10_000.0
+
+
+def _record_outcome_attribution_for_result(
+    *,
+    result: dict[str, Any],
+    req: AutoTradeStartRequest,
+    symbol_cfg: AutoTradeSymbolConfig,
+    position_before_exit: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not _order_result_indicates_realized_exit(
+        req=req,
+        symbol_cfg=symbol_cfg,
+        result=result,
+    ):
+        return None
+
+    try:
+        position = position_before_exit or {}
+        execution = result.get("execution") if isinstance(result.get("execution"), dict) else {}
+        paper_result = (
+            execution.get("paper_result")
+            if isinstance(execution.get("paper_result"), dict)
+            else {}
+        )
+        order_state_result = (
+            execution.get("order_state")
+            if isinstance(execution.get("order_state"), dict)
+            else {}
+        )
+
+        entry_price = _to_float(position.get("avg_price"))
+        if entry_price is None and req.execution_mode == "paper":
+            entry_price = _to_float(position.get("current_price"))
+
+        exit_price = (
+            _to_float(result.get("exit_price"))
+            or _to_float(result.get("filled_price"))
+            or _to_float(paper_result.get("fill_price"))
+            or _to_float(paper_result.get("effective_price"))
+            or _to_float(result.get("price"))
+        )
+
+        quantity = (
+            _to_float(paper_result.get("quantity"))
+            or _to_float(order_state_result.get("filled_quantity"))
+            or _to_float(result.get("quantity"))
+            or _to_float(symbol_cfg.quantity)
+        )
+
+        notional = None
+        if entry_price is not None and quantity is not None:
+            notional = entry_price * quantity
+
+        cost_breakdown = paper_result.get("cost_breakdown")
+        if not isinstance(cost_breakdown, dict):
+            cost_breakdown = {}
+
+        commission_bps = _bps_from_amount(cost_breakdown.get("commission"), notional)
+        tax_bps = _bps_from_amount(cost_breakdown.get("tax"), notional)
+        slippage_cost_bps = _bps_from_amount(
+            cost_breakdown.get("slippage_cost"),
+            notional,
+        )
+        if slippage_cost_bps is None:
+            slippage_cost_bps = abs(_safe_float(paper_result.get("slippage_bps"), 0.0))
+
+        trading_cost_bps = None
+        if commission_bps is not None or tax_bps is not None:
+            trading_cost_bps = (commission_bps or 0.0) + (tax_bps or 0.0)
+
+        recording = record_outcome_attribution(
+            {
+                **result,
+                "symbol": symbol_cfg.symbol,
+                "execution_mode": req.execution_mode,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "quantity": quantity,
+                "entry_time": (
+                    result.get("entry_time")
+                    or position.get("opened_at")
+                    or position.get("updated_at")
+                    or position.get("synced_at")
+                ),
+                "exit_time": result.get("exit_time") or result.get("closed_at") or _now(),
+                "trading_cost_bps": trading_cost_bps,
+                "slippage_cost_bps": slippage_cost_bps,
+                "net_edge": getattr(symbol_cfg, "net_edge", None),
+                "portfolio_adjusted_net_edge": result.get("portfolio_adjusted_net_edge"),
+                "fill_quality_adjusted_edge": result.get("fill_quality_adjusted_edge"),
+                "final_entry_edge": result.get("final_entry_edge")
+                or getattr(symbol_cfg, "final_entry_edge", None),
+                "portfolio_penalty": result.get("portfolio_penalty"),
+                "fill_quality": result.get("fill_quality")
+                or getattr(symbol_cfg, "fill_quality", None),
+                "signal_decay": result.get("signal_decay")
+                or getattr(symbol_cfg, "signal_decay", None),
+                "regime_gate": result.get("regime_gate")
+                or getattr(symbol_cfg, "regime_gate", None),
+                "position_sizing": result.get("position_sizing"),
+                "paper_result": paper_result,
+                "order_state": order_state_result,
+                "source": "auto_trading_close",
+            }
+        )
+        result["outcome_attribution"] = recording
+        return recording
+    except Exception:
+        return None
+
+
 def _run_symbol(
     req: AutoTradeStartRequest,
     symbol_cfg: AutoTradeSymbolConfig,
@@ -1200,12 +2279,43 @@ def _run_symbol(
             }
 
         price = float(price_result["price"])
+        position_before_exit = _exit_position_snapshot(req=req, symbol_cfg=symbol_cfg)
         symbol_cfg = _apply_order_sizing_defaults(
             req,
             symbol_cfg,
             price,
             price_result.get("price_data") or {},
         )
+        orderbook_check: dict[str, Any] | None = None
+        if (
+            settings.pretrade_orderbook_check_enabled
+            and symbol_cfg.requested_action != "exit"
+        ):
+            order_value = None
+            if symbol_cfg.quantity and price:
+                order_value = float(symbol_cfg.quantity) * float(price)
+            elif symbol_cfg.cash_available:
+                order_value = float(symbol_cfg.cash_available)
+
+            orderbook = _fetch_orderbook_neutral(symbol_cfg.symbol)
+            orderbook_check = _orderbook_feature_summary(
+                orderbook,
+                order_value=order_value,
+            )
+
+            if (
+                req.execution_mode != "paper"
+                and orderbook_check.get("approved") is False
+            ):
+                return {
+                    "symbol": symbol_cfg.symbol,
+                    "status": "blocked",
+                    "message": str(
+                        orderbook_check.get("message") or "Orderbook check failed"
+                    ),
+                    "orderbook_check": orderbook_check,
+                }
+
         preview_req = _to_preview_request(symbol_cfg, price)
         preview = create_order_preview(preview_req)
         result: dict[str, Any] = {
@@ -1215,13 +2325,33 @@ def _run_symbol(
             "price_source": price_result["source"],
             "preview": preview,
         }
+        if symbol_cfg.fill_quality is not None:
+            result["fill_quality"] = symbol_cfg.fill_quality
+        if symbol_cfg.regime_gate is not None:
+            result["regime_gate"] = symbol_cfg.regime_gate
+        if symbol_cfg.signal_decay is not None:
+            result["signal_decay"] = symbol_cfg.signal_decay
+        if symbol_cfg.final_entry_edge is not None:
+            result["final_entry_edge"] = symbol_cfg.final_entry_edge
+        if orderbook_check is not None:
+            result["orderbook_check"] = orderbook_check
         if preview["status"] != "pending":
             result["message"] = preview["message"]
+            _record_fill_quality_for_result(
+                result=result,
+                req=req,
+                symbol_cfg=symbol_cfg,
+            )
             return result
 
         if req.execution_mode == "paper":
             if not req.auto_confirm_paper:
                 result["message"] = "Paper preview created but auto_confirm_paper is false"
+                _record_fill_quality_for_result(
+                    result=result,
+                    req=req,
+                    symbol_cfg=symbol_cfg,
+                )
                 return result
             result["execution"] = confirm_order_preview(
                 OrderConfirmRequest(
@@ -1231,6 +2361,17 @@ def _run_symbol(
                 )
             )
             result["status"] = result["execution"]["status"]
+            _record_fill_quality_for_result(
+                result=result,
+                req=req,
+                symbol_cfg=symbol_cfg,
+            )
+            _record_outcome_attribution_for_result(
+                result=result,
+                req=req,
+                symbol_cfg=symbol_cfg,
+                position_before_exit=position_before_exit,
+            )
             return result
 
         result["execution"] = execute_live_order(
@@ -1243,6 +2384,17 @@ def _run_symbol(
             )
         )
         result["status"] = result["execution"]["status"]
+        _record_fill_quality_for_result(
+            result=result,
+            req=req,
+            symbol_cfg=symbol_cfg,
+        )
+        _record_outcome_attribution_for_result(
+            result=result,
+            req=req,
+            symbol_cfg=symbol_cfg,
+            position_before_exit=position_before_exit,
+        )
         return result
     except (OrderApprovalError, LiveTradingError, AutoTradingError) as exc:
         return {
@@ -1465,8 +2617,8 @@ def _open_paper_positions() -> dict[str, dict[str, Any]]:
             paper_trading.initialize_db(conn)
             rows = conn.execute(
                 """
-                SELECT symbol, name, quantity, avg_price AS current_price,
-                       opened_at, updated_at
+                SELECT symbol, name, market, sector, quantity,
+                       avg_price, avg_price AS current_price, opened_at, updated_at
                 FROM positions
                 WHERE quantity > 0
                 """
@@ -1487,7 +2639,7 @@ def _open_live_positions() -> dict[str, dict[str, Any]]:
             broker_sync._ensure_column(conn, "broker_positions", "opened_at", "TEXT")
             rows = conn.execute(
                 """
-                SELECT symbol, name, quantity, current_price, opened_at, synced_at
+                SELECT symbol, name, quantity, avg_price, current_price, opened_at, synced_at
                 FROM broker_positions
                 WHERE broker = 'KIS'
                   AND quantity > 0

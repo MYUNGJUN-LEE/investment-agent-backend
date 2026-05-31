@@ -51,6 +51,10 @@ from app.trading.auto_trading import (
     start_auto_trading,
     stop_auto_trading,
 )
+from app.trading.auto_tuning import (
+    generate_auto_tuning_recommendations,
+    latest_auto_tuning_recommendation,
+)
 from app.trading.broker_sync import sync_kis_account
 from app.trading.edge_calibration import (
     calibrate_edge_model,
@@ -829,6 +833,7 @@ def admin_runtime_status(limit: int = 20):
     latest_universe = get_latest_universe_scan()
     workers = embedded_worker_status()
     raw_active_sessions = auto_trading_store.list_sessions(status="active", limit=50)
+    auto_tuning = latest_auto_tuning_recommendation()
     summary = _admin_runtime_summary(
         generated_at=generated_at,
         auto_status=auto_status,
@@ -845,7 +850,28 @@ def admin_runtime_status(limit: int = 20):
         "latest_universe": latest_universe,
         "samples": samples,
         "workers": workers,
+        "auto_tuning": auto_tuning,
     }
+
+
+@app.get(
+    "/admin/auto-tuning/latest",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getLatestAutoTuningRecommendation",
+    summary="Get the latest saved auto-tuning recommendation report",
+)
+def admin_auto_tuning_latest():
+    return latest_auto_tuning_recommendation()
+
+
+@app.post(
+    "/admin/auto-tuning/refresh",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="refreshAutoTuningRecommendations",
+    summary="Generate advisory auto-tuning recommendations from recent outcome attribution",
+)
+def admin_auto_tuning_refresh():
+    return generate_auto_tuning_recommendations(persist=True)
 
 
 def _admin_runtime_summary(

@@ -2383,7 +2383,8 @@ def _worker_hurdle_rate_bps(execution_mode: str = "paper") -> float:
     if execution_mode != "paper":
         return max(0.0, configured)
 
-    # Paper bootstrap: positive configured hurdle should not block sample collection.
+    # Paper bootstrap:
+    # If config has a positive hurdle like 40bps, do not let it block sample collection.
     if configured > 0:
         configured = -20.0
     else:

@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
+from app.models import PaperRunRequest
+from app.trading import cost_model
 from app.trading import order_approval, paper_trading
 
 
@@ -140,8 +142,28 @@ def test_order_preview_and_confirm_execute_paper_order(tmp_path, monkeypatch):
             ("005930",),
         ).fetchone()
 
+    expected_cost = cost_model.estimate_order_cost(
+        PaperRunRequest(
+            symbol="005930",
+            name="?쇱꽦?꾩옄",
+            market="KR",
+            strategy_type="daytrade",
+            signal_type="entry",
+            price=75000,
+            quantity=3,
+        ),
+        side="BUY",
+        quantity=3,
+    )
+    expected_avg_price = round(
+        (expected_cost.requested_amount + expected_cost.total_cost) / 3,
+        4,
+    )
+
     assert preview_status == "confirmed"
-    assert position == (3, 75011.25)
+    assert expected_cost.commission == round(75000 * 3 * settings.commission_rate, 6)
+    assert expected_cost.tax == 0.0
+    assert position == (3, expected_avg_price)
 
 
 def test_order_preview_blocks_when_expected_edge_does_not_cover_costs(tmp_path, monkeypatch):

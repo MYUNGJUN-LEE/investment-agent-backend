@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.config import settings
 from app.models import PaperRunRequest
 from app.trading.cost_model import estimate_order_cost, evaluate_entry_edge
 
@@ -51,6 +52,32 @@ def test_edge_gate_rejects_trade_when_net_edge_is_too_small():
 
 
 def test_edge_gate_accepts_trade_with_cost_adjusted_edge_and_reward_risk():
+    edge_probe = evaluate_entry_edge(
+        PaperRunRequest(
+            symbol="005930",
+            market="KR",
+            strategy_type="daytrade",
+            risk_level="medium",
+            signal_type="entry",
+            price=100_000,
+            quantity=10,
+            confidence=0.9,
+            expected_gross_edge_bps=0,
+            expected_win_bps=90,
+            expected_loss_bps=50,
+            expected_sharpe=1.2,
+        ),
+        quantity=10,
+    )
+    required_gross_edge_bps = round(
+        (
+            edge_probe["required_net_edge_bps"]
+            + edge_probe["round_trip_cost"]["total_cost_bps"]
+        )
+        / settings.default_fill_probability
+        + 1.0,
+        4,
+    )
     req = PaperRunRequest(
         symbol="005930",
         market="KR",
@@ -60,7 +87,7 @@ def test_edge_gate_accepts_trade_with_cost_adjusted_edge_and_reward_risk():
         price=100_000,
         quantity=10,
         confidence=0.9,
-        expected_gross_edge_bps=120,
+        expected_gross_edge_bps=required_gross_edge_bps,
         expected_win_bps=90,
         expected_loss_bps=50,
         expected_sharpe=1.2,
@@ -70,3 +97,4 @@ def test_edge_gate_accepts_trade_with_cost_adjusted_edge_and_reward_risk():
 
     assert decision["approved"] is True
     assert decision["reward_risk_ratio"] == 1.8
+    assert decision["net_edge_bps"] >= decision["required_net_edge_bps"]

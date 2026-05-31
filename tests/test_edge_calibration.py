@@ -59,7 +59,7 @@ def test_edge_calibration_fits_coefficients_from_scanner_history(tmp_path, monke
     assert status["coefficient_count"] == len(edge_calibration.FEATURE_NAMES) * 2
     assert "expected_return" in model
     assert estimate is not None
-    assert estimate["edge_model"] == "calibrated_ridge_v1"
+    assert estimate["edge_model"] == "calibrated_ridge_v2_cost_adjusted"
 
 
 def test_label_age_blocks_immediate_future_snapshot(tmp_path, monkeypatch):
@@ -231,13 +231,14 @@ def test_edge_entry_gate_passes_after_oos_and_top10_thresholds(tmp_path, monkeyp
                 symbol=symbol,
                 raw_score=70 + index,
                 current_price=100,
+                net_edge=200 + index * 10,
             )
             _insert_price(
                 conn,
                 scan_id=f"future-{index}",
                 created_at=f"2026-05-24T10:0{index}:00",
                 symbol=symbol,
-                price=105 + index,
+                price=95 if index == 0 else 105 + index,
             )
 
     result = edge_calibration.calibrate_edge_model(
@@ -246,8 +247,28 @@ def test_edge_entry_gate_passes_after_oos_and_top10_thresholds(tmp_path, monkeyp
         min_samples=5,
         max_samples=10,
     )
+    with sqlite3.connect(calibration_db) as conn:
+        for index in range(5):
+            conn.execute(
+                """
+                UPDATE edge_training_samples
+                SET net_edge_bps = ?
+                WHERE symbol = ?
+                """,
+                (100 + index * 50, f"{index + 1:06d}"),
+            )
     gate = edge_calibration.edge_entry_gate(
-        [{"symbol": "000001", "net_edge": 80}],
+        [
+            {
+                "symbol": "000001",
+                "status": "READY",
+                "net_edge": 200,
+                "expected_return": 500,
+                "trading_cost": 49.4,
+                "slippage_cost": 10,
+                "liquidity_drag_bps": 0,
+            }
+        ],
         calibration_db_path=calibration_db,
     )
 
@@ -258,7 +279,7 @@ def test_edge_entry_gate_passes_after_oos_and_top10_thresholds(tmp_path, monkeyp
     assert gate["top10_performance"]["sample_count"] == 5
 
 
-def test_edge_gate_uses_expectancy_instead_of_direct_win_rate(monkeypatch):
+def test_edge_gate_requires_current_top10_quality_metrics(monkeypatch):
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_samples", 5)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 1)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_return_bps", 10_000)
@@ -268,28 +289,45 @@ def test_edge_gate_uses_expectancy_instead_of_direct_win_rate(monkeypatch):
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_expectancy_bps", 0)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 60)
 
+    top10_performance = {
+        "status": "ready",
+        "sample_count": 10,
+        "top_count": 10,
+        "avg_return_bps": 12,
+        "win_rate": 0.60,
+        "loss_rate": 0.40,
+        "avg_win_bps": 60,
+        "avg_loss_bps": 10,
+        "expectancy_bps": 32,
+    }
+    candidate = {
+        "symbol": "005930",
+        "status": "READY",
+        "net_edge": 200,
+        "expected_return": 500,
+        "trading_cost": 49.4,
+        "slippage_cost": 10,
+        "liquidity_drag_bps": 0,
+    }
+
     gate = edge_calibration._gate_from_metrics(
         sample_count=5,
         oos_sample_count=1,
         mae_return_bps=100,
         mae_risk_bps=100,
-        top10_performance={
-            "status": "ready",
-            "sample_count": 10,
-            "top_count": 10,
-            "avg_return_bps": 12,
-            "win_rate": 0.40,
-            "loss_rate": 0.60,
-            "avg_win_bps": 60,
-            "avg_loss_bps": 10,
-            "expectancy_bps": 18,
-        },
+        top10_performance=top10_performance,
         fill_adjustment={"multiplier": 1.0},
-        candidates=[{"symbol": "005930", "net_edge": 80}],
+        ic_metrics={"ic": 0.03},
+        candidates=[candidate],
     )
 
     assert gate["approved"] is True
     assert gate["required"]["target_top10_win_rate"] == 0.50
+    assert gate["required"]["min_profit_factor"] == 1.10
+    assert gate["required"]["min_recent_ic"] == 0.02
+    assert gate["required"]["min_cost_coverage"] == 2.0
+    assert gate["top10_performance"]["profit_factor"] == 9.0
+    assert gate["best_cost_coverage"] == round(500 / (49.4 + 10), 4)
 
     blocked = edge_calibration._gate_from_metrics(
         sample_count=5,
@@ -308,11 +346,31 @@ def test_edge_gate_uses_expectancy_instead_of_direct_win_rate(monkeypatch):
             "expectancy_bps": -10,
         },
         fill_adjustment={"multiplier": 1.0},
-        candidates=[{"symbol": "005930", "net_edge": 80}],
+        ic_metrics={"ic": 0.03},
+        candidates=[candidate],
     )
 
     assert blocked["approved"] is False
     assert "top10_expectancy_bps" in blocked["message"]
+
+    low_win_rate = edge_calibration._gate_from_metrics(
+        sample_count=5,
+        oos_sample_count=1,
+        mae_return_bps=100,
+        mae_risk_bps=100,
+        top10_performance={
+            **top10_performance,
+            "win_rate": 0.40,
+            "loss_rate": 0.60,
+            "expectancy_bps": 18,
+        },
+        fill_adjustment={"multiplier": 1.0},
+        ic_metrics={"ic": 0.03},
+        candidates=[candidate],
+    )
+
+    assert low_win_rate["approved"] is False
+    assert "top10_win_rate 0.4 < 0.5" in low_win_rate["message"]
 
 
 def test_edge_gate_uses_configured_top10_return_threshold(monkeypatch):
@@ -334,14 +392,25 @@ def test_edge_gate_uses_configured_top10_return_threshold(monkeypatch):
             "sample_count": 10,
             "top_count": 10,
             "avg_return_bps": 25,
-            "win_rate": 0.40,
-            "loss_rate": 0.60,
+            "win_rate": 0.60,
+            "loss_rate": 0.40,
             "avg_win_bps": 90,
             "avg_loss_bps": 20,
             "expectancy_bps": 24,
         },
         fill_adjustment={"multiplier": 1.0},
-        candidates=[{"symbol": "035900", "net_edge": 100}],
+        ic_metrics={"ic": 0.03},
+        candidates=[
+            {
+                "symbol": "035900",
+                "status": "READY",
+                "net_edge": 200,
+                "expected_return": 500,
+                "trading_cost": 49.4,
+                "slippage_cost": 10,
+                "liquidity_drag_bps": 0,
+            }
+        ],
     )
 
     assert gate["approved"] is True
@@ -446,7 +515,7 @@ def test_refresh_purges_premature_horizon_labels(tmp_path, monkeypatch):
     assert summary["sample_count"] == 0
 
 
-def test_top10_performance_includes_archived_ranked_samples(tmp_path):
+def test_top10_performance_uses_only_current_eligible_ranked_samples(tmp_path):
     calibration_db = tmp_path / "edge.sqlite3"
     edge_calibration.initialize_edge_calibration_db(calibration_db)
     with sqlite3.connect(calibration_db) as conn:
@@ -473,8 +542,8 @@ def test_top10_performance_includes_archived_ranked_samples(tmp_path):
         calibration_path=calibration_db,
     )
 
-    assert performance["sample_count"] == 2
-    assert performance["avg_return_bps"] == 15.0
+    assert performance["sample_count"] == 1
+    assert performance["avg_return_bps"] == 20.0
 
 
 def test_paper_and_live_gate_use_two_bps_top10_average(monkeypatch):
@@ -492,11 +561,20 @@ def test_paper_and_live_gate_use_two_bps_top10_average(monkeypatch):
         "sample_count": 1,
         "top_count": 10,
         "avg_return_bps": 2.5,
-        "win_rate": 1.0,
-        "loss_rate": 0.0,
-        "avg_win_bps": 2.5,
-        "avg_loss_bps": 0.0,
-        "expectancy_bps": 2.5,
+        "win_rate": 0.80,
+        "loss_rate": 0.20,
+        "avg_win_bps": 3.0,
+        "avg_loss_bps": 1.0,
+        "expectancy_bps": 2.2,
+    }
+    candidate = {
+        "symbol": "005930",
+        "status": "READY",
+        "net_edge": 100,
+        "expected_return": 500,
+        "trading_cost": 49.4,
+        "slippage_cost": 10,
+        "liquidity_drag_bps": 0,
     }
     paper_gate = edge_calibration._gate_from_metrics(
         sample_count=1,
@@ -505,7 +583,8 @@ def test_paper_and_live_gate_use_two_bps_top10_average(monkeypatch):
         mae_risk_bps=0,
         top10_performance=top10_performance,
         fill_adjustment={"multiplier": 1.0},
-        candidates=[{"symbol": "005930", "net_edge": 100}],
+        ic_metrics={"ic": 0.03},
+        candidates=[candidate],
         execution_mode="paper",
     )
     live_gate = edge_calibration._gate_from_metrics(
@@ -515,7 +594,8 @@ def test_paper_and_live_gate_use_two_bps_top10_average(monkeypatch):
         mae_risk_bps=0,
         top10_performance=top10_performance,
         fill_adjustment={"multiplier": 1.0},
-        candidates=[{"symbol": "005930", "net_edge": 100}],
+        ic_metrics={"ic": 0.03},
+        candidates=[candidate],
     )
 
     assert paper_gate["approved"] is True
@@ -532,6 +612,11 @@ def _insert_candidate(
     symbol: str,
     raw_score: float,
     current_price: float,
+    expected_return: float = 0.0,
+    expected_risk: float = 0.0,
+    trading_cost: float = 0.0,
+    slippage_cost: float = 0.0,
+    net_edge: float = 0.0,
 ) -> None:
     conn.execute(
         """
@@ -542,7 +627,7 @@ def _insert_candidate(
             change_rate, volume, volume_ratio, turnover_value, news_count,
             disclosure_count, claimed_by_worker, expires_at, raw_json
         )
-        VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, 1, 'test', 'READY',
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'test', 'READY',
                 'buy_candidate', ?, 2, 1000000, 2, 50000000000, 1, 0,
                 NULL, '2026-05-24T10:00:00', ?)
         """,
@@ -552,6 +637,11 @@ def _insert_candidate(
             symbol,
             symbol,
             raw_score,
+            expected_return,
+            expected_risk,
+            trading_cost,
+            slippage_cost,
+            net_edge,
             raw_score,
             current_price,
             '{"intraday": {"minute_volume_ratio": 2.0}}',

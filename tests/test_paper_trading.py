@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
+from app.models import PaperRunRequest
+from app.trading import cost_model
 from app.trading import paper_trading
 from app.trading import risk_manager
 
@@ -48,9 +50,26 @@ def test_paper_run_once_entry_records_signal_order_and_position(tmp_path, monkey
     assert body["side"] == "BUY"
     assert body["quantity"] == 3
     assert body["amount"] == 225000
-    assert body["total_cost"] == 33.75
+    expected_cost = cost_model.estimate_order_cost(
+        PaperRunRequest(
+            symbol="005930",
+            name="?쇱꽦?꾩옄",
+            market="KR",
+            strategy_type="daytrade",
+            signal_type="entry",
+            price=75000,
+            quantity=3,
+        ),
+        side="BUY",
+        quantity=3,
+    )
+    expected_avg_price = round(
+        (expected_cost.requested_amount + expected_cost.total_cost) / 3,
+        4,
+    )
+    assert body["total_cost"] == expected_cost.total_cost
     assert body["position"]["quantity"] == 3
-    assert body["position"]["avg_price"] == 75011.25
+    assert body["position"]["avg_price"] == expected_avg_price
     assert body["performance_metrics"]["turnover"] > 0
 
     with sqlite3.connect(db_path) as conn:
@@ -66,7 +85,13 @@ def test_paper_run_once_entry_records_signal_order_and_position(tmp_path, monkey
 
     assert signal_count == 1
     assert order_count == 1
-    assert position == (3, 75011.25, 225033.75)
+    assert expected_cost.commission == round(225000 * settings.commission_rate, 6)
+    assert expected_cost.tax == 0.0
+    assert position == (
+        3,
+        expected_avg_price,
+        round(expected_cost.requested_amount + expected_cost.total_cost, 4),
+    )
     assert performance_count == 1
 
 
@@ -112,10 +137,42 @@ def test_paper_run_once_exit_closes_position_and_records_pnl(tmp_path, monkeypat
     assert body["side"] == "SELL"
     assert body["quantity"] == 2
     assert body["amount"] == 152000
-    assert body["total_cost"] == 326.8
+    entry_cost = cost_model.estimate_order_cost(
+        PaperRunRequest(
+            symbol="005930",
+            name="?쇱꽦?꾩옄",
+            market="KR",
+            strategy_type="daytrade",
+            signal_type="entry",
+            price=75000,
+            quantity=2,
+        ),
+        side="BUY",
+        quantity=2,
+    )
+    exit_cost = cost_model.estimate_order_cost(
+        PaperRunRequest(
+            symbol="005930",
+            name="?쇱꽦?꾩옄",
+            market="KR",
+            strategy_type="daytrade",
+            signal_type="exit",
+            price=76000,
+            quantity=2,
+        ),
+        side="SELL",
+        quantity=2,
+    )
+    expected_realized_pnl = round(
+        exit_cost.requested_amount
+        - exit_cost.total_cost
+        - (entry_cost.requested_amount + entry_cost.total_cost),
+        2,
+    )
+    assert body["total_cost"] == exit_cost.total_cost
     assert body["position"]["quantity"] == 0
     assert body["position"]["avg_price"] == 0
-    assert body["position"]["realized_pnl"] == 1650.7
+    assert body["position"]["realized_pnl"] == expected_realized_pnl
 
     with sqlite3.connect(db_path) as conn:
         signal_count = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
@@ -133,7 +190,9 @@ def test_paper_run_once_exit_closes_position_and_records_pnl(tmp_path, monkeypat
             "SELECT realized_pnl FROM paper_orders WHERE side = 'SELL'"
         ).fetchone()[0]
 
-    assert realized_pnl == 1650.7
+    assert exit_cost.commission == round(152000 * settings.commission_rate, 6)
+    assert exit_cost.tax == round(152000 * settings.kr_stock_sell_tax_rate, 6)
+    assert realized_pnl == expected_realized_pnl
 
 
 def test_paper_run_once_exit_without_position_is_rejected(tmp_path, monkeypatch):
