@@ -2113,7 +2113,7 @@ def _with_expected_value_scores(
     expected_risk = max(
         25.0,
         min(
-            500.0,
+            200.0,
             expected_risk
             - float(quality["risk_discount_bps"])
             + float(quality["risk_penalty_bps"]),
