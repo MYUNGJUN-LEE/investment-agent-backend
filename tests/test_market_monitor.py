@@ -358,9 +358,9 @@ def test_process_due_monitor_jobs_uses_configured_intervals(tmp_path, monkeypatc
         market_monitor.JOB_OPENDART,
     ]
     intervals = {job["name"]: job["interval_seconds"] for job in status["jobs"]}
-    assert intervals[market_monitor.JOB_KIS_MARKET] == 60
-    assert intervals[market_monitor.JOB_OPENDART] == 300
-    assert intervals[market_monitor.JOB_NAVER_NEWS] == 600
+    assert intervals[market_monitor.JOB_KIS_MARKET] == settings.monitor_price_interval_seconds
+    assert intervals[market_monitor.JOB_OPENDART] == settings.monitor_disclosure_interval_seconds
+    assert intervals[market_monitor.JOB_NAVER_NEWS] == settings.monitor_news_interval_seconds
 
 
 def test_monitor_status_endpoint_reports_sqlite_not_supabase(tmp_path, monkeypatch):

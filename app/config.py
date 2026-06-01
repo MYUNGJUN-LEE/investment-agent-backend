@@ -270,6 +270,14 @@ class Settings(BaseSettings):
     universe_scanner_candidate_ttl_seconds: int = 7200
     universe_scanner_min_interval_seconds: int = 900
     universe_scanner_worker_hurdle_rate_bps: float = 40.0
+    universe_scanner_paper_bootstrap_soft_pass_enabled: bool = True
+    universe_scanner_paper_bootstrap_min_net_edge_bps: float = -20.0
+    universe_scanner_paper_bootstrap_min_score: float = 40.0
+    universe_scanner_buy_score_threshold: float = 70.0
+    universe_scanner_watch_score_threshold: float = 40.0
+    universe_scanner_paper_promote_exclude_to_watch_enabled: bool = True
+    universe_scanner_paper_promote_exclude_min_score: float = 40.0
+    universe_scanner_paper_promote_exclude_min_net_edge_bps: float = 0.0
     universe_scanner_default_spread_bps: float = 5.0
     universe_scanner_default_slippage_bps: float = 10.0
     universe_scanner_min_turnover_value: float = 20_000_000_000.0

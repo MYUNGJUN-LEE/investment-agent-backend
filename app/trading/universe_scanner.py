@@ -324,6 +324,12 @@ def scan_universe_for_auto_trade(
         "candidate_count": len(candidates),
         "final_count": len(active_candidates),
         "executable_count": len(symbols),
+        "paper_bootstrap_soft_pass_count": sum(
+            1 for item in ranked_candidates if item.get("paper_bootstrap_soft_pass")
+        ),
+        "paper_promoted_to_watch_count": sum(
+            1 for item in ranked_candidates if item.get("paper_promoted_to_watch")
+        ),
         "worker_hurdle_rate": hurdle_rate,
         "entry_gate": ranked_candidates[0].get("entry_gate") if ranked_candidates else None,
         "active_candidate_symbols": [
@@ -1399,6 +1405,20 @@ def _fetch_scanner_price_data(
         return fetch_price_data(symbol)
 
 
+def _score_decision(score: float, *, price_source: Any = None) -> str:
+    if price_source == "latest_close":
+        return "watch"
+
+    buy_threshold = float(settings.universe_scanner_buy_score_threshold or 70.0)
+    watch_threshold = float(settings.universe_scanner_watch_score_threshold or 40.0)
+
+    if score >= buy_threshold:
+        return "buy_candidate"
+    if score >= watch_threshold:
+        return "watch"
+    return "exclude"
+
+
 def _score_snapshot(item: dict[str, Any]) -> dict[str, Any]:
     price = _to_float(item.get("current_price"))
     fallback_price = _latest_close_from_daily(item)
@@ -1526,13 +1546,7 @@ def _score_snapshot(item: dict[str, Any]) -> dict[str, Any]:
         score -= 15
         reasons.append("overheated risk")
 
-    decision = "exclude"
-    if item.get("price_source") == "latest_close":
-        decision = "watch"
-    elif score >= 65:
-        decision = "buy_candidate"
-    elif score >= 40:
-        decision = "watch"
+    decision = _score_decision(score, price_source=item.get("price_source"))
     return {
         **item,
         "score": round(max(0.0, min(100.0, score)), 2),
@@ -1820,13 +1834,7 @@ def _enrich_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             enrichment_errors.append(f"opendart: {exc}")
 
     score = round(max(0.0, min(100.0, score)), 2)
-    decision = "exclude"
-    if candidate.get("price_source") == "latest_close":
-        decision = "watch"
-    elif score >= 70:
-        decision = "buy_candidate"
-    elif score >= 45:
-        decision = "watch"
+    decision = _score_decision(score, price_source=candidate.get("price_source"))
     return {
         **candidate,
         "score": score,
@@ -1850,20 +1858,28 @@ def _rank_execution_candidates(
         int(settings.universe_scanner_candidate_ttl_seconds or 3600),
     )
     edge_model = load_edge_model()
-    scored = [
-        _apply_corporate_event_to_candidate(
-            _apply_market_safety_to_candidate(
-                _with_expected_value_scores(
-                    item,
-                    expires_at=expires_at,
-                    edge_model=edge_model,
-                ),
-                execution_mode=execution_mode,
-            ),
+    scored: list[dict[str, Any]] = []
+    for item in candidates:
+        candidate = _with_expected_value_scores(
+            item,
+            expires_at=expires_at,
+            edge_model=edge_model,
+        )
+        candidate = _apply_market_safety_to_candidate(
+            candidate,
             execution_mode=execution_mode,
         )
-        for item in candidates
-    ]
+        candidate = _apply_corporate_event_to_candidate(
+            candidate,
+            execution_mode=execution_mode,
+        )
+        candidate = _paper_promote_exclude_to_watch_if_eligible(
+            candidate,
+            hurdle_rate=hurdle_rate,
+            execution_mode=execution_mode,
+        )
+        scored.append(candidate)
+
     entry_gate = _edge_entry_gate_for_mode(scored, execution_mode=execution_mode)
     ranked = sorted(
         scored,
@@ -1895,6 +1911,9 @@ def _rank_execution_candidates(
                 "reason": reason,
                 "worker_hurdle_rate": round(hurdle_rate, 4),
                 "entry_gate": entry_gate,
+                "paper_bootstrap_soft_pass": (
+                    "paper bootstrap soft-pass for collecting calibration gate" in reason
+                ),
             }
         )
     return prepared
@@ -1979,6 +1998,146 @@ def _edge_entry_gate_for_mode(
         if "execution_mode" not in str(exc):
             raise
         return edge_entry_gate(candidates)
+
+
+def _is_paper_mode(execution_mode: str | None) -> bool:
+    return str(execution_mode or "paper").lower() == "paper"
+
+
+def _is_collecting_entry_gate(entry_gate: dict[str, Any] | None) -> bool:
+    if not isinstance(entry_gate, dict):
+        return False
+
+    status = str(entry_gate.get("status") or "").lower()
+    message = str(entry_gate.get("message") or "").lower()
+
+    if status in {
+        "collecting",
+        "empty",
+        "insufficient",
+        "insufficient_samples",
+        "not_ready",
+        "bootstrap",
+    }:
+        return True
+
+    collecting_tokens = (
+        "sample_count 0/",
+        "oos_sample_count 0/",
+        "need at least",
+        "no edge samples",
+        "no samples",
+        "collecting",
+        "waiting for horizon",
+    )
+
+    return any(token in message for token in collecting_tokens)
+
+
+def _has_explicit_safety_block(candidate: dict[str, Any]) -> bool:
+    if candidate.get("status") == "EXCLUDED":
+        return True
+
+    market_safety = candidate.get("market_safety") or {}
+    if isinstance(market_safety, dict) and market_safety.get("block") is True:
+        return True
+
+    corporate_event = candidate.get("corporate_event_check") or {}
+    if isinstance(corporate_event, dict) and corporate_event.get("block") is True:
+        return True
+
+    return False
+
+
+def _has_large_cap_gate_block(candidate: dict[str, Any]) -> bool:
+    large_cap_gate = candidate.get("large_cap_top10_gate")
+    return isinstance(large_cap_gate, dict) and large_cap_gate.get("passed") is False
+
+
+def _paper_bootstrap_soft_pass_allowed(
+    candidate: dict[str, Any],
+    *,
+    entry_gate: dict[str, Any] | None,
+    execution_mode: str = "paper",
+) -> bool:
+    if not bool(settings.universe_scanner_paper_bootstrap_soft_pass_enabled):
+        return False
+
+    if not _is_paper_mode(execution_mode):
+        return False
+
+    if not _is_collecting_entry_gate(entry_gate):
+        return False
+
+    if _has_explicit_safety_block(candidate):
+        return False
+
+    if _has_large_cap_gate_block(candidate):
+        return False
+
+    score = float(candidate.get("score") or candidate.get("composite_score") or 0.0)
+    min_score = float(settings.universe_scanner_paper_bootstrap_min_score or 40.0)
+    if score < min_score:
+        return False
+
+    net_edge = float(candidate.get("net_edge") or 0.0)
+    min_edge = float(settings.universe_scanner_paper_bootstrap_min_net_edge_bps or -20.0)
+    if net_edge < min_edge:
+        return False
+
+    return True
+
+
+def _paper_promote_exclude_to_watch_if_eligible(
+    candidate: dict[str, Any],
+    *,
+    hurdle_rate: float,
+    execution_mode: str = "paper",
+) -> dict[str, Any]:
+    if not bool(settings.universe_scanner_paper_promote_exclude_to_watch_enabled):
+        return candidate
+
+    if not _is_paper_mode(execution_mode):
+        return candidate
+
+    if str(candidate.get("decision") or "").lower() != "exclude":
+        return candidate
+
+    if _has_explicit_safety_block(candidate):
+        return candidate
+
+    if _has_large_cap_gate_block(candidate):
+        return candidate
+
+    if not candidate.get("current_price"):
+        return candidate
+
+    score = float(
+        candidate.get("score")
+        or candidate.get("raw_score")
+        or candidate.get("composite_score")
+        or 0.0
+    )
+    min_score = float(settings.universe_scanner_paper_promote_exclude_min_score or 40.0)
+    if score < min_score:
+        return candidate
+
+    net_edge = float(candidate.get("net_edge") or 0.0)
+    min_edge = float(settings.universe_scanner_paper_promote_exclude_min_net_edge_bps or 0.0)
+
+    if net_edge < min_edge:
+        return candidate
+
+    reason = str(candidate.get("reason") or "")
+    return {
+        **candidate,
+        "decision": "watch",
+        "paper_promoted_to_watch": True,
+        "reason": (
+            f"{reason}; paper bootstrap promoted exclude to watch sub-candidate "
+            f"(score {score:.2f}, net_edge {net_edge:.2f}bps)"
+        ).strip("; "),
+    }
 
 
 def _execution_priority(candidate: dict[str, Any]) -> float:
@@ -2193,7 +2352,7 @@ def _execution_status_for_candidate(
     execution_mode: str = "paper",
 ) -> tuple[str, str]:
     reasons = [str(candidate.get("reason") or "")]
-    paper_bootstrap = execution_mode == "paper"
+    paper_bootstrap = _is_paper_mode(execution_mode)
 
     large_cap_gate = candidate.get("large_cap_top10_gate") or _large_cap_top10_gate(candidate)
     if not large_cap_gate.get("passed", True):
@@ -2267,11 +2426,17 @@ def _execution_status_for_candidate(
             return "SKIPPED", _join_reasons(reasons)
 
     if not entry_gate.get("approved", False):
-        gate_status = str(entry_gate.get("status") or "")
         gate_message = str(entry_gate.get("message") or "entry gate blocked")
 
-        if paper_bootstrap and gate_status in {"collecting", "empty"}:
-            reasons.append(f"entry gate soft-passed during paper bootstrap: {gate_message}")
+        if _paper_bootstrap_soft_pass_allowed(
+            candidate,
+            entry_gate=entry_gate,
+            execution_mode=execution_mode,
+        ):
+            reasons.append(
+                "paper bootstrap soft-pass for collecting calibration gate: "
+                f"{gate_message}"
+            )
         else:
             reasons.append(gate_message)
             return "SKIPPED", _join_reasons(reasons)
@@ -2847,6 +3012,8 @@ def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
                 "failed_universe_filters": item.get("failed_universe_filters"),
                 "market_safety": item.get("market_safety"),
                 "corporate_event_check": item.get("corporate_event_check"),
+                "paper_bootstrap_soft_pass": item.get("paper_bootstrap_soft_pass"),
+                "paper_promoted_to_watch": item.get("paper_promoted_to_watch"),
                 "claimed_by_worker": item.get("claimed_by_worker"),
                 "expires_at": item.get("expires_at"),
             }

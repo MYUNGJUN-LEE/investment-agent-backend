@@ -386,7 +386,7 @@ def test_large_cap_requires_five_percent_expected_return_for_top10(monkeypatch):
     monkeypatch.setattr(
         universe_scanner.settings,
         "universe_scanner_large_cap_min_3d_return_bps",
-        200,
+        500,
     )
     candidate = {
         "symbol": "005930",
@@ -418,6 +418,128 @@ def test_large_cap_requires_five_percent_expected_return_for_top10(monkeypatch):
     assert blocked_status == "ARCHIVED"
     assert "large-cap requires" in blocked_reason
     assert allowed_status == "READY"
+
+
+def test_scanner_decision_thresholds_use_config(monkeypatch):
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_buy_score_threshold", 70.0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_watch_score_threshold", 40.0)
+
+    assert universe_scanner._score_decision(70.0) == "buy_candidate"
+    assert universe_scanner._score_decision(43.0) == "watch"
+    assert universe_scanner._score_decision(39.99) == "exclude"
+
+
+def test_paper_bootstrap_soft_pass_collecting_gate_only(monkeypatch):
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_scanner_paper_bootstrap_soft_pass_enabled",
+        True,
+    )
+    candidate = {
+        "symbol": "123456",
+        "decision": "buy_candidate",
+        "current_price": 10_000,
+        "score": 60.0,
+        "composite_score": 60.0,
+        "net_edge": 25.0,
+        "expected_return": 250.0,
+        "edge_reward_risk": {
+            "expected_value_after_cost_bps": 10.0,
+            "reward_risk_ratio": 1.0,
+        },
+        "large_cap_top10_gate": {"passed": True},
+    }
+    collecting_gate = {
+        "status": "blocked",
+        "approved": False,
+        "message": "Calibration performance gate blocked entries: sample_count 0/600",
+    }
+    mature_blocked_gate = {
+        "status": "blocked",
+        "approved": False,
+        "message": "Calibration performance gate blocked entries: recent_ic -0.10 < 0.02",
+    }
+
+    paper_status, paper_reason = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate=collecting_gate,
+        execution_mode="paper",
+    )
+    live_status, _ = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=0.0,
+        entry_gate=collecting_gate,
+        execution_mode="live",
+    )
+    mature_status, _ = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate=mature_blocked_gate,
+        execution_mode="paper",
+    )
+
+    assert paper_status == "READY"
+    assert "paper bootstrap soft-pass for collecting calibration gate" in paper_reason
+    assert live_status == "SKIPPED"
+    assert mature_status == "SKIPPED"
+
+
+def test_paper_promotes_safe_exclude_to_watch_only(monkeypatch):
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_scanner_paper_promote_exclude_to_watch_enabled",
+        True,
+    )
+    candidate = {
+        "symbol": "123456",
+        "decision": "exclude",
+        "current_price": 10_000,
+        "score": 43.0,
+        "composite_score": 43.0,
+        "net_edge": 135.0,
+        "large_cap_top10_gate": {"passed": True},
+    }
+
+    promoted = universe_scanner._paper_promote_exclude_to_watch_if_eligible(
+        candidate,
+        hurdle_rate=40.0,
+        execution_mode="paper",
+    )
+    live = universe_scanner._paper_promote_exclude_to_watch_if_eligible(
+        candidate,
+        hurdle_rate=40.0,
+        execution_mode="live",
+    )
+    safety_blocked = universe_scanner._paper_promote_exclude_to_watch_if_eligible(
+        {
+            **candidate,
+            "market_safety": {"block": True},
+            "status": "EXCLUDED",
+        },
+        hurdle_rate=40.0,
+        execution_mode="paper",
+    )
+    large_cap_blocked = universe_scanner._paper_promote_exclude_to_watch_if_eligible(
+        {
+            **candidate,
+            "large_cap_top10_gate": {"passed": False},
+        },
+        hurdle_rate=40.0,
+        execution_mode="paper",
+    )
+
+    assert promoted["decision"] == "watch"
+    assert promoted["paper_promoted_to_watch"] is True
+    assert live["decision"] == "exclude"
+    assert safety_blocked["decision"] == "exclude"
+    assert large_cap_blocked["decision"] == "exclude"
 
 
 def test_universe_scanner_uses_fast_price_fetch_and_caps_symbol_sleep(monkeypatch):
