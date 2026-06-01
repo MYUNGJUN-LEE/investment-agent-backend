@@ -2628,7 +2628,7 @@ def _large_cap_top10_gate(candidate: dict[str, Any]) -> dict[str, Any]:
         "reason": (
             "large-cap 3-day expected return gate passed"
             if large_cap and passed
-            else "large-cap requires >=5% expected 3-day return"
+            else "large-cap requires >=2% expected 3-day return"
             if large_cap
             else "not a large-cap conditional candidate"
         ),
