@@ -207,6 +207,13 @@ class Settings(BaseSettings):
     quant_validation_min_positive_fold_rate: float = 0.60
     quant_validation_min_median_net_edge_bps: float = 0.0
     quant_validation_num_trials: int = 20
+    quant_validation_embargo_seconds: int = 86400
+    quant_validation_rolling_ic_windows: str = "100,300,500"
+    quant_validation_min_group_samples: int = 30
+    quant_validation_group_limit: int = 50
+    quant_validation_include_group_oos: bool = True
+    quant_validation_include_rolling_ic: bool = True
+    quant_validation_include_purged_walk_forward: bool = True
     overfit_guard_enabled: bool = False
     overfit_guard_db_path: str = "data/overfit_guard.sqlite3"
     overfit_guard_min_samples: int = 1000

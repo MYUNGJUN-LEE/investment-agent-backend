@@ -88,6 +88,7 @@ from app.trading.order_approval import (
 )
 from app.trading.overfit_guard import overfit_guard_summary
 from app.trading.paper_trading import run_paper_once
+from app.trading.quant_validation import quant_validation_summary
 from app.trading.tuning_review import (
     export_approved_tuning_env_lines,
     latest_approved_tuning_decisions,
@@ -902,6 +903,16 @@ def admin_overfit_guard_summary(execution_mode: str = "paper"):
         execution_mode=execution_mode,
         persist=True,
     )
+
+
+@app.get(
+    "/admin/quant-validation/summary",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getQuantValidationSummary",
+    summary="Run manual quant validation diagnostics",
+)
+def admin_quant_validation_summary():
+    return quant_validation_summary()
 
 
 @app.post(
