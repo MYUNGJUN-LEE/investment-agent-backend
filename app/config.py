@@ -325,7 +325,7 @@ class Settings(BaseSettings):
     universe_scanner_macro_min_risk_on_score: float = 35.0
     universe_scanner_min_market_cap: float = 300_000_000_000.0
     universe_scanner_max_market_cap: float = 2_000_000_000_000.0
-    universe_scanner_large_cap_min_3d_return_bps: float = 500.0
+    universe_scanner_large_cap_min_3d_return_bps: float = 200.0
     entry_time_filter_enabled: bool = True
     entry_time_windows: str = "09:00-10:30,14:30-15:20"
     embedded_workers_enabled: bool = os.getenv("RENDER_SERVICE_TYPE") == "web"

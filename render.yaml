@@ -164,4 +164,4 @@ services:
       - key: UNIVERSE_SCANNER_MAX_MARKET_CAP
         value: "2000000000000"
       - key: UNIVERSE_SCANNER_LARGE_CAP_MIN_3D_RETURN_BPS
-        value: "500"
+        value: "200"

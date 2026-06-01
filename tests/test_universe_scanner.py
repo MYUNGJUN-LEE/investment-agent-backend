@@ -386,7 +386,7 @@ def test_large_cap_requires_five_percent_expected_return_for_top10(monkeypatch):
     monkeypatch.setattr(
         universe_scanner.settings,
         "universe_scanner_large_cap_min_3d_return_bps",
-        500,
+        200,
     )
     candidate = {
         "symbol": "005930",

@@ -272,7 +272,7 @@ stocks and toward mid-cap/KOSDAQ quality names. Market-cap focus is enforced
 with `UNIVERSE_SCANNER_MIN_MARKET_CAP=300000000000` and
 `UNIVERSE_SCANNER_MAX_MARKET_CAP=2000000000000`; known large-cap symbols can
 enter the execution top 10 only when the scanner estimates at least
-`UNIVERSE_SCANNER_LARGE_CAP_MIN_3D_RETURN_BPS=500`.
+`UNIVERSE_SCANNER_LARGE_CAP_MIN_3D_RETURN_BPS=200`.
 Set `UNIVERSE_SCANNER_INTRADAY_ENRICHMENT_ENABLED=true`,
 `UNIVERSE_SCANNER_NEWS_ENRICHMENT_ENABLED=true`, or
 `UNIVERSE_SCANNER_DISCLOSURE_ENRICHMENT_ENABLED=true` only when you want the
