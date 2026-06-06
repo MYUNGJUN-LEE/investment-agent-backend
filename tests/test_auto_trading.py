@@ -1249,6 +1249,105 @@ def test_auto_trading_worker_processes_persisted_session(tmp_path, monkeypatch):
     assert session["last_results"] == [{"symbol": "005930", "status": "mocked"}]
 
 
+def test_auto_trading_worker_keeps_session_active_on_recoverable_db_lock(
+    tmp_path,
+    monkeypatch,
+):
+    auto_db = tmp_path / "auto.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(auto_db))
+
+    def locked_cycle(req, session_id=None):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(auto_trading, "_run_cycle", locked_cycle)
+
+    session = auto_trading_store.create_session(
+        AutoTradeStartRequest(run_immediately=True, interval_seconds=60),
+        db_path=auto_db,
+    )
+    processed = auto_trading.process_due_sessions(worker_id="test-worker")
+    updated = auto_trading_store.get_session(session["session_id"], db_path=auto_db)
+    events = auto_trading_store.list_events(session["session_id"], db_path=auto_db)
+
+    assert processed[0]["status"] == "active"
+    assert processed[0]["recoverable_error"] == "database is locked"
+    assert updated["status"] == "active"
+    assert updated["locked_by"] is None
+    assert updated["last_error"] is None
+    assert updated["last_recoverable_error"] == "database is locked"
+    assert updated["last_cycle_error"] == "database is locked"
+    assert updated["cycle_count"] == 1
+    assert any(event["event_type"] == "cycle_recoverable_error" for event in events)
+
+
+def test_start_after_locked_error_session_expires_previous_and_starts_clean(
+    tmp_path,
+    monkeypatch,
+):
+    auto_db = tmp_path / "auto.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(auto_db))
+    monkeypatch.setattr(settings, "auto_trading_one_session_per_account", True)
+
+    previous = auto_trading_store.create_session(
+        AutoTradeStartRequest(run_immediately=True, interval_seconds=60),
+        db_path=auto_db,
+    )
+    auto_trading_store.fail_cycle(
+        previous["session_id"],
+        "database is locked",
+        db_path=auto_db,
+    )
+
+    started = auto_trading.start_auto_trading(
+        AutoTradeStartRequest(run_immediately=True, interval_seconds=60)
+    )
+    active = auto_trading_store.list_sessions(status="active", db_path=auto_db)
+    previous_updated = auto_trading_store.get_session(previous["session_id"], db_path=auto_db)
+
+    assert started["status"] == "active"
+    assert started["session_id"] != previous["session_id"]
+    assert started["auto_recovery_applied"] is True
+    assert len(active) == 1
+    assert previous_updated["status"] == "stopped"
+    assert previous_updated["recovery_applied"] == 1
+
+
+def test_auto_trading_cycle_reports_scanner_recovery_failure(monkeypatch):
+    monkeypatch.setattr(
+        auto_trading,
+        "get_latest_universe_scan",
+        lambda: {
+            "status": "success",
+            "created_at": "2000-01-01T00:00:00",
+        },
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "scan_universe_for_auto_trade",
+        lambda req, worker_id=None: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")
+        ),
+    )
+
+    results = auto_trading._run_cycle(
+        AutoTradeStartRequest(symbols=[], auto_discover_symbols=True)
+    )
+
+    assert results == [
+        {
+            "symbol": "__universe__",
+            "status": "skipped",
+            "message": "Universe scanner recovery failed: database is locked",
+            "scanner_is_stale": True,
+            "latest_scan_age_seconds": results[0]["latest_scan_age_seconds"],
+            "scanner_stale_after_seconds": results[0]["scanner_stale_after_seconds"],
+            "last_scanner_recovery_attempt_at": results[0]["last_scanner_recovery_attempt_at"],
+            "last_scanner_recovery_status": "error",
+            "last_scanner_recovery_error": "database is locked",
+        }
+    ]
+
+
 def test_auto_trading_worker_completes_fast_universe_scan_cycle(tmp_path, monkeypatch):
     auto_db = tmp_path / "auto.sqlite3"
     universe_db = tmp_path / "universe.sqlite3"

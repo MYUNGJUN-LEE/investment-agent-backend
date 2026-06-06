@@ -184,6 +184,112 @@ def test_refresh_edge_training_samples_stores_prediction_labels(tmp_path, monkey
     assert summary["summary"]["total_return_bps"] == 800
     assert summary["summary"]["win_count"] == 1
     assert summary["recent_samples"][0]["symbol"] == "005930"
+    assert summary["unit_performance"]["candidate_label"]["win_rate"] == 1.0
+
+
+def test_refresh_edge_training_samples_deduplicates_symbol_within_horizon(
+    tmp_path, monkeypatch
+):
+    universe_db = tmp_path / "universe.sqlite3"
+    calibration_db = tmp_path / "edge.sqlite3"
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_horizon_seconds", 3600)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_min_label_age_seconds", 0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_min_future_snapshots", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_label_snapshots_enabled", False)
+
+    universe_scanner.initialize_universe_db(universe_db)
+    with sqlite3.connect(universe_db) as conn:
+        _insert_candidate(
+            conn,
+            scan_id="scan-a",
+            scan_time="2026-05-24T09:00:00",
+            symbol="005930",
+            raw_score=80,
+            current_price=100,
+        )
+        _insert_candidate(
+            conn,
+            scan_id="scan-b",
+            scan_time="2026-05-24T09:10:00",
+            symbol="005930",
+            raw_score=79,
+            current_price=101,
+        )
+        _insert_price(
+            conn,
+            scan_id="future-a",
+            created_at="2026-05-24T10:00:00",
+            symbol="005930",
+            price=108,
+        )
+        _insert_price(
+            conn,
+            scan_id="future-b",
+            created_at="2026-05-24T10:10:00",
+            symbol="005930",
+            price=109,
+        )
+
+    result = edge_calibration.refresh_edge_training_samples(
+        universe_db_path=universe_db,
+        calibration_db_path=calibration_db,
+        horizon_seconds=3600,
+    )
+
+    assert result["inserted_count"] == 1
+    assert result["stored_sample_count"] == 1
+
+
+def test_realized_risk_uses_entry_to_horizon_adverse_excursion(
+    tmp_path, monkeypatch
+):
+    universe_db = tmp_path / "universe.sqlite3"
+    calibration_db = tmp_path / "edge.sqlite3"
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_horizon_seconds", 3600)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_min_label_age_seconds", 0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_min_future_snapshots", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_label_snapshots_enabled", False)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_label_at_horizon_end", True)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_label_horizon_tolerance_seconds", 0)
+
+    universe_scanner.initialize_universe_db(universe_db)
+    with sqlite3.connect(universe_db) as conn:
+        _insert_candidate(
+            conn,
+            scan_id="scan-a",
+            scan_time="2026-05-24T09:00:00",
+            symbol="005930",
+            raw_score=80,
+            current_price=100,
+        )
+        _insert_price(
+            conn,
+            scan_id="future-mid",
+            created_at="2026-05-24T09:30:00",
+            symbol="005930",
+            price=90,
+        )
+        _insert_price(
+            conn,
+            scan_id="future-end",
+            created_at="2026-05-24T10:00:00",
+            symbol="005930",
+            price=110,
+        )
+
+    result = edge_calibration.refresh_edge_training_samples(
+        universe_db_path=universe_db,
+        calibration_db_path=calibration_db,
+        horizon_seconds=3600,
+    )
+
+    assert result["inserted_count"] == 1
+    with sqlite3.connect(calibration_db) as conn:
+        risk_bps = conn.execute(
+            "SELECT realized_risk_bps FROM edge_training_samples"
+        ).fetchone()[0]
+
+    assert risk_bps == 1000
 
 
 def test_edge_calibration_if_due_skips_when_recent(tmp_path, monkeypatch):
@@ -216,6 +322,12 @@ def test_edge_entry_gate_passes_after_oos_and_top10_thresholds(tmp_path, monkeyp
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 1)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_return_bps", 10_000)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_risk_bps", 10_000)
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "edge_calibration_gate_max_mae_net_edge_bps",
+        10_000,
+        raising=False,
+    )
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 0)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_win_rate", 0.0)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 60)
@@ -373,6 +485,58 @@ def test_edge_gate_requires_current_top10_quality_metrics(monkeypatch):
     assert "top10_win_rate 0.4 < 0.5" in low_win_rate["message"]
 
 
+def test_edge_gate_blocks_when_net_edge_mae_is_too_high(monkeypatch):
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_samples", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_return_bps", 10_000)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_risk_bps", 10_000)
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "edge_calibration_gate_max_mae_net_edge_bps",
+        180,
+        raising=False,
+    )
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_win_rate", 0.0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_expectancy_bps", -1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 0)
+
+    gate = edge_calibration._gate_from_metrics(
+        sample_count=10,
+        oos_sample_count=10,
+        mae_return_bps=50,
+        mae_risk_bps=50,
+        top10_performance={
+            "status": "ready",
+            "sample_count": 10,
+            "top_count": 10,
+            "avg_return_bps": 25,
+            "win_rate": 0.60,
+            "loss_rate": 0.40,
+            "avg_win_bps": 90,
+            "avg_loss_bps": 20,
+            "expectancy_bps": 24,
+            "mae_net_edge_error_bps": 451,
+        },
+        fill_adjustment={"multiplier": 1.0},
+        ic_metrics={"ic": 0.03},
+        candidates=[
+            {
+                "symbol": "035900",
+                "status": "READY",
+                "net_edge": 200,
+                "expected_return": 500,
+                "trading_cost": 49.4,
+                "slippage_cost": 10,
+                "liquidity_drag_bps": 0,
+            }
+        ],
+    )
+
+    assert gate["approved"] is False
+    assert "mae_net_edge_error_bps 451.0 >= 180.0" in gate["message"]
+
+
 def test_edge_gate_uses_configured_top10_return_threshold(monkeypatch):
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_samples", 1)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 1)
@@ -454,8 +618,42 @@ def test_top10_performance_uses_all_stored_top10_samples(tmp_path):
     assert all_performance["avg_predicted_net_edge_bps"] == 3.0
     assert all_performance["avg_net_edge_error_bps"] == 2.5
     assert all_performance["net_edge_formula"]
-    assert all_performance["sample_source"] == "all_stored_top10_samples"
+    assert all_performance["sample_source"] == edge_calibration.TOP10_SAMPLE_SOURCE_SCAN_RUN
     assert limited_performance["sample_count"] == 10
+
+
+def test_top10_performance_groups_candidates_by_scan_run_id(tmp_path):
+    calibration_db = tmp_path / "edge.sqlite3"
+    edge_calibration.initialize_edge_calibration_db(calibration_db)
+    with sqlite3.connect(calibration_db) as conn:
+        for index, return_bps in enumerate((10.0, 20.0, 30.0), start=1):
+            _insert_training_sample(
+                conn,
+                source_candidate_id=index,
+                scan_id="scan-a",
+                symbol=f"00593{index}",
+                observed_at=f"2026-05-24T10:0{index}:00",
+                realized_return_bps=return_bps,
+                rank=index,
+            )
+        _insert_training_sample(
+            conn,
+            source_candidate_id=10,
+            scan_id="scan-b",
+            symbol="000660",
+            observed_at="2026-05-24T10:10:00",
+            realized_return_bps=40.0,
+            rank=1,
+        )
+
+    performance = edge_calibration._top10_performance_from_store(
+        calibration_path=calibration_db,
+    )
+
+    assert performance["sample_count"] == 2
+    assert performance["scan_run_count"] == 2
+    assert performance["candidate_sample_count"] == 4
+    assert performance["avg_return_bps"] == 30.0
 
 
 def test_refresh_top10_performance_records_every_interval(tmp_path, monkeypatch):
@@ -467,7 +665,7 @@ def test_refresh_top10_performance_records_every_interval(tmp_path, monkeypatch)
             _insert_training_sample(
                 conn,
                 source_candidate_id=index + 1,
-                symbol="005930",
+                symbol=f"{index + 1:06d}",
                 observed_at=f"2026-05-24T10:0{index}:00",
                 realized_return_bps=10.0,
                 rank=1,
@@ -672,7 +870,9 @@ def _insert_training_sample(
     conn: sqlite3.Connection,
     *,
     source_candidate_id: int,
+    scan_id: str | None = None,
     symbol: str,
+    scan_time: str = "2026-05-24T09:00:00",
     observed_at: str,
     realized_return_bps: float,
     rank: int,
@@ -693,18 +893,20 @@ def _insert_training_sample(
     conn.execute(
         """
         INSERT INTO edge_training_samples (
-            source_candidate_id, symbol, scan_time, observed_at, entry_price,
+            source_candidate_id, scan_id, symbol, scan_time, observed_at, entry_price,
             observed_price, features_json, realized_return_bps,
             realized_risk_bps, label_observation_span_seconds, raw_score, expected_return_bps,
             expected_risk_bps, trading_cost_bps, slippage_cost_bps,
             net_edge_bps, composite_score, rank, status, created_at, raw_json
         )
-        VALUES (?, ?, '2026-05-24T09:00:00', ?, 100, 101, ?,
+        VALUES (?, ?, ?, ?, ?, 100, 101, ?,
                 ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')
         """,
         (
             source_candidate_id,
+            scan_id,
             symbol,
+            scan_time,
             observed_at,
             "[1,0,0,0,0,0,0,0,0,0]",
             realized_return_bps,

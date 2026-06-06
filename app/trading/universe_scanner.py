@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, time, timedelta
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import time as time_module
@@ -14,6 +15,7 @@ from app.data_sources.opendart import fetch_opendart_disclosures
 from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.services.naver_news import search_naver_news
 from app.storage.market_data import get_latest_market_context
+from app.storage.sqlite import connect_sqlite, sqlite_write_with_retry
 from app.trading.corporate_events import corporate_event_check
 from app.trading.kospi_universe import (
     kospi_universe_cache_status,
@@ -29,6 +31,7 @@ from app.trading.atr_exits import atr_exit_levels_from_price_data
 from app.trading import paper_trading
 
 EDGE_RISK_WEIGHT = 0.10
+logger = logging.getLogger(__name__)
 
 DEFAULT_UNIVERSE = {
     "035900": "JYP Entertainment",
@@ -298,6 +301,14 @@ def scan_universe_for_auto_trade(
         limit=final_limit,
         worker_hurdle_rate=hurdle_rate,
     )
+    market_coverage = _market_coverage_diagnostics(
+        source_symbols=source_symbols,
+        snapshots=snapshots,
+        scored_candidates=ranked,
+        candidate_pool=candidates,
+        ranked_candidates=ranked_candidates,
+        final_candidates=active_candidates,
+    )
 
     symbols = [
         _to_symbol_config(req, candidate)
@@ -309,9 +320,18 @@ def scan_universe_for_auto_trade(
         "status": "partial" if collection["timed_out"] else "success",
         "created_at": created_at,
         "source_symbol_count": len(source_symbols),
+        "total_source_symbol_count": market_coverage["total_source_symbol_count"],
+        "kospi_source_symbol_count": market_coverage["kospi_source_symbol_count"],
+        "kosdaq_source_symbol_count": market_coverage["kosdaq_source_symbol_count"],
+        "konex_source_symbol_count": market_coverage["konex_source_symbol_count"],
+        "unknown_market_symbol_count": market_coverage["unknown_market_symbol_count"],
         "universe_sources": universe_sources,
         "kospi_universe": universe_sources.get("kospi_universe"),
         "snapshot_count": len(snapshots),
+        "kospi_snapshot_count": market_coverage["kospi_snapshot_count"],
+        "kosdaq_snapshot_count": market_coverage["kosdaq_snapshot_count"],
+        "konex_snapshot_count": market_coverage["konex_snapshot_count"],
+        "unknown_market_snapshot_count": market_coverage["unknown_market_snapshot_count"],
         "snapshot_error_count": collection["error_count"],
         "cleaning_excluded_count": cleaning["excluded_count"],
         "cleaning_excluded": cleaning["excluded"],
@@ -322,7 +342,16 @@ def scan_universe_for_auto_trade(
         "candidate_limit": candidate_limit,
         "final_limit": final_limit,
         "candidate_count": len(candidates),
+        "kospi_candidate_count": market_coverage["kospi_candidate_count"],
+        "kosdaq_candidate_count": market_coverage["kosdaq_candidate_count"],
+        "konex_candidate_count": market_coverage["konex_candidate_count"],
+        "unknown_market_candidate_count": market_coverage["unknown_market_candidate_count"],
         "final_count": len(active_candidates),
+        "kospi_final_candidate_count": market_coverage["kospi_final_candidate_count"],
+        "kosdaq_final_candidate_count": market_coverage["kosdaq_final_candidate_count"],
+        "konex_final_candidate_count": market_coverage["konex_final_candidate_count"],
+        "unknown_market_final_candidate_count": market_coverage["unknown_market_final_candidate_count"],
+        "market_coverage": market_coverage,
         "executable_count": len(symbols),
         "paper_bootstrap_soft_pass_count": sum(
             1 for item in ranked_candidates if item.get("paper_bootstrap_soft_pass")
@@ -348,8 +377,7 @@ def scan_universe_for_auto_trade(
 def get_latest_universe_scan(db_path: Path | str | None = None) -> dict[str, Any]:
     path = _db_path(db_path)
     initialize_universe_db(path)
-    with sqlite3.connect(path) as conn:
-        conn.row_factory = sqlite3.Row
+    with _connect(path, row_factory=True) as conn:
         run = conn.execute(
             """
             SELECT * FROM universe_scan_runs
@@ -464,8 +492,7 @@ def get_ready_execution_candidates(
         else float(worker_hurdle_rate)
     )
     now = _now()
-    with sqlite3.connect(path) as conn:
-        conn.row_factory = sqlite3.Row
+    with _connect(path, row_factory=True) as conn:
         rows = conn.execute(
             """
             SELECT *
@@ -505,8 +532,7 @@ def get_active_scanner_candidates(
         where = "WHERE expires_at > ?"
         params.append(_now())
     params.append(limit)
-    with sqlite3.connect(path) as conn:
-        conn.row_factory = sqlite3.Row
+    with _connect(path, row_factory=True) as conn:
         rows = conn.execute(
             f"""
             SELECT *
@@ -530,10 +556,13 @@ def scanner_candidate_to_symbol_config(
 def initialize_universe_db(db_path: Path | str | None = None) -> None:
     path = _db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
-        conn.executescript(SCHEMA_SQL)
-        _ensure_universe_schema_migrations(conn)
-        _backfill_scanner_candidate_history_from_legacy(conn)
+    def operation() -> None:
+        with _connect(path) as conn:
+            conn.executescript(SCHEMA_SQL)
+            _ensure_universe_schema_migrations(conn)
+            _backfill_scanner_candidate_history_from_legacy(conn)
+
+    sqlite_write_with_retry(operation)
 
 
 def _ensure_universe_schema_migrations(conn: sqlite3.Connection) -> None:
@@ -819,6 +848,19 @@ def _resolve_source_symbols_with_diagnostics(
         kospi_status=kospi_status,
         kospi_loaded_count=len(kospi_items),
     )
+    if _kospi_source_enabled() and not kospi_items:
+        logger.warning(
+            "KOSPI source is enabled but no KOSPI symbols were loaded; "
+            "scanner will continue with explicit/seed/watchlist/default sources. "
+            "kospi_status=%s",
+            kospi_status,
+        )
+    elif kospi_items:
+        logger.info(
+            "KOSPI source loaded %s symbols; %s remain after priority/dedupe/caps",
+            len(kospi_items),
+            diagnostics.get("kospi_source_symbol_count", diagnostics.get("kospi_count")),
+        )
 
     return source_symbols, diagnostics
 
@@ -938,8 +980,16 @@ def _source_diagnostics(
         return sum(
             1
             for item in final_items
-            if str(item.get("market") or item.get("market_segment") or "").upper() == market
+            if _source_item_market(item) == market
         )
+
+    def count_unknown_market() -> int:
+        return sum(1 for item in final_items if _source_item_market(item) == "UNKNOWN")
+
+    source_detail_counts: dict[str, int] = {}
+    for item in final_items:
+        detail = str(item.get("source_detail") or item.get("source") or "unknown")
+        source_detail_counts[detail] = source_detail_counts.get(detail, 0) + 1
 
     return {
         "priority_order": [
@@ -957,10 +1007,16 @@ def _source_diagnostics(
         "default_count": count_source("default"),
         "kospi_count": count_source("kospi"),
         "kosdaq_count": count_market("KOSDAQ"),
+        "total_source_symbol_count": len(source_symbols),
+        "kospi_source_symbol_count": count_market("KOSPI"),
+        "kosdaq_source_symbol_count": count_market("KOSDAQ"),
+        "konex_source_symbol_count": count_market("KONEX"),
+        "unknown_market_symbol_count": count_unknown_market(),
         "source_symbol_count_before_dedupe": before_dedupe,
         "source_symbol_count_after_dedupe": after_dedupe,
         "source_symbol_count_after_caps": len(source_symbols),
         "deduped_count": max(0, before_dedupe - after_dedupe),
+        "source_detail_counts": source_detail_counts,
         "kospi_scan_all": bool(settings.universe_kospi_scan_all),
         "kospi_symbols_loaded": kospi_loaded_count,
         "kospi_source_enabled": _kospi_source_enabled(),
@@ -979,6 +1035,163 @@ def _source_diagnostics(
         "raw_source_count": len(raw_items),
         "kospi_universe": kospi_status,
     }
+
+
+def _source_item_market(item: dict[str, Any]) -> str:
+    market = str(item.get("market") or item.get("market_segment") or "").upper()
+    source = str(item.get("source") or "").lower()
+    if market == "KOSPI" or source == "kospi":
+        return "KOSPI"
+    if market == "KOSDAQ" or source == "kosdaq":
+        return "KOSDAQ"
+    if market == "KONEX" or source == "konex":
+        return "KONEX"
+    return "UNKNOWN"
+
+
+def _candidate_market_key(item: dict[str, Any]) -> str:
+    market = _market_segment(item)
+    source = str(item.get("source") or "").lower()
+    if market == "KOSPI" or source == "kospi":
+        return "KOSPI"
+    if market == "KOSDAQ" or source == "kosdaq":
+        return "KOSDAQ"
+    if market == "KONEX" or source == "konex":
+        return "KONEX"
+    return "UNKNOWN"
+
+
+def _count_items_by_market(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"KOSPI": 0, "KOSDAQ": 0, "KONEX": 0, "UNKNOWN": 0}
+    for item in items:
+        key = _candidate_market_key(item)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _market_coverage_diagnostics(
+    *,
+    source_symbols: dict[str, dict[str, Any]],
+    snapshots: list[dict[str, Any]],
+    scored_candidates: list[dict[str, Any]],
+    candidate_pool: list[dict[str, Any]],
+    ranked_candidates: list[dict[str, Any]],
+    final_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    source_items = list(source_symbols.values())
+    source_counts = {"KOSPI": 0, "KOSDAQ": 0, "KONEX": 0, "UNKNOWN": 0}
+    for item in source_items:
+        key = _source_item_market(item)
+        source_counts[key] = source_counts.get(key, 0) + 1
+
+    snapshot_counts = _count_items_by_market(snapshots)
+    candidate_counts = _count_items_by_market(candidate_pool)
+    final_counts = _count_items_by_market(final_candidates)
+    scored_counts = _count_items_by_market(scored_candidates)
+    ranked_counts = _count_items_by_market(ranked_candidates)
+
+    return {
+        "total_source_symbol_count": len(source_symbols),
+        "kospi_source_symbol_count": source_counts["KOSPI"],
+        "kosdaq_source_symbol_count": source_counts["KOSDAQ"],
+        "konex_source_symbol_count": source_counts["KONEX"],
+        "unknown_market_symbol_count": source_counts["UNKNOWN"],
+        "kospi_snapshot_count": snapshot_counts["KOSPI"],
+        "kosdaq_snapshot_count": snapshot_counts["KOSDAQ"],
+        "konex_snapshot_count": snapshot_counts["KONEX"],
+        "unknown_market_snapshot_count": snapshot_counts["UNKNOWN"],
+        "kospi_scored_candidate_count": scored_counts["KOSPI"],
+        "kosdaq_scored_candidate_count": scored_counts["KOSDAQ"],
+        "kospi_candidate_count": candidate_counts["KOSPI"],
+        "kosdaq_candidate_count": candidate_counts["KOSDAQ"],
+        "konex_candidate_count": candidate_counts["KONEX"],
+        "unknown_market_candidate_count": candidate_counts["UNKNOWN"],
+        "kospi_ranked_candidate_count": ranked_counts["KOSPI"],
+        "kosdaq_ranked_candidate_count": ranked_counts["KOSDAQ"],
+        "kospi_final_candidate_count": final_counts["KOSPI"],
+        "kosdaq_final_candidate_count": final_counts["KOSDAQ"],
+        "konex_final_candidate_count": final_counts["KONEX"],
+        "unknown_market_final_candidate_count": final_counts["UNKNOWN"],
+        "kospi_non_final_reasons": _market_non_final_reasons(
+            market="KOSPI",
+            source_symbols=source_symbols,
+            snapshots=snapshots,
+            scored_candidates=scored_candidates,
+            ranked_candidates=ranked_candidates,
+            final_candidates=final_candidates,
+        ),
+    }
+
+
+def _market_non_final_reasons(
+    *,
+    market: str,
+    source_symbols: dict[str, dict[str, Any]],
+    snapshots: list[dict[str, Any]],
+    scored_candidates: list[dict[str, Any]],
+    ranked_candidates: list[dict[str, Any]],
+    final_candidates: list[dict[str, Any]],
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    final_symbols = {str(item.get("symbol")) for item in final_candidates if item.get("symbol")}
+    snapshot_by_symbol = {
+        str(item.get("symbol")): item
+        for item in snapshots
+        if item.get("symbol")
+    }
+    scored_by_symbol = {
+        str(item.get("symbol")): item
+        for item in scored_candidates
+        if item.get("symbol")
+    }
+    ranked_by_symbol = {
+        str(item.get("symbol")): item
+        for item in ranked_candidates
+        if item.get("symbol")
+    }
+    rows: list[dict[str, Any]] = []
+    for symbol, source_item in source_symbols.items():
+        if _source_item_market(source_item) != market:
+            continue
+        if symbol in final_symbols:
+            continue
+
+        snapshot = snapshot_by_symbol.get(symbol)
+        scored = scored_by_symbol.get(symbol)
+        ranked = ranked_by_symbol.get(symbol)
+        if snapshot is None:
+            stage = "snapshot"
+            reason = "no snapshot collected"
+            score = None
+        elif snapshot.get("universe_cleaning_passed") is False:
+            stage = "cleaning"
+            reason = "; ".join(str(item) for item in snapshot.get("universe_cleaning_reasons") or [])
+            score = None
+        elif scored is None:
+            stage = "scoring"
+            reason = str(snapshot.get("reason") or snapshot.get("message") or "not scored")
+            score = None
+        elif ranked is None:
+            stage = "candidate_limit"
+            reason = "scored but outside candidate_limit after ranking"
+            score = scored.get("score")
+        else:
+            stage = str(ranked.get("status") or ranked.get("decision") or "ranking")
+            reason = str(ranked.get("reason") or "not in final candidate slice")
+            score = ranked.get("composite_score") or ranked.get("score")
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "name": source_item.get("name") or (snapshot or {}).get("name"),
+                "stage": stage,
+                "score": score,
+                "reason": reason,
+            }
+        )
+        if len(rows) >= limit:
+            break
+    return rows
 
 
 def _collect_price_snapshots(
@@ -3027,37 +3240,40 @@ def _record_snapshots(
     created_at: str,
     snapshots: list[dict[str, Any]],
 ) -> None:
-    with sqlite3.connect(path) as conn:
-        conn.executemany(
-            """
-            INSERT INTO universe_price_snapshots (
-                scan_id, created_at, symbol, name, current_price, change_rate,
-                volume, volume_ratio, turnover_value, market_cap, market_segment,
-                universe_profile, trend, source, raw_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    scan_id,
-                    created_at,
-                    item.get("symbol"),
-                    item.get("name"),
-                    _to_float(item.get("current_price")),
-                    _to_float(item.get("change_rate")),
-                    _to_int(item.get("volume")),
-                    _to_float(item.get("volume_ratio")),
-                    _to_float(item.get("turnover_value")),
-                    _market_cap_krw(item),
-                    _market_segment(item),
-                    item.get("universe_profile"),
-                    item.get("trend"),
-                    item.get("source"),
-                    _json(item),
+    def operation() -> None:
+        with _connect(path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO universe_price_snapshots (
+                    scan_id, created_at, symbol, name, current_price, change_rate,
+                    volume, volume_ratio, turnover_value, market_cap, market_segment,
+                    universe_profile, trend, source, raw_json
                 )
-                for item in snapshots
-            ],
-        )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        scan_id,
+                        created_at,
+                        item.get("symbol"),
+                        item.get("name"),
+                        _to_float(item.get("current_price")),
+                        _to_float(item.get("change_rate")),
+                        _to_int(item.get("volume")),
+                        _to_float(item.get("volume_ratio")),
+                        _to_float(item.get("turnover_value")),
+                        _market_cap_krw(item),
+                        _market_segment(item),
+                        item.get("universe_profile"),
+                        item.get("trend"),
+                        item.get("source"),
+                        _json(item),
+                    )
+                    for item in snapshots
+                ],
+            )
+
+    sqlite_write_with_retry(operation)
 
 
 def _record_candidates(
@@ -3066,42 +3282,45 @@ def _record_candidates(
     created_at: str,
     candidates: list[dict[str, Any]],
 ) -> None:
-    with sqlite3.connect(path) as conn:
-        conn.executemany(
-            """
-            INSERT INTO universe_candidates (
-                scan_id, created_at, symbol, name, rank, score, decision, reason,
-                current_price, change_rate, volume, volume_ratio, turnover_value,
-                market_cap, market_segment, universe_profile, news_count,
-                disclosure_count, raw_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    scan_id,
-                    created_at,
-                    item.get("symbol"),
-                    item.get("name"),
-                    _to_int(item.get("rank")) or index,
-                    _to_float(item.get("score")) or 0.0,
-                    item.get("decision", "exclude"),
-                    item.get("reason", ""),
-                    _to_float(item.get("current_price")),
-                    _to_float(item.get("change_rate")),
-                    _to_int(item.get("volume")),
-                    _to_float(item.get("volume_ratio")),
-                    _to_float(item.get("turnover_value")),
-                    _market_cap_krw(item),
-                    _market_segment(item),
-                    item.get("universe_profile"),
-                    _to_int(item.get("news_count")) or 0,
-                    _to_int(item.get("disclosure_count")) or 0,
-                    _json(item),
+    def operation() -> None:
+        with _connect(path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO universe_candidates (
+                    scan_id, created_at, symbol, name, rank, score, decision, reason,
+                    current_price, change_rate, volume, volume_ratio, turnover_value,
+                    market_cap, market_segment, universe_profile, news_count,
+                    disclosure_count, raw_json
                 )
-                for index, item in enumerate(candidates, start=1)
-            ],
-        )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        scan_id,
+                        created_at,
+                        item.get("symbol"),
+                        item.get("name"),
+                        _to_int(item.get("rank")) or index,
+                        _to_float(item.get("score")) or 0.0,
+                        item.get("decision", "exclude"),
+                        item.get("reason", ""),
+                        _to_float(item.get("current_price")),
+                        _to_float(item.get("change_rate")),
+                        _to_int(item.get("volume")),
+                        _to_float(item.get("volume_ratio")),
+                        _to_float(item.get("turnover_value")),
+                        _market_cap_krw(item),
+                        _market_segment(item),
+                        item.get("universe_profile"),
+                        _to_int(item.get("news_count")) or 0,
+                        _to_int(item.get("disclosure_count")) or 0,
+                        _json(item),
+                    )
+                    for index, item in enumerate(candidates, start=1)
+                ],
+            )
+
+    sqlite_write_with_retry(operation)
 
 
 def _record_scanner_candidates(
@@ -3118,53 +3337,56 @@ def _record_scanner_candidates(
         if int(item.get("rank") or 0) <= execution_limit
         and item.get("status") != "ARCHIVED"
     ]
-    with sqlite3.connect(path) as conn:
-        conn.execute("DELETE FROM scanner_candidates")
-        conn.executemany(
-            """
-            INSERT INTO scanner_candidate_history (
-                scan_id, scan_time, symbol, name, raw_score, expected_return,
-                expected_risk, trading_cost, slippage_cost, net_edge,
-                composite_score, rank, reason, status, decision, current_price,
-                change_rate, volume, volume_ratio, turnover_value, market_cap,
-                market_segment, universe_profile, news_count, disclosure_count,
-                claimed_by_worker, expires_at, raw_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                _candidate_row_values(
-                    scan_id=scan_id,
-                    scan_time=scan_time,
-                    item=item if int(item.get("rank") or 0) <= execution_limit else {
-                        **item,
-                        "status": "ARCHIVED",
-                    },
+    def operation() -> None:
+        with _connect(path) as conn:
+            conn.execute("DELETE FROM scanner_candidates")
+            conn.executemany(
+                """
+                INSERT INTO scanner_candidate_history (
+                    scan_id, scan_time, symbol, name, raw_score, expected_return,
+                    expected_risk, trading_cost, slippage_cost, net_edge,
+                    composite_score, rank, reason, status, decision, current_price,
+                    change_rate, volume, volume_ratio, turnover_value, market_cap,
+                    market_segment, universe_profile, news_count, disclosure_count,
+                    claimed_by_worker, expires_at, raw_json
                 )
-                for item in candidates
-            ],
-        )
-        conn.executemany(
-            """
-            INSERT INTO scanner_candidates (
-                scan_id, scan_time, symbol, name, raw_score, expected_return,
-                expected_risk, trading_cost, slippage_cost, net_edge,
-                composite_score, rank, reason, status, decision, current_price,
-                change_rate, volume, volume_ratio, turnover_value, market_cap,
-                market_segment, universe_profile, news_count, disclosure_count,
-                claimed_by_worker, expires_at, raw_json
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    _candidate_row_values(
+                        scan_id=scan_id,
+                        scan_time=scan_time,
+                        item=item if int(item.get("rank") or 0) <= execution_limit else {
+                            **item,
+                            "status": "ARCHIVED",
+                        },
+                    )
+                    for item in candidates
+                ],
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                _candidate_row_values(
-                    scan_id=scan_id,
-                    scan_time=scan_time,
-                    item=item,
+            conn.executemany(
+                """
+                INSERT INTO scanner_candidates (
+                    scan_id, scan_time, symbol, name, raw_score, expected_return,
+                    expected_risk, trading_cost, slippage_cost, net_edge,
+                    composite_score, rank, reason, status, decision, current_price,
+                    change_rate, volume, volume_ratio, turnover_value, market_cap,
+                    market_segment, universe_profile, news_count, disclosure_count,
+                    claimed_by_worker, expires_at, raw_json
                 )
-                for item in active_rows
-            ],
-        )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    _candidate_row_values(
+                        scan_id=scan_id,
+                        scan_time=scan_time,
+                        item=item,
+                    )
+                    for item in active_rows
+                ],
+            )
+
+    sqlite_write_with_retry(operation)
 
 
 def _candidate_row_values(
@@ -3206,26 +3428,29 @@ def _candidate_row_values(
 
 
 def _record_scan_run(path: Path, result: dict[str, Any]) -> None:
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            """
-            INSERT INTO universe_scan_runs (
-                scan_id, created_at, source_symbol_count, candidate_limit,
-                final_limit, status, error, raw_json
+    def operation() -> None:
+        with _connect(path) as conn:
+            conn.execute(
+                """
+                INSERT INTO universe_scan_runs (
+                    scan_id, created_at, source_symbol_count, candidate_limit,
+                    final_limit, status, error, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result["scan_id"],
+                    result["created_at"],
+                    result["source_symbol_count"],
+                    result["candidate_limit"],
+                    result["final_limit"],
+                    result["status"],
+                    result.get("error"),
+                    _json(_serializable_result(result)),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                result["scan_id"],
-                result["created_at"],
-                result["source_symbol_count"],
-                result["candidate_limit"],
-                result["final_limit"],
-                result["status"],
-                result.get("error"),
-                _json(_serializable_result(result)),
-            ),
-        )
+
+    sqlite_write_with_retry(operation)
 
 
 def _serializable_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -3335,8 +3560,7 @@ def _paper_average_realized_return_bps(limit: int = 20) -> float | None:
     if not path.exists():
         return None
     try:
-        with sqlite3.connect(path) as conn:
-            conn.row_factory = sqlite3.Row
+        with _connect(path, row_factory=True) as conn:
             rows = conn.execute(
                 """
                 SELECT requested_amount, amount, net_realized_pnl, realized_pnl
@@ -3359,6 +3583,10 @@ def _paper_average_realized_return_bps(limit: int = 20) -> float | None:
     if not returns:
         return None
     return sum(returns) / len(returns)
+
+
+def _connect(path: Path | str, *, row_factory: bool = False) -> sqlite3.Connection:
+    return connect_sqlite(path, row_factory=row_factory)
 
 
 def _db_path(db_path: Path | str | None = None) -> Path:

@@ -32,6 +32,7 @@ from app.trading import paper_trading
 from app.trading import risk_manager
 from app.trading.atr_exits import atr_exit_levels_from_price_data
 from app.trading.edge_calibration import refresh_edge_training_samples
+from app.trading.execution_status import print_startup_log
 from app.trading.fill_quality import (
     fill_quality_adjustment_for_candidate,
     record_fill_quality_event,
@@ -39,8 +40,14 @@ from app.trading.fill_quality import (
 from app.trading.outcome_attribution import record_outcome_attribution
 from app.trading.regime_gate import regime_gate_for_mode
 from app.trading.universe_scanner import (
+    get_latest_universe_scan,
     scan_universe_for_auto_trade,
     scanner_candidate_to_symbol_config,
+)
+from app.storage.sqlite import (
+    RecoverableSQLiteError,
+    connect_sqlite,
+    is_recoverable_sqlite_error,
 )
 
 
@@ -54,7 +61,10 @@ def start_auto_trading(req: AutoTradeStartRequest) -> dict[str, Any]:
     """Persist an auto-trading session for a separate worker process."""
     _validate_start_request(req)
     account_key = auto_trading_store.account_key_for_request(req)
+    recovery_applied = False
     if settings.auto_trading_one_session_per_account:
+        recovered = auto_trading_store.recover_overdue_active_sessions()
+        recovery_applied = bool(recovered)
         existing = auto_trading_store.get_active_session_for_account(account_key)
         if existing:
             return {
@@ -65,12 +75,16 @@ def start_auto_trading(req: AutoTradeStartRequest) -> dict[str, Any]:
                 "interval_seconds": existing["interval_seconds"],
                 "max_cycles": existing["max_cycles"],
                 "started_at": existing["created_at"],
+                "auto_recovery_applied": bool(
+                    recovery_applied or existing.get("recovery_applied")
+                ),
                 "message": (
                     "An active auto-trading session already exists for this account; "
                     "no duplicate session was created."
                 ),
                 "universe_scan": None,
             }
+        recovery_applied = recovery_applied or _recover_previous_locked_error_session(account_key)
     session = auto_trading_store.create_session(req)
     return {
         "session_id": session["session_id"],
@@ -80,6 +94,9 @@ def start_auto_trading(req: AutoTradeStartRequest) -> dict[str, Any]:
         "interval_seconds": req.interval_seconds,
         "max_cycles": req.max_cycles,
         "started_at": session["created_at"],
+        "auto_recovery_applied": bool(
+            recovery_applied or session.get("recovery_applied")
+        ),
         "message": "Auto-trading session saved. Run the auto-trading worker to process it.",
         "universe_scan": None,
     }
@@ -104,8 +121,18 @@ def list_auto_trading_sessions(
         auto_trading_store.session_to_status(session)
         for session in auto_trading_store.list_sessions(status=status, limit=limit)
     ]
+    latest = sessions[0] if sessions else None
     return {
         "count": len(sessions),
+        "active_session_count": (
+            len(sessions)
+            if status == "active"
+            else len(auto_trading_store.list_sessions(status="active", limit=500))
+        ),
+        "latest_session_status": latest.get("status") if latest else None,
+        "last_recoverable_error": latest.get("last_recoverable_error") if latest else None,
+        "last_cycle_error": latest.get("last_cycle_error") if latest else None,
+        "auto_recovery_applied": bool(latest.get("recovery_applied")) if latest else False,
         "sessions": sessions,
     }
 
@@ -141,13 +168,20 @@ def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, 
         auto_trading_store.session_to_status(session)
         for session in auto_trading_store.list_sessions(status="active", limit=500)
     ]
+    recent_sessions = list_auto_trading_sessions(limit=10)["sessions"]
+    latest = recent_sessions[0] if recent_sessions else None
     if req.command == "status":
         return {
             "status": "success",
             "command": req.command,
             "message": f"{len(active)} active auto-trading session(s)",
+            "active_session_count": len(active),
+            "latest_session_status": latest.get("status") if latest else None,
+            "last_recoverable_error": latest.get("last_recoverable_error") if latest else None,
+            "last_cycle_error": latest.get("last_cycle_error") if latest else None,
+            "auto_recovery_applied": bool(latest.get("recovery_applied")) if latest else False,
             "active_sessions": active,
-            "recent_sessions": list_auto_trading_sessions(limit=10)["sessions"],
+            "recent_sessions": recent_sessions,
             "stopped_sessions": [],
             "started_session": None,
             "worker_status": worker_status,
@@ -161,6 +195,11 @@ def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, 
             "status": "success",
             "command": req.command,
             "message": f"Stopped {len(stopped)} active auto-trading session(s)",
+            "active_session_count": 0,
+            "latest_session_status": latest.get("status") if latest else None,
+            "last_recoverable_error": latest.get("last_recoverable_error") if latest else None,
+            "last_cycle_error": latest.get("last_cycle_error") if latest else None,
+            "auto_recovery_applied": bool(latest.get("recovery_applied")) if latest else False,
             "active_sessions": [],
             "recent_sessions": list_auto_trading_sessions(limit=10)["sessions"],
             "stopped_sessions": stopped,
@@ -173,8 +212,13 @@ def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, 
             "status": "already_active",
             "command": req.command,
             "message": "Auto-trading is already active; no duplicate session created",
+            "active_session_count": len(active),
+            "latest_session_status": latest.get("status") if latest else None,
+            "last_recoverable_error": latest.get("last_recoverable_error") if latest else None,
+            "last_cycle_error": latest.get("last_cycle_error") if latest else None,
+            "auto_recovery_applied": bool(latest.get("recovery_applied")) if latest else False,
             "active_sessions": active,
-            "recent_sessions": list_auto_trading_sessions(limit=10)["sessions"],
+            "recent_sessions": recent_sessions,
             "stopped_sessions": [],
             "started_session": None,
             "worker_status": worker_status,
@@ -202,6 +246,11 @@ def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, 
         "status": "started",
         "command": req.command,
         "message": "Auto-trading started with universe auto-discovery",
+        "active_session_count": len(list_auto_trading_sessions(status="active", limit=10)["sessions"]),
+        "latest_session_status": started.get("status"),
+        "last_recoverable_error": None,
+        "last_cycle_error": None,
+        "auto_recovery_applied": bool(started.get("auto_recovery_applied")),
         "active_sessions": list_auto_trading_sessions(status="active", limit=10)["sessions"],
         "recent_sessions": list_auto_trading_sessions(limit=10)["sessions"],
         "stopped_sessions": [],
@@ -272,11 +321,48 @@ def process_due_sessions(
                 }
             )
         except Exception as exc:
-            updated = auto_trading_store.fail_cycle(
-                session["session_id"],
-                str(exc),
-                worker_id=worker_id,
-            )
+            if _is_recoverable_runtime_error(exc):
+                try:
+                    updated = auto_trading_store.recoverable_cycle_error(
+                        session["session_id"],
+                        str(exc),
+                        worker_id=worker_id,
+                    )
+                except Exception as recovery_exc:
+                    processed.append(
+                        {
+                            "session_id": session["session_id"],
+                            "status": "recoverable_error_not_recorded",
+                            "recoverable_error": str(exc),
+                            "recovery_write_error": str(recovery_exc),
+                        }
+                    )
+                    continue
+                processed.append(
+                    {
+                        "session_id": session["session_id"],
+                        "status": (updated or {}).get("status", "active"),
+                        "recoverable_error": str(exc),
+                    }
+                )
+                continue
+
+            try:
+                updated = auto_trading_store.fail_cycle(
+                    session["session_id"],
+                    str(exc),
+                    worker_id=worker_id,
+                )
+            except Exception as failure_write_exc:
+                processed.append(
+                    {
+                        "session_id": session["session_id"],
+                        "status": "error_not_recorded",
+                        "error": str(exc),
+                        "failure_write_error": str(failure_write_exc),
+                    }
+                )
+                continue
             processed.append(
                 {
                     "session_id": session["session_id"],
@@ -299,9 +385,95 @@ def run_worker_forever(
         else poll_seconds
     )
     auto_trading_store.initialize_auto_trading_db()
+    order_state.initialize_order_state_db()
+    print_startup_log(
+        auto_trading_worker_enabled=True,
+        scanner_worker_enabled=bool(settings.universe_full_scan_enabled),
+    )
     while True:
         process_due_sessions(worker_id=worker_id)
         time.sleep(float(poll_seconds))
+
+
+def _is_recoverable_runtime_error(exc: BaseException) -> bool:
+    return isinstance(exc, RecoverableSQLiteError) or is_recoverable_sqlite_error(exc)
+
+
+def _recover_previous_locked_error_session(account_key: str) -> bool:
+    recent = auto_trading_store.list_sessions(limit=20)
+    return any(
+        session.get("account_key") == account_key
+        and session.get("status") == "error"
+        and is_recoverable_sqlite_error(session.get("last_error"))
+        for session in recent
+    )
+
+
+def _scanner_staleness_report() -> dict[str, Any]:
+    latest = get_latest_universe_scan()
+    now = datetime.now()
+    latest_time = (
+        _parse_iso_datetime(latest.get("created_at"))
+        or _parse_iso_datetime(latest.get("scan_time"))
+    )
+    latest_age = None
+    if latest_time is not None:
+        now_for_age = datetime.now(latest_time.tzinfo) if latest_time.tzinfo else now
+        latest_age = max(0, int((now_for_age - latest_time).total_seconds()))
+
+    stale_after = _scanner_stale_after_seconds_for_cycle()
+    is_stale = bool(
+        latest.get("status") not in {"empty", "not_found"}
+        and latest_age is not None
+        and latest_age > stale_after
+    )
+
+    return {
+        "scanner_is_stale": is_stale,
+        "latest_scan_age_seconds": latest_age,
+        "scanner_stale_after_seconds": stale_after,
+    }
+
+
+def _scanner_stale_after_seconds_for_cycle() -> int:
+    source_count = max(1, int(settings.universe_scanner_max_source_symbols or 1))
+    symbol_interval = max(
+        0.0,
+        float(settings.universe_scanner_symbol_interval_seconds or 0.0),
+    )
+    cap = max(0.0, float(settings.universe_scanner_symbol_interval_cap_seconds or 0.0))
+    if cap > 0:
+        symbol_interval = min(symbol_interval, cap)
+    estimated_scan_seconds = int(source_count * symbol_interval) + 300
+    return max(
+        900,
+        int(settings.universe_scanner_min_interval_seconds or 0),
+        estimated_scan_seconds * 2,
+    )
+
+
+def _scan_market_coverage_fields(scan: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "total_source_symbol_count",
+        "kospi_source_symbol_count",
+        "kosdaq_source_symbol_count",
+        "konex_source_symbol_count",
+        "unknown_market_symbol_count",
+        "kospi_snapshot_count",
+        "kosdaq_snapshot_count",
+        "konex_snapshot_count",
+        "unknown_market_snapshot_count",
+        "kospi_candidate_count",
+        "kosdaq_candidate_count",
+        "konex_candidate_count",
+        "unknown_market_candidate_count",
+        "kospi_final_candidate_count",
+        "kosdaq_final_candidate_count",
+        "konex_final_candidate_count",
+        "unknown_market_final_candidate_count",
+        "market_coverage",
+    )
+    return {key: scan[key] for key in keys if key in scan}
 
 
 def _run_cycle(
@@ -311,10 +483,26 @@ def _run_cycle(
     symbols = list(req.symbols)
     results_prefix: list[dict[str, Any]] = []
     if req.auto_discover_symbols and not symbols:
-        scan = scan_universe_for_auto_trade(
-            req,
-            worker_id=session_id or "inline-auto-trading",
-        )
+        stale_check = _scanner_staleness_report()
+        try:
+            scan = scan_universe_for_auto_trade(
+                req,
+                worker_id=session_id or "inline-auto-trading",
+            )
+        except Exception as exc:
+            return [
+                {
+                    "symbol": "__universe__",
+                    "status": "skipped",
+                    "message": f"Universe scanner recovery failed: {exc}",
+                    "scanner_is_stale": stale_check["scanner_is_stale"],
+                    "latest_scan_age_seconds": stale_check["latest_scan_age_seconds"],
+                    "scanner_stale_after_seconds": stale_check["scanner_stale_after_seconds"],
+                    "last_scanner_recovery_attempt_at": datetime.now().isoformat(timespec="seconds"),
+                    "last_scanner_recovery_status": "error",
+                    "last_scanner_recovery_error": str(exc),
+                }
+            ]
         symbols = scan["symbols"]
         symbols.extend(
             _managed_position_exit_symbols(
@@ -331,12 +519,25 @@ def _run_cycle(
                 "snapshot_count": scan.get("snapshot_count", scan["source_symbol_count"]),
                 "candidate_count": scan["candidate_count"],
                 "final_count": scan["final_count"],
+                **_scan_market_coverage_fields(scan),
                 "executable_count": scan.get("executable_count"),
                 "final_candidates": scan["final_candidates"],
                 "ready_candidates": scan.get("ready_candidates", []),
                 "worker_hurdle_rate": scan.get("worker_hurdle_rate"),
                 "active_candidate_symbols": scan.get("active_candidate_symbols", []),
                 "entry_gate": scan.get("entry_gate"),
+                "scanner_is_stale": stale_check["scanner_is_stale"],
+                "latest_scan_age_seconds": stale_check["latest_scan_age_seconds"],
+                "scanner_stale_after_seconds": stale_check["scanner_stale_after_seconds"],
+                "last_scanner_recovery_attempt_at": (
+                    datetime.now().isoformat(timespec="seconds")
+                    if stale_check["scanner_is_stale"]
+                    else None
+                ),
+                "last_scanner_recovery_status": (
+                    "success" if stale_check["scanner_is_stale"] else "not_needed"
+                ),
+                "last_scanner_recovery_error": None,
             }
         )
         min_scanned_symbols = max(
@@ -745,7 +946,7 @@ def _recent_symbol_returns_from_universe_db(
         return []
 
     try:
-        conn = sqlite3.connect(path)
+        conn = connect_sqlite(path)
         try:
             rows = conn.execute(
                 """
@@ -2030,8 +2231,7 @@ def _strategy_circuit_breaker_for_symbol(
     path = settings.storage_path(paper_trading.DEFAULT_DB_PATH)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(path) as conn:
-            conn.row_factory = sqlite3.Row
+        with connect_sqlite(path, row_factory=True) as conn:
             paper_trading.initialize_db(conn)
             return risk_manager.strategy_circuit_breaker(
                 conn=conn,
@@ -2612,8 +2812,7 @@ def _open_paper_positions() -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
     try:
-        with sqlite3.connect(path) as conn:
-            conn.row_factory = sqlite3.Row
+        with connect_sqlite(path, row_factory=True) as conn:
             paper_trading.initialize_db(conn)
             rows = conn.execute(
                 """
@@ -2633,8 +2832,7 @@ def _open_live_positions() -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
     try:
-        with sqlite3.connect(path) as conn:
-            conn.row_factory = sqlite3.Row
+        with connect_sqlite(path, row_factory=True) as conn:
             conn.executescript(broker_sync.SCHEMA_SQL)
             broker_sync._ensure_column(conn, "broker_positions", "opened_at", "TEXT")
             rows = conn.execute(

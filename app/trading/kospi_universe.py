@@ -4,12 +4,15 @@ from contextlib import closing
 from datetime import datetime
 import csv
 import json
+import logging
+import re
 from pathlib import Path
 import sqlite3
 from typing import Any
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS kospi_symbols (
@@ -73,6 +76,9 @@ def _normalize_item(item: Any, *, source: str) -> dict[str, Any] | None:
     if not symbol or not symbol.isdigit() or len(symbol) != 6:
         return None
 
+    if not _looks_like_common_stock(symbol=symbol, name=name, raw_json=raw_json):
+        return None
+
     return {
         "symbol": symbol,
         "name": str(name).strip() if name is not None and str(name).strip() else None,
@@ -80,6 +86,57 @@ def _normalize_item(item: Any, *, source: str) -> dict[str, Any] | None:
         "source": source,
         "raw_json": raw_json,
     }
+
+
+def _looks_like_common_stock(
+    *,
+    symbol: str,
+    name: Any,
+    raw_json: dict[str, Any],
+) -> bool:
+    del symbol
+    name_text = str(name or "").strip()
+    compact_name = re.sub(r"\s+", "", name_text).upper()
+    security_type = str(
+        raw_json.get("security_type")
+        or raw_json.get("type")
+        or raw_json.get("종목종류")
+        or raw_json.get("증권종류")
+        or ""
+    ).upper()
+    combined = f"{compact_name} {security_type}"
+
+    excluded_tokens = (
+        "ETF",
+        "ETN",
+        "ELW",
+        "SPAC",
+        "스팩",
+        "인버스",
+        "레버리지",
+        "선물",
+        "채권",
+        "워런트",
+        "WARRANT",
+    )
+    if any(token in combined for token in excluded_tokens):
+        return False
+
+    # Preferred shares usually carry a trailing 우/우B/1우-style suffix.
+    if re.search(r"(\d우|우B|우C|우선주|우)$", compact_name):
+        return False
+
+    status_text = str(
+        raw_json.get("status")
+        or raw_json.get("listing_status")
+        or raw_json.get("상태")
+        or raw_json.get("거래상태")
+        or ""
+    )
+    if any(token in status_text for token in ("상장폐지", "정리매매", "거래정지")):
+        return False
+
+    return True
 
 
 def _apply_limit(items: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
@@ -339,14 +396,44 @@ def load_kospi_symbols(
         configured = int(limit if limit is not None else settings.universe_kospi_symbol_limit or 0)
         effective_limit = configured if configured > 0 else None
 
-    if source == "cache":
-        return _apply_limit(load_cached_kospi_symbols(limit=effective_limit), effective_limit)
-    if source == "kis":
-        return _apply_limit(_load_from_existing_kis_helper(effective_limit), effective_limit)
-    if source == "csv":
-        return _apply_limit(load_kospi_symbols_from_csv(limit=effective_limit), effective_limit)
+    source_order = _kospi_source_order(source)
+    for source_name in source_order:
+        items = _load_kospi_symbols_from_source(source_name, effective_limit)
+        if items:
+            logger.info(
+                "Loaded %s KOSPI symbols from %s",
+                len(items),
+                source_name,
+            )
+            return _apply_limit(items, effective_limit)
 
-    cached = load_cached_kospi_symbols(limit=effective_limit)
-    if cached:
-        return _apply_limit(cached, effective_limit)
-    return _apply_limit(load_kospi_symbols_from_csv(limit=effective_limit), effective_limit)
+    logger.warning(
+        "No KOSPI symbols loaded from configured/local sources: %s",
+        ",".join(source_order),
+    )
+    return []
+
+
+def _kospi_source_order(source: str) -> list[str]:
+    source = str(source or "").strip().lower()
+    if source == "disabled":
+        return []
+    preferred = source if source in {"cache", "csv", "kis"} else "cache"
+    ordered = [preferred]
+    for fallback in ("cache", "csv", "kis"):
+        if fallback not in ordered:
+            ordered.append(fallback)
+    return ordered
+
+
+def _load_kospi_symbols_from_source(
+    source: str,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    if source == "cache":
+        return load_cached_kospi_symbols(limit=limit)
+    if source == "csv":
+        return load_kospi_symbols_from_csv(limit=limit)
+    if source == "kis":
+        return _load_from_existing_kis_helper(limit)
+    return []

@@ -473,6 +473,14 @@
           <div class="state-card"><span>Samples</span><strong id="sampleState">-</strong><small id="sampleDetail">-</small></div>
           <div class="state-card"><span>Workers</span><strong id="workerState">-</strong><small id="workerDetail">-</small></div>
           <div class="state-card"><span>Active Sessions</span><strong id="activeSessionCount">0</strong><small id="sessionDetail">-</small></div>
+          <div class="state-card"><span>Execution Mode</span><strong id="runtimeExecutionMode">-</strong><small id="runtimeBrokerMode">-</small></div>
+          <div class="state-card"><span>Entry Planner</span><strong id="plannedEntryCount">0</strong><small id="orderStatus">-</small></div>
+          <div class="state-card"><span>Paper Orders</span><strong id="paperOrdersCount">0</strong><small id="paperOrdersDetail">-</small></div>
+          <div class="state-card"><span>Broker Executions</span><strong id="brokerExecutionsCount">0</strong><small id="submittedOrderDetail">-</small></div>
+          <div class="state-card"><span>Candidate Label WR</span><strong id="candidateLabelWinRate">-</strong><small id="candidateLabelDetail">scanner labels</small></div>
+          <div class="state-card"><span>Paper Order WR</span><strong id="paperOrderWinRate">N/A</strong><small id="paperOrderDetail">internal paper orders</small></div>
+          <div class="state-card"><span>Broker Fill WR</span><strong id="brokerFillWinRate">N/A</strong><small id="brokerFillDetail">broker executions</small></div>
+          <div class="state-card"><span>Edge Metric</span><strong id="edgeMetricFreshness">-</strong><small id="edgeMetricDetail">-</small></div>
           <div class="state-card"><span>Latest Scan</span><strong id="latestScanState">-</strong><small id="latestScanDetail">-</small></div>
           <div class="state-card"><span>Scan Runs</span><strong id="runtimeScanCount">0</strong><small id="runtimeCandidateCount">-</small></div>
           <div class="state-card"><span>Price Snapshots</span><strong id="runtimeSnapshotCount">0</strong><small id="runtimeLatestScanTime">-</small></div>
@@ -523,7 +531,9 @@
           <div class="metric"><span>Total Realized Net Edge</span><strong id="totalRealizedNetEdgeBps">0</strong></div>
           <div class="metric"><span>Avg Realized Net Edge</span><strong id="avgRealizedNetEdgeBps">-</strong></div>
           <div class="metric"><span>Net Edge Win Rate</span><strong id="netEdgeWinRate">-</strong></div>
-          <div class="metric"><span>Price Win Rate</span><strong id="winRate">-</strong></div>
+          <div class="metric"><span>Candidate Label Win Rate</span><strong id="winRate">-</strong></div>
+          <div class="metric"><span>Paper Order Win Rate</span><strong id="edgePaperOrderWinRate">N/A</strong></div>
+          <div class="metric"><span>Broker Fill Win Rate</span><strong id="edgeBrokerFillWinRate">N/A</strong></div>
           <div class="metric"><span>Total Expected Return</span><strong id="totalExpectedReturnBps">0</strong></div>
           <div class="metric"><span>Total Predicted Edge</span><strong id="totalPredictedNetEdgeBps">0</strong></div>
           <div class="metric"><span>Avg Return bps</span><strong id="avgReturnBps">-</strong></div>
@@ -612,6 +622,22 @@
       workerDetail: document.getElementById("workerDetail"),
       activeSessionCount: document.getElementById("activeSessionCount"),
       sessionDetail: document.getElementById("sessionDetail"),
+      runtimeExecutionMode: document.getElementById("runtimeExecutionMode"),
+      runtimeBrokerMode: document.getElementById("runtimeBrokerMode"),
+      plannedEntryCount: document.getElementById("plannedEntryCount"),
+      orderStatus: document.getElementById("orderStatus"),
+      paperOrdersCount: document.getElementById("paperOrdersCount"),
+      paperOrdersDetail: document.getElementById("paperOrdersDetail"),
+      brokerExecutionsCount: document.getElementById("brokerExecutionsCount"),
+      submittedOrderDetail: document.getElementById("submittedOrderDetail"),
+      candidateLabelWinRate: document.getElementById("candidateLabelWinRate"),
+      candidateLabelDetail: document.getElementById("candidateLabelDetail"),
+      paperOrderWinRate: document.getElementById("paperOrderWinRate"),
+      paperOrderDetail: document.getElementById("paperOrderDetail"),
+      brokerFillWinRate: document.getElementById("brokerFillWinRate"),
+      brokerFillDetail: document.getElementById("brokerFillDetail"),
+      edgeMetricFreshness: document.getElementById("edgeMetricFreshness"),
+      edgeMetricDetail: document.getElementById("edgeMetricDetail"),
       latestScanState: document.getElementById("latestScanState"),
       latestScanDetail: document.getElementById("latestScanDetail"),
       runtimeScanCount: document.getElementById("runtimeScanCount"),
@@ -649,6 +675,8 @@
       maeNetEdgeErrorBps: document.getElementById("maeNetEdgeErrorBps"),
       metricSampleCount: document.getElementById("metricSampleCount"),
       winRate: document.getElementById("winRate"),
+      edgePaperOrderWinRate: document.getElementById("edgePaperOrderWinRate"),
+      edgeBrokerFillWinRate: document.getElementById("edgeBrokerFillWinRate"),
       top10SampleCount: document.getElementById("top10SampleCount"),
       top10AvgReturnBps: document.getElementById("top10AvgReturnBps"),
       top10AvgRealizedNetEdgeBps: document.getElementById("top10AvgRealizedNetEdgeBps"),
@@ -994,7 +1022,45 @@
       els.workerDetail.textContent = workerNames(workers);
 
       els.activeSessionCount.textContent = fmtNumber(summary.active_session_count, 0);
-      els.sessionDetail.textContent = summary.latest_session_updated_at || "-";
+      els.sessionDetail.textContent = [
+        summary.latest_session_status || "",
+        summary.latest_session_updated_at || "",
+        summary.latest_session && summary.latest_session.last_error
+          ? `error ${summary.latest_session.last_error}`
+          : ""
+      ].filter(Boolean).join(" | ") || "-";
+      els.runtimeExecutionMode.textContent = summary.execution_mode || "-";
+      els.runtimeExecutionMode.className = summary.execution_mode === "live" ? "bad" : "ok";
+      els.runtimeBrokerMode.textContent = [
+        summary.broker_provider || "KIS",
+        summary.kis_is_paper ? "KIS paper" : "KIS live",
+        summary.submits_to_broker ? "broker submit on" : "broker submit off",
+        summary.uses_internal_paper_orders ? "internal paper on" : "internal paper off"
+      ].join(" | ");
+      els.plannedEntryCount.textContent = fmtNumber(summary.planned_entry_count, 0);
+      els.orderStatus.textContent = stateLabel(summary.order_status || "-");
+      els.orderStatus.className = summary.order_status === "not_submitted" ? "warn" : statusTextClass(summary.order_status || "");
+      els.paperOrdersCount.textContent = fmtNumber(summary.paper_orders_count, 0);
+      els.paperOrdersCount.className = Number(summary.paper_orders_count || 0) > 0 ? "ok" : "warn";
+      els.paperOrdersDetail.textContent = summary.paper_orders_zero_reason || "internal paper orders";
+      els.brokerExecutionsCount.textContent = fmtNumber(summary.broker_executions_count, 0);
+      els.brokerExecutionsCount.className = Number(summary.broker_executions_count || 0) > 0 ? "ok" : "warn";
+      els.submittedOrderDetail.textContent = `${fmtNumber(summary.submitted_order_count, 0)} submitted`;
+      els.candidateLabelWinRate.textContent = displayPercent(summary.candidate_label_win_rate_display, summary.candidate_label_win_rate);
+      els.candidateLabelDetail.textContent = `${fmtNumber(summary.candidate_label_sample_count, 0)} label samples`;
+      els.paperOrderWinRate.textContent = displayPercent(summary.paper_order_win_rate_display, summary.paper_order_win_rate);
+      els.paperOrderWinRate.className = summary.paper_order_win_rate === null || summary.paper_order_win_rate === undefined ? "warn" : "ok";
+      els.paperOrderDetail.textContent = `${fmtNumber(summary.paper_order_sample_count, 0)} paper orders`;
+      els.brokerFillWinRate.textContent = displayPercent(summary.broker_execution_win_rate_display, summary.broker_execution_win_rate);
+      els.brokerFillWinRate.className = summary.broker_execution_win_rate === null || summary.broker_execution_win_rate === undefined ? "warn" : "ok";
+      els.brokerFillDetail.textContent = `${fmtNumber(summary.broker_execution_sample_count, 0)} broker fills`;
+      els.edgeMetricFreshness.textContent = summary.stale_reason ? "stale reason" : "current";
+      els.edgeMetricFreshness.className = summary.stale_reason ? "bad" : "ok";
+      els.edgeMetricDetail.textContent = [
+        `gate ${fmtNumber(summary.gate_sample_count, 0)}`,
+        `edge ${fmtNumber(summary.dashboard_edge_sample_count, 0)}`,
+        summary.edge_metric_updated_at || summary.gate_metric_snapshot_timestamp || ""
+      ].filter(Boolean).join(" | ");
       els.latestScanState.textContent = stateLabel(summary.latest_scan_status || latest.status || "-");
       els.latestScanState.className = statusTextClass(summary.latest_scan_status || latest.status || "");
       els.latestScanDetail.textContent = shortId(summary.latest_scan_id || latest.scan_id || "");
@@ -1088,7 +1154,9 @@
       els.avgPredictedNetEdgeBps.textContent = fmtBps(summary.avg_predicted_net_edge_bps);
       els.maeNetEdgeErrorBps.textContent = fmtBps(summary.mae_net_edge_error_bps);
       els.metricSampleCount.textContent = fmtNumber(summary.metric_sample_count || 0, 0);
-      els.winRate.textContent = fmtPercent(summary.win_rate);
+      els.winRate.textContent = fmtUnitPercent(data.unit_performance && data.unit_performance.candidate_label, summary.win_rate);
+      els.edgePaperOrderWinRate.textContent = fmtUnitPercent(data.unit_performance && data.unit_performance.paper_order, null);
+      els.edgeBrokerFillWinRate.textContent = fmtUnitPercent(data.unit_performance && data.unit_performance.actual_broker_fill, null);
       renderDiagnostics(data.diagnostics || {});
       renderTop10Performance(data.top10_performance || {});
 
@@ -1283,6 +1351,18 @@
       const number = Number(value);
       if (!Number.isFinite(number)) return escapeHtml(value);
       return `${(number * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
+    }
+
+    function displayPercent(display, value) {
+      if (display && display !== "-") return escapeHtml(display);
+      return fmtPercent(value);
+    }
+
+    function fmtUnitPercent(unit, fallback) {
+      if (!unit) return fmtPercent(fallback);
+      const sampleCount = Number(unit.sample_count || 0);
+      if (!sampleCount || unit.win_rate === undefined || unit.win_rate === null) return "N/A";
+      return fmtPercent(unit.win_rate);
     }
 
     function fmtSeconds(value) {

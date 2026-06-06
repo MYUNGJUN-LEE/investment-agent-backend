@@ -15,6 +15,7 @@ from app.models import (
     PipelineRequest,
 )
 from app.services.pipeline import run_full_pipeline
+from app.storage.sqlite import connect_sqlite, sqlite_write_with_retry
 from app.strategies.rule_based import build_strategy_decision
 from app.trading import paper_trading, risk_manager
 
@@ -59,42 +60,45 @@ def create_order_preview(
     token = None
     message = "Strategy blocked this order preview"
 
-    with sqlite3.connect(resolved_db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        paper_trading.initialize_db(conn)
+    def operation() -> int:
+        nonlocal risk_decision, status, token, message
+        with connect_sqlite(resolved_db_path, row_factory=True) as conn:
+            paper_trading.initialize_db(conn)
 
-        if strategy_decision["approved"]:
-            paper_req = _to_paper_request(req, strategy_decision)
-            decision = risk_manager.approve_order(
-                conn=conn,
-                req=paper_req,
-                side=strategy_decision["side"],
-                quantity=req.quantity,
-                now=now,
-            )
-            risk_decision = _risk_decision_to_dict(decision)
-            if decision.approved:
-                status = "pending"
-                token = secrets.token_urlsafe(24)
-                message = "Order preview is ready for user confirmation"
+            if strategy_decision["approved"]:
+                paper_req = _to_paper_request(req, strategy_decision)
+                decision = risk_manager.approve_order(
+                    conn=conn,
+                    req=paper_req,
+                    side=strategy_decision["side"],
+                    quantity=req.quantity,
+                    now=now,
+                )
+                risk_decision = _risk_decision_to_dict(decision)
+                if decision.approved:
+                    status = "pending"
+                    token = secrets.token_urlsafe(24)
+                    message = "Order preview is ready for user confirmation"
+                else:
+                    message = f"Risk blocked this order preview: {decision.message} ({decision.code})"
             else:
-                message = f"Risk blocked this order preview: {decision.message} ({decision.code})"
-        else:
-            risk_decision = None
-            message = "; ".join(strategy_decision["blocking_reasons"])
+                risk_decision = None
+                message = "; ".join(strategy_decision["blocking_reasons"])
 
-        preview_id = _insert_preview(
-            conn=conn,
-            created_at=now,
-            status=status,
-            preview_token=token,
-            req=req,
-            strategy_decision=strategy_decision,
-            risk_decision=risk_decision,
-            pipeline_result=pipeline_result,
-            message=message,
-            amount=amount,
-        )
+            return _insert_preview(
+                conn=conn,
+                created_at=now,
+                status=status,
+                preview_token=token,
+                req=req,
+                strategy_decision=strategy_decision,
+                risk_decision=risk_decision,
+                pipeline_result=pipeline_result,
+                message=message,
+                amount=amount,
+            )
+
+    preview_id = sqlite_write_with_retry(operation)
 
     return {
         "status": status,
@@ -123,8 +127,7 @@ def confirm_order_preview(
     """Confirm a pending preview and execute it through paper trading."""
     resolved_db_path = settings.storage_path(db_path or paper_trading.DEFAULT_DB_PATH)
 
-    with sqlite3.connect(resolved_db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    with connect_sqlite(resolved_db_path, row_factory=True) as conn:
         paper_trading.initialize_db(conn)
         preview = _get_preview(conn, req.preview_id)
         if not preview:
@@ -152,23 +155,25 @@ def confirm_order_preview(
     )
     paper_result = paper_trading.run_paper_once(paper_req, db_path=resolved_db_path)
 
-    with sqlite3.connect(resolved_db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        status = "confirmed" if paper_result["order_status"] == "FILLED" else "rejected"
-        conn.execute(
-            """
-            UPDATE order_previews
-            SET status = ?, confirmed_at = ?, paper_order_id = ?
-            WHERE id = ?
-            """,
-            (
-                status,
-                _now(),
-                paper_result["order_id"],
-                req.preview_id,
-            ),
-        )
-        conn.commit()
+    def operation() -> str:
+        with connect_sqlite(resolved_db_path, row_factory=True) as conn:
+            status = "confirmed" if paper_result["order_status"] == "FILLED" else "rejected"
+            conn.execute(
+                """
+                UPDATE order_previews
+                SET status = ?, confirmed_at = ?, paper_order_id = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    _now(),
+                    paper_result["order_id"],
+                    req.preview_id,
+                ),
+            )
+            return status
+
+    status = sqlite_write_with_retry(operation)
 
     return {
         "status": status,

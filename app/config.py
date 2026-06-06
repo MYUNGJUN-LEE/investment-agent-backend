@@ -194,11 +194,16 @@ class Settings(BaseSettings):
     edge_calibration_gate_min_oos_samples: int = 200
     edge_calibration_gate_max_mae_return_bps: float = 180.0
     edge_calibration_gate_max_mae_risk_bps: float = 180.0
+    edge_calibration_gate_max_mae_net_edge_bps: float = 180.0
     edge_calibration_gate_min_top10_avg_return_bps: float = 5.0
     edge_calibration_paper_min_top10_avg_return_bps: float = 5.0
     edge_calibration_gate_min_top10_win_rate: float = 0.50
     edge_calibration_gate_min_top10_expectancy_bps: float = 0.0
     edge_calibration_gate_min_fill_adjusted_edge_bps: float = 60.0
+    edge_calibration_gate_min_concentration_samples: int = 20
+    edge_calibration_gate_max_symbol_share: float = 0.20
+    edge_calibration_gate_max_sector_share: float = 0.35
+    edge_calibration_gate_max_theme_share: float = 0.35
     quant_validation_enabled: bool = False
     quant_validation_min_samples: int = 1000
     quant_validation_max_samples: int = 3000
@@ -358,10 +363,7 @@ class Settings(BaseSettings):
             or os.getenv("RENDER_SERVICE_ID")
             or os.getenv("RENDER_SERVICE_TYPE")
         ):
-            for raw in ("/var/data", "/data"):
-                candidate = Path(raw)
-                if candidate.exists():
-                    return candidate
+            return Path("/var/data")
         return None
 
     def storage_path(self, value: str | Path) -> Path:

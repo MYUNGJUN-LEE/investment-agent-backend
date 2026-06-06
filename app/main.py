@@ -69,6 +69,7 @@ from app.trading.edge_calibration import (
     refresh_edge_training_samples,
     refresh_top10_performance_if_due,
 )
+from app.trading.execution_status import trading_status_snapshot
 from app.trading.kis_paper_e2e import KisPaperE2EError, preflight_kis_paper_e2e
 from app.trading.live_trading import LiveTradingError, execute_live_order
 from app.trading.market_monitor import (
@@ -852,6 +853,7 @@ def admin_runtime_status(limit: int = 20):
     workers = embedded_worker_status()
     raw_active_sessions = auto_trading_store.list_sessions(status="active", limit=50)
     auto_tuning = latest_auto_tuning_recommendation()
+    trading_status = trading_status_snapshot(sample_limit=limit)
     summary = _admin_runtime_summary(
         generated_at=generated_at,
         auto_status=auto_status,
@@ -860,16 +862,58 @@ def admin_runtime_status(limit: int = 20):
         workers=workers,
         raw_active_sessions=raw_active_sessions,
     )
+    summary.update(_runtime_execution_summary_fields(trading_status))
     return {
         "status": "success",
         "generated_at": generated_at,
         "summary": summary,
+        "trading_status": trading_status,
         "auto_trading": auto_status,
         "latest_universe": latest_universe,
         "samples": samples,
         "workers": workers,
         "auto_tuning": auto_tuning,
     }
+
+
+def _runtime_execution_summary_fields(status: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "execution_mode",
+        "broker_provider",
+        "kis_is_paper",
+        "submits_to_broker",
+        "uses_internal_paper_orders",
+        "active_session_count",
+        "latest_session",
+        "planned_entry_count",
+        "submitted_order_count",
+        "paper_orders_count",
+        "broker_executions_count",
+        "auto_trading_db_missing",
+        "order_state_db_missing",
+        "order_status",
+        "paper_orders_zero_reason",
+        "candidate_label_win_rate",
+        "candidate_label_win_rate_display",
+        "paper_order_win_rate",
+        "paper_order_win_rate_display",
+        "broker_execution_win_rate",
+        "broker_execution_win_rate_display",
+        "actual_trading_win_rate",
+        "actual_trading_win_rate_display",
+        "candidate_label_win_rate_is_actual_trading_win_rate",
+        "win_rates",
+        "gate_calibration_db_path",
+        "dashboard_edge_calibration_db_path",
+        "gate_metric_snapshot_timestamp",
+        "edge_metric_updated_at",
+        "gate_sample_count",
+        "dashboard_edge_sample_count",
+        "candidate_reason_sample_count",
+        "candidate_reason_required_sample_count",
+        "stale_reason",
+    )
+    return {key: status.get(key) for key in keys}
 
 
 @app.get(
@@ -1059,6 +1103,7 @@ def _admin_runtime_summary(
     raw_active_sessions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     active_sessions = auto_status.get("active_sessions") or []
+    recent_sessions = auto_status.get("recent_sessions") or []
     raw_active_sessions = raw_active_sessions or []
     worker_rows = workers.get("workers") or []
     worker_count = len(worker_rows)
@@ -1123,10 +1168,24 @@ def _admin_runtime_summary(
     else:
         sample_state = "empty"
 
+    scanner_recovery = _latest_scanner_recovery_from_sessions(
+        active_sessions + recent_sessions
+    )
+    latest_session = (active_sessions or recent_sessions or [None])[0]
+
     return {
         "scanner_state": scanner_state,
+        "scanner_is_stale": scanner_state == "stale",
         "sample_state": sample_state,
         "active_session_count": len(active_sessions),
+        "latest_session_status": latest_session.get("status") if latest_session else None,
+        "last_recoverable_error": (
+            latest_session.get("last_recoverable_error") if latest_session else None
+        ),
+        "last_cycle_error": latest_session.get("last_cycle_error") if latest_session else None,
+        "auto_recovery_applied": (
+            bool(latest_session.get("recovery_applied")) if latest_session else False
+        ),
         "worker_count": worker_count,
         "alive_worker_count": len(alive_workers),
         "trading_worker_alive": trading_worker_alive,
@@ -1143,9 +1202,46 @@ def _admin_runtime_summary(
         "latest_scan_time": latest_scan_time,
         "latest_scan_age_seconds": latest_scan_age_seconds,
         "scanner_stale_after_seconds": stale_after_seconds,
+        "last_scanner_recovery_attempt_at": scanner_recovery.get("attempt_at"),
+        "last_scanner_recovery_status": scanner_recovery.get("status"),
+        "last_scanner_recovery_error": scanner_recovery.get("error"),
         "latest_scan_final_count": _to_int(latest_universe.get("final_count")),
         "latest_scan_executable_count": _to_int(
             latest_universe.get("executable_count")
+        ),
+        "latest_scan_total_source_symbol_count": _to_int(
+            latest_universe.get("total_source_symbol_count")
+            or latest_universe.get("source_symbol_count")
+        ),
+        "latest_scan_kospi_source_symbol_count": _to_int(
+            latest_universe.get("kospi_source_symbol_count")
+        ),
+        "latest_scan_kosdaq_source_symbol_count": _to_int(
+            latest_universe.get("kosdaq_source_symbol_count")
+        ),
+        "latest_scan_konex_source_symbol_count": _to_int(
+            latest_universe.get("konex_source_symbol_count")
+        ),
+        "latest_scan_unknown_market_symbol_count": _to_int(
+            latest_universe.get("unknown_market_symbol_count")
+        ),
+        "latest_scan_kospi_snapshot_count": _to_int(
+            latest_universe.get("kospi_snapshot_count")
+        ),
+        "latest_scan_kosdaq_snapshot_count": _to_int(
+            latest_universe.get("kosdaq_snapshot_count")
+        ),
+        "latest_scan_kospi_candidate_count": _to_int(
+            latest_universe.get("kospi_candidate_count")
+        ),
+        "latest_scan_kosdaq_candidate_count": _to_int(
+            latest_universe.get("kosdaq_candidate_count")
+        ),
+        "latest_scan_kospi_final_candidate_count": _to_int(
+            latest_universe.get("kospi_final_candidate_count")
+        ),
+        "latest_scan_kosdaq_final_candidate_count": _to_int(
+            latest_universe.get("kosdaq_final_candidate_count")
         ),
         "universe_scan_count": scan_count,
         "scanner_candidate_history_count": candidate_count,
@@ -1200,6 +1296,25 @@ def _scanner_stale_after_seconds(active_sessions: list[dict[str, Any]]) -> int:
         symbol_interval = min(symbol_interval, cap)
     estimated_scan_seconds = int(source_count * symbol_interval) + 300
     return max(900, session_interval * 5, estimated_scan_seconds * 2)
+
+
+def _latest_scanner_recovery_from_sessions(
+    sessions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    for session in sessions:
+        for item in session.get("last_results") or []:
+            if not isinstance(item, dict) or item.get("symbol") != "__universe__":
+                continue
+            return {
+                "attempt_at": item.get("last_scanner_recovery_attempt_at"),
+                "status": item.get("last_scanner_recovery_status"),
+                "error": item.get("last_scanner_recovery_error"),
+            }
+    return {
+        "attempt_at": None,
+        "status": None,
+        "error": None,
+    }
 
 
 @app.post(
@@ -1350,6 +1465,21 @@ def list_auto_trading_sessions_endpoint(
     limit: int = 50,
 ):
     return list_auto_trading_sessions(status=status, limit=limit)
+
+
+@app.get(
+    "/trading/status",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="getTradingExecutionStatus",
+    summary="Get separated scanner, planner, order, paper, and broker execution status",
+)
+@app.get(
+    "/trading/status/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+def get_trading_execution_status(limit: int = 20):
+    return trading_status_snapshot(sample_limit=limit)
 
 
 @app.get(

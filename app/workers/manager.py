@@ -5,6 +5,7 @@ import threading
 from typing import Callable
 
 from app.config import settings
+from app.trading.execution_status import print_startup_log
 from app.workers import (
     broker_worker,
     dart_worker,
@@ -60,6 +61,12 @@ def embedded_worker_status() -> dict[str, object]:
 
 
 def start_on_app_startup_if_enabled() -> dict[str, object]:
+    print_startup_log(
+        auto_trading_worker_enabled=bool(settings.embedded_workers_enabled),
+        scanner_worker_enabled=bool(
+            settings.embedded_workers_enabled and settings.universe_full_scan_enabled
+        ),
+    )
     if not settings.embedded_workers_enabled:
         return embedded_worker_status()
     return ensure_embedded_workers_started()

@@ -7,6 +7,7 @@ import pytest
 from app.models import AutoTradeStartRequest, AutoTradeSymbolConfig
 from app.trading import auto_trading
 from app.trading.atr_exits import atr_exit_levels_from_price_data
+from app.trading import kospi_universe
 from app.trading import universe_scanner
 
 
@@ -64,6 +65,179 @@ def test_kospi_csv_sources_keep_priority_and_bypass_normal_cap(tmp_path, monkeyp
     legacy_sources = universe_scanner._resolve_source_symbols(req)
     assert legacy_sources["035900"] == "Explicit JYP"
     assert legacy_sources["123456"] == "KOSPI One"
+
+
+def test_kospi_loader_falls_back_to_cache_when_configured_csv_missing(tmp_path, monkeypatch):
+    cache_path = tmp_path / "kospi.sqlite3"
+    missing_csv = tmp_path / "missing_kospi_symbols.csv"
+    kospi_universe.upsert_kospi_symbols(
+        [
+            {"symbol": "005930", "name": "Samsung Electronics", "market": "KOSPI"},
+            {"symbol": "000660", "name": "SK hynix", "market": "KOSPI"},
+        ],
+        source="pytest",
+        db_path=cache_path,
+    )
+
+    monkeypatch.setattr(kospi_universe.settings, "universe_include_kospi", True)
+    monkeypatch.setattr(kospi_universe.settings, "universe_kospi_symbol_source", "csv")
+    monkeypatch.setattr(kospi_universe.settings, "universe_kospi_csv_path", str(missing_csv))
+    monkeypatch.setattr(kospi_universe.settings, "universe_kospi_cache_path", str(cache_path))
+
+    symbols = kospi_universe.load_kospi_symbols(scan_all=True)
+
+    assert [item["symbol"] for item in symbols] == ["000660", "005930"]
+    assert {item["market"] for item in symbols} == {"KOSPI"}
+    assert {item["source_detail"] for item in symbols} == {"pytest"}
+
+
+def test_auto_discover_scan_includes_known_kospi_common_stocks(tmp_path, monkeypatch):
+    db_path = tmp_path / "universe.sqlite3"
+    csv_path = tmp_path / "kospi_symbols.csv"
+    known_kospi = {
+        "005930": "Samsung Electronics",
+        "000660": "SK hynix",
+        "005380": "Hyundai Motor",
+        "035420": "NAVER",
+        "051910": "LG Chem",
+        "068270": "Celltrion",
+    }
+    csv_path.write_text(
+        "symbol,name,market\n"
+        + "".join(f"{symbol},{name},KOSPI\n" for symbol, name in known_kospi.items()),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(universe_scanner.settings, "universe_include_kospi", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_symbol_source", "csv")
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_scan_all", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_full_scan_enabled", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_full_scan_batch_size", 3)
+    monkeypatch.setattr(universe_scanner.settings, "universe_full_scan_batch_pause_seconds", 0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_csv_path", str(csv_path))
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_cache_path", str(tmp_path / "kospi.sqlite3"))
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 1)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_candidate_limit", 6)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_final_limit", 3)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_symbol_interval_seconds", 0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_worker_hurdle_rate_bps", 0)
+    monkeypatch.setattr(universe_scanner, "_is_kr_regular_market_open", lambda: True)
+    monkeypatch.setattr(universe_scanner, "_paper_average_realized_return_bps", lambda: None)
+    monkeypatch.setattr(
+        universe_scanner,
+        "edge_entry_gate",
+        lambda candidates=None: {
+            "status": "approved",
+            "approved": True,
+            "message": "test gate approved",
+        },
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "estimate_expected_edges",
+        lambda candidate, raw_score, model=None: {
+            "expected_return": 360.0,
+            "expected_risk": 80.0,
+            "edge_model": "pytest",
+        },
+    )
+
+    def fake_fetch_price_data(symbol: str, *, include_intraday=True) -> dict:
+        if symbol in known_kospi:
+            price = 70_000
+            return {
+                "symbol": symbol,
+                "name": known_kospi[symbol],
+                "current_price": price,
+                "change_rate": 2.0,
+                "volume": 5_000_000,
+                "volume_ratio": 2.5,
+                "turnover_value": 350_000_000_000,
+                "market_cap": 300_000_000_000_000,
+                "market_segment": "KOSPI",
+                "intraday": {"minute_volume_ratio": 1.8},
+                "latest_technical_features": {
+                    "close": price,
+                    "return_5d": 0.04,
+                    "return_20d": 0.09,
+                    "return_60d": 0.16,
+                    "high_breakout_20d": True,
+                    "low_breakdown_20d": False,
+                    "ma5": price,
+                    "ma20": price * 0.98,
+                    "ma60": price * 0.94,
+                    "ma20_slope": 120,
+                    "atr_14": 1_800,
+                    "atr_14_pct": 1_800 / price,
+                },
+                "technical_features": [
+                    {"close": price * 0.99, "atr_14": 1_800},
+                    {"close": price, "atr_14": 1_800},
+                ],
+                "overheated": False,
+                "source": "pytest",
+            }
+        return {
+            "symbol": symbol,
+            "current_price": 10_000,
+            "change_rate": 0.1,
+            "volume": 1_000,
+            "volume_ratio": 0.2,
+            "turnover_value": 10_000_000,
+            "market_cap": 500_000_000_000,
+            "market_segment": "KOSDAQ",
+            "latest_technical_features": {},
+            "overheated": False,
+            "source": "pytest",
+        }
+
+    monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
+
+    result = universe_scanner.scan_universe_for_auto_trade(
+        AutoTradeStartRequest(
+            auto_discover_symbols=True,
+            universe_candidate_limit=6,
+            universe_final_limit=3,
+        ),
+        db_path=db_path,
+    )
+
+    assert result["kospi_source_symbol_count"] == len(known_kospi)
+    assert result["kospi_snapshot_count"] == len(known_kospi)
+    assert result["kospi_candidate_count"] == len(known_kospi)
+    assert result["kospi_final_candidate_count"] == 3
+    assert result["kosdaq_source_symbol_count"] >= 1
+    assert result["final_count"] == 3
+    assert {
+        item["symbol"]
+        for item in result["final_candidates"]
+    }.issubset(set(known_kospi))
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        snapshot_rows = conn.execute(
+            """
+            SELECT symbol, market_segment
+            FROM universe_price_snapshots
+            WHERE symbol IN (?, ?, ?, ?, ?, ?)
+            ORDER BY symbol
+            """,
+            tuple(sorted(known_kospi)),
+        ).fetchall()
+        candidate_rows = conn.execute(
+            """
+            SELECT symbol, market_segment
+            FROM universe_candidates
+            WHERE symbol IN (?, ?, ?, ?, ?, ?)
+            ORDER BY symbol
+            """,
+            tuple(sorted(known_kospi)),
+        ).fetchall()
+
+    assert {row["symbol"] for row in snapshot_rows} == set(known_kospi)
+    assert {row["market_segment"] for row in snapshot_rows} == {"KOSPI"}
+    assert {row["symbol"] for row in candidate_rows} == set(known_kospi)
+    assert {row["market_segment"] for row in candidate_rows} == {"KOSPI"}
 
 
 def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monkeypatch):
@@ -693,6 +867,12 @@ def test_auto_trading_blocks_when_universe_scan_has_too_few_symbols(monkeypatch)
             "worker_hurdle_rate": 50,
             "active_candidate_symbols": ["005930"],
             "entry_gate": None,
+            "scanner_is_stale": False,
+            "latest_scan_age_seconds": None,
+            "scanner_stale_after_seconds": 900,
+            "last_scanner_recovery_attempt_at": None,
+            "last_scanner_recovery_status": "not_needed",
+            "last_scanner_recovery_error": None,
             "message": (
                 "Universe scanner scanned 14 symbols; "
                 "at least 15 symbols are required before trading"

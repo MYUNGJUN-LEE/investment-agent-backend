@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 import json
@@ -8,6 +9,7 @@ import sqlite3
 from typing import Any, Iterator
 
 from app.config import settings
+from app.storage.sqlite import connect_sqlite
 from app.trading import paper_trading
 
 logger = logging.getLogger(__name__)
@@ -275,6 +277,11 @@ COMPOSITE_SCORE_FORMULA = (
     "+ executable_status_bonus"
 )
 
+TOP10_SAMPLE_SOURCE_SCAN_RUN = "scan_run_deduped_top10_samples"
+CANDIDATE_LABEL_UNIT = "candidate_label"
+PAPER_ORDER_UNIT = "paper_order"
+ACTUAL_BROKER_FILL_UNIT = "actual_broker_fill"
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS edge_calibration_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -310,6 +317,8 @@ CREATE TABLE IF NOT EXISTS edge_calibration_meta (
 CREATE TABLE IF NOT EXISTS edge_training_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_candidate_id INTEGER NOT NULL UNIQUE,
+    scan_id TEXT,
+    label_horizon_key TEXT,
     symbol TEXT NOT NULL,
     scan_time TEXT NOT NULL,
     observed_at TEXT NOT NULL,
@@ -328,6 +337,9 @@ CREATE TABLE IF NOT EXISTS edge_training_samples (
     composite_score REAL,
     rank INTEGER,
     status TEXT,
+    market_segment TEXT,
+    sector TEXT,
+    theme TEXT,
     created_at TEXT NOT NULL,
     raw_json TEXT NOT NULL
 );
@@ -791,6 +803,7 @@ def get_edge_training_sample_summary(
             "sample_count": 0,
             "summary": _empty_sample_summary(),
             "top10_performance": _empty_top10_performance(),
+            "unit_performance": _empty_unit_performance(),
             "label_policy": label_policy_summary(),
             "recent_samples": [],
             "symbol_summary": [],
@@ -804,6 +817,20 @@ def get_edge_training_sample_summary(
         conn.row_factory = sqlite3.Row
         aggregate = conn.execute(
             f"""
+            WITH canonical AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY symbol, COALESCE(label_horizon_key, symbol || ':' || scan_time)
+                            ORDER BY observed_at ASC, id ASC
+                        ) AS symbol_horizon_rank
+                    FROM edge_training_samples
+                    WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                )
+                WHERE symbol_horizon_rank = 1
+            )
             SELECT
                 COUNT(*) AS sample_count,
                 COALESCE(SUM(realized_return_bps), 0) AS total_return_bps,
@@ -865,20 +892,33 @@ def get_edge_training_sample_summary(
                         - COALESCE(slippage_cost_bps, 0)
                     ) <= 0 THEN 1 ELSE 0
                 END) AS net_edge_loss_count
-            FROM edge_training_samples
-            WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+            FROM canonical
             """
         ).fetchone()
         recent = conn.execute(
             f"""
+            WITH canonical AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY symbol, COALESCE(label_horizon_key, symbol || ':' || scan_time)
+                            ORDER BY observed_at ASC, id ASC
+                        ) AS symbol_horizon_rank
+                    FROM edge_training_samples
+                    WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                )
+                WHERE symbol_horizon_rank = 1
+            )
             SELECT
-                id, symbol, scan_time, observed_at, entry_price, observed_price,
+                id, scan_id, label_horizon_key, symbol, scan_time, observed_at, entry_price, observed_price,
                 realized_return_bps, realized_risk_bps, label_observation_span_seconds,
                 raw_score,
                 expected_return_bps, expected_risk_bps, trading_cost_bps,
-                slippage_cost_bps, net_edge_bps, composite_score, rank, status
-            FROM edge_training_samples
-            WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                slippage_cost_bps, net_edge_bps, composite_score, rank, status,
+                market_segment, sector, theme
+            FROM canonical
             ORDER BY observed_at DESC, id DESC
             LIMIT ?
             """,
@@ -886,6 +926,20 @@ def get_edge_training_sample_summary(
         ).fetchall()
         symbols = conn.execute(
             f"""
+            WITH canonical AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY symbol, COALESCE(label_horizon_key, symbol || ':' || scan_time)
+                            ORDER BY observed_at ASC, id ASC
+                        ) AS symbol_horizon_rank
+                    FROM edge_training_samples
+                    WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                )
+                WHERE symbol_horizon_rank = 1
+            )
             SELECT
                 symbol,
                 COUNT(*) AS sample_count,
@@ -896,8 +950,7 @@ def get_edge_training_sample_summary(
                 AVG(expected_return_bps) AS avg_expected_return_bps,
                 AVG(net_edge_bps) AS avg_predicted_net_edge_bps,
                 SUM(CASE WHEN realized_return_bps > 0 THEN 1 ELSE 0 END) AS win_count
-            FROM edge_training_samples
-            WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+            FROM canonical
             GROUP BY symbol
             ORDER BY sample_count DESC, avg_return_bps DESC
             LIMIT ?
@@ -908,6 +961,7 @@ def get_edge_training_sample_summary(
     summary = _sample_summary_from_row(dict(aggregate or {}))
     diagnostics = get_edge_data_diagnostics(calibration_db_path=path)
     top10_performance = _top10_performance_from_store(calibration_path=path)
+    unit_performance = _unit_performance_summary(calibration_path=path)
     return {
         "status": "ready" if summary["sample_count"] else "empty",
         "message": (
@@ -918,6 +972,7 @@ def get_edge_training_sample_summary(
         "sample_count": summary["sample_count"],
         "summary": summary,
         "top10_performance": top10_performance,
+        "unit_performance": unit_performance,
         "label_policy": label_policy_summary(),
         "recent_samples": [_sample_row(row) for row in recent],
         "symbol_summary": [_symbol_sample_row(row) for row in symbols],
@@ -1044,7 +1099,7 @@ def load_edge_model(
     model: dict[str, dict[str, float]] = {}
     if path.exists():
         initialize_edge_calibration_db(path)
-        with sqlite3.connect(path) as conn:
+        with connect_sqlite(path) as conn:
             rows = conn.execute(
                 """
                 SELECT target, feature, coefficient
@@ -1575,6 +1630,71 @@ def _label_observation_span_seconds(
     return max(0, int((end - start).total_seconds()))
 
 
+def _label_horizon_key(
+    *,
+    symbol: str,
+    scan_time: str,
+    horizon_seconds: int,
+) -> str:
+    horizon = max(60, int(horizon_seconds or 86400))
+    try:
+        parsed = datetime.fromisoformat(str(scan_time))
+        bucket = int(parsed.timestamp()) // horizon
+        return f"{symbol}:{horizon}:{bucket}"
+    except (TypeError, ValueError, OSError):
+        return f"{symbol}:{horizon}:{str(scan_time)[:10]}"
+
+
+def _canonical_sample_key(row: sqlite3.Row | dict[str, Any]) -> str:
+    symbol = str(_row_value(row, "symbol") or "")
+    horizon_key = _row_value(row, "label_horizon_key")
+    if horizon_key:
+        return f"{symbol}:{horizon_key}"
+    return f"{symbol}:{_row_value(row, 'scan_time') or _row_value(row, 'id')}"
+
+
+def _scan_run_key(row: sqlite3.Row | dict[str, Any]) -> str:
+    scan_id = _row_value(row, "scan_id")
+    if scan_id:
+        return str(scan_id)
+    raw = _parse_json(_row_value(row, "raw_json"), {})
+    if isinstance(raw, dict):
+        raw_scan_id = raw.get("scan_id") or raw.get("scan_run_id")
+        candidate = raw.get("candidate")
+        if isinstance(candidate, dict):
+            raw_scan_id = raw_scan_id or candidate.get("scan_id") or candidate.get("scan_run_id")
+        if raw_scan_id:
+            return str(raw_scan_id)
+    return f"legacy-row:{_row_value(row, 'id')}"
+
+
+def _metadata_from_candidate_row(
+    row: sqlite3.Row,
+    raw_payload: dict[str, Any],
+) -> dict[str, str | None]:
+    market_segment = (
+        _row_value(row, "market_segment")
+        or raw_payload.get("market_segment")
+        or raw_payload.get("market")
+    )
+    sector = (
+        raw_payload.get("sector")
+        or raw_payload.get("industry")
+        or raw_payload.get("sector_name")
+    )
+    theme = (
+        raw_payload.get("theme")
+        or raw_payload.get("strategy_theme")
+        or raw_payload.get("universe_profile")
+        or _row_value(row, "universe_profile")
+    )
+    return {
+        "market_segment": str(market_segment) if market_segment else None,
+        "sector": str(sector) if sector else None,
+        "theme": str(theme) if theme else None,
+    }
+
+
 def _candidate_lookback_seconds(horizon_seconds: int) -> int | None:
     configured = settings.edge_calibration_candidate_lookback_seconds
     if configured is not None and int(configured) > 0:
@@ -1680,7 +1800,7 @@ def _fetch_future_price_rows(
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """
-        SELECT created_at, current_price
+        SELECT created_at, current_price, raw_json
         FROM universe_price_snapshots
         WHERE symbol = ?
           AND scan_id != ?
@@ -1705,6 +1825,105 @@ def _fetch_future_price_rows(
     estimated = max(32, int(horizon_seconds / 30) + 10)
     row_limit = max(configured, estimated)
     return rows[:row_limit]
+
+
+def _fetch_excursion_price_rows(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str,
+    scan_id: str,
+    scan_time: str,
+    horizon_seconds: int,
+) -> list[sqlite3.Row]:
+    try:
+        start_dt = datetime.fromisoformat(scan_time)
+    except ValueError:
+        return []
+    tolerance_seconds = max(
+        0,
+        int(settings.edge_calibration_label_horizon_tolerance_seconds or 0),
+    )
+    end_dt = start_dt + timedelta(
+        seconds=max(60, int(horizon_seconds or 86400)) + tolerance_seconds
+    )
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        """
+        SELECT created_at, current_price, raw_json
+        FROM universe_price_snapshots
+        WHERE symbol = ?
+          AND scan_id != ?
+          AND created_at > ?
+          AND created_at <= ?
+          AND current_price IS NOT NULL
+          AND current_price > 0
+        ORDER BY created_at ASC
+        """,
+        (
+            symbol,
+            scan_id,
+            scan_time,
+            end_dt.isoformat(timespec="seconds"),
+        ),
+    ).fetchall()
+
+
+def _snapshot_price_extremes(row: sqlite3.Row) -> tuple[float | None, float | None]:
+    raw = _parse_json(_row_value(row, "raw_json"), {})
+    if not isinstance(raw, dict):
+        raw = {}
+    output = raw.get("output") if isinstance(raw.get("output"), dict) else {}
+    intraday = raw.get("intraday") if isinstance(raw.get("intraday"), dict) else {}
+    sources = [dict(row), raw, output, intraday]
+    lows = [
+        _first_float_from_mapping(source, ("low", "low_price", "stck_lwpr", "lwpr"))
+        for source in sources
+    ]
+    highs = [
+        _first_float_from_mapping(source, ("high", "high_price", "stck_hgpr", "hgpr"))
+        for source in sources
+    ]
+    current = _to_float(_row_value(row, "current_price"))
+    low = min([value for value in lows if value is not None] + ([current] if current else []), default=None)
+    high = max([value for value in highs if value is not None] + ([current] if current else []), default=None)
+    return low, high
+
+
+def _adverse_excursion_bps(
+    *,
+    entry_price: float,
+    rows: list[sqlite3.Row],
+    side: str | None = None,
+) -> float:
+    if entry_price <= 0 or not rows:
+        return 0.0
+    side_text = str(side or "").lower()
+    lows: list[float] = []
+    highs: list[float] = []
+    for row in rows:
+        low, high = _snapshot_price_extremes(row)
+        if low is not None and low > 0:
+            lows.append(low)
+        if high is not None and high > 0:
+            highs.append(high)
+    if side_text in {"sell", "short", "exit"}:
+        if not highs:
+            return 0.0
+        return max(0.0, (max(highs) - entry_price) / entry_price * 10_000)
+    if not lows:
+        return 0.0
+    return max(0.0, (entry_price - min(lows)) / entry_price * 10_000)
+
+
+def _first_float_from_mapping(
+    mapping: dict[str, Any],
+    keys: tuple[str, ...],
+) -> float | None:
+    for key in keys:
+        value = _to_float(mapping.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _labeled_candidate_ids(calibration_path: Path) -> set[int]:
@@ -1916,21 +2135,32 @@ def _training_payload_from_candidate_row(
     )
     if not future_rows:
         return None
+    excursion_rows = _fetch_excursion_price_rows(
+        conn,
+        symbol=str(row["symbol"]),
+        scan_id=scan_id,
+        scan_time=scan_time,
+        horizon_seconds=horizon_seconds,
+    ) or future_rows
     final_price = _to_float(future_rows[-1]["current_price"])
     observed_at = str(future_rows[-1]["created_at"])
-    prices = [_to_float(item["current_price"]) for item in future_rows]
+    prices = [_to_float(item["current_price"]) for item in excursion_rows]
     usable_prices = [price for price in prices if price is not None and price > 0]
     if final_price is None or not usable_prices:
         return None
     realized_return_bps = (final_price - entry_price) / entry_price * 10_000
-    min_price = min(usable_prices)
-    realized_risk_bps = max(0.0, (entry_price - min_price) / entry_price * 10_000)
+    raw_payload = _parse_json(row["raw_json"], {})
+    side = str(raw_payload.get("side") or raw_payload.get("action") or row["decision"] or "")
+    realized_risk_bps = _adverse_excursion_bps(
+        entry_price=entry_price,
+        rows=excursion_rows,
+        side=side,
+    )
     label_observation_span = _label_observation_span_seconds(
         scan_time=scan_time,
         observed_at=observed_at,
     )
     raw_score = _to_float(row["raw_score"]) or 0.0
-    raw_payload = _parse_json(row["raw_json"], {})
     candidate = {
         **raw_payload,
         "raw_score": raw_score,
@@ -1964,8 +2194,16 @@ def _training_payload_from_candidate_row(
             slippage_cost_bps=slippage_cost_bps,
             liquidity_drag_bps=liquidity_drag_bps,
         )
+    metadata = _metadata_from_candidate_row(row, raw_payload)
+    label_horizon_key = _label_horizon_key(
+        symbol=str(row["symbol"]),
+        scan_time=scan_time,
+        horizon_seconds=horizon_seconds,
+    )
     return {
         "source_candidate_id": int(row["id"]),
+        "scan_id": scan_id,
+        "label_horizon_key": label_horizon_key,
         "symbol": str(row["symbol"]),
         "scan_time": scan_time,
         "observed_at": observed_at,
@@ -1985,11 +2223,20 @@ def _training_payload_from_candidate_row(
         "composite_score": _to_float(row["composite_score"]),
         "rank": _to_int(row["rank"]),
         "status": row["status"],
+        **metadata,
         "raw_json": {
+            "scan_id": scan_id,
+            "label_horizon_key": label_horizon_key,
             "candidate": raw_payload,
             "feature_map": feature_map,
             "label_policy": label_policy_summary(),
             "label_observation_span_seconds": label_observation_span,
+            "risk_policy": {
+                "realized_risk_bps": realized_risk_bps,
+                "adverse_excursion_source": "entry_to_horizon_price_extremes",
+                "excursion_snapshot_count": len(excursion_rows),
+                "side": side or "buy",
+            },
             "sample_metrics": {
                 "raw_score": raw_score,
                 "expected_return_bps": expected_return_bps,
@@ -2083,19 +2330,36 @@ def _store_training_sample(
     conn: sqlite3.Connection,
     payload: dict[str, Any],
 ) -> int:
+    if payload.get("label_horizon_key"):
+        existing = conn.execute(
+            """
+            SELECT 1
+            FROM edge_training_samples
+            WHERE symbol = ?
+              AND label_horizon_key = ?
+            LIMIT 1
+            """,
+            (payload["symbol"], payload["label_horizon_key"]),
+        ).fetchone()
+        if existing:
+            return 0
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO edge_training_samples (
-            source_candidate_id, symbol, scan_time, observed_at, entry_price,
+            source_candidate_id, scan_id, label_horizon_key,
+            symbol, scan_time, observed_at, entry_price,
             observed_price, features_json, realized_return_bps,
             realized_risk_bps, label_observation_span_seconds, raw_score, expected_return_bps,
             expected_risk_bps, trading_cost_bps, slippage_cost_bps,
-            net_edge_bps, composite_score, rank, status, created_at, raw_json
+            net_edge_bps, composite_score, rank, status,
+            market_segment, sector, theme, created_at, raw_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload["source_candidate_id"],
+            payload.get("scan_id"),
+            payload.get("label_horizon_key"),
             payload["symbol"],
             payload["scan_time"],
             payload["observed_at"],
@@ -2114,6 +2378,9 @@ def _store_training_sample(
             payload.get("composite_score"),
             payload.get("rank"),
             payload.get("status"),
+            payload.get("market_segment"),
+            payload.get("sector"),
+            payload.get("theme"),
             _now(),
             _json(payload.get("raw_json") or {}),
         ),
@@ -2147,11 +2414,21 @@ def _iter_training_samples_from_store(
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""
+            WITH ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol, COALESCE(label_horizon_key, symbol || ':' || scan_time)
+                        ORDER BY observed_at ASC, id ASC
+                    ) AS symbol_horizon_rank
+                FROM edge_training_samples
+                WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+            )
             SELECT features_json, realized_return_bps, realized_risk_bps
             FROM (
                 SELECT *
-                FROM edge_training_samples
-                WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                FROM ranked
+                WHERE symbol_horizon_rank = 1
                 ORDER BY observed_at DESC, id DESC
                 LIMIT ?
             )
@@ -2265,153 +2542,234 @@ def _top10_performance_from_store(
 ) -> dict[str, Any]:
     initialize_edge_calibration_db(calibration_path)
     _purge_invalid_label_samples_by_path(calibration_path)
+    rows = _top10_candidate_rows(calibration_path=calibration_path)
+    scan_units = _scan_run_units_from_top10_rows(rows, limit=limit)
+    if not scan_units:
+        return _empty_top10_performance(limit=limit)
+    return _performance_summary_from_rows(
+        scan_units,
+        top_count=10,
+        sample_source=TOP10_SAMPLE_SOURCE_SCAN_RUN,
+        sample_limit=limit,
+        candidate_sample_count=len(rows),
+        scan_run_count=len(scan_units),
+        concentration=_concentration_from_rows(rows),
+    )
+
+
+def _top10_candidate_rows(
+    *,
+    calibration_path: Path,
+) -> list[dict[str, Any]]:
     with sqlite3.connect(calibration_path) as conn:
         conn.row_factory = sqlite3.Row
-        query = f"""
-            SELECT
-                COUNT(*) AS sample_count,
-                COUNT(expected_return_bps) AS metric_sample_count,
-                COALESCE(SUM(realized_return_bps), 0) AS total_return_bps,
-                COALESCE(SUM(realized_risk_bps), 0) AS total_risk_bps,
-                COALESCE(SUM(
-                    realized_return_bps - (realized_risk_bps * 0.10)
-                    - COALESCE(trading_cost_bps, 0)
-                    - COALESCE(slippage_cost_bps, 0)
-                ), 0) AS total_realized_net_edge_bps,
-                COALESCE(SUM(expected_return_bps), 0) AS total_expected_return_bps,
-                COALESCE(SUM(expected_risk_bps), 0) AS total_expected_risk_bps,
-                COALESCE(SUM(net_edge_bps), 0) AS total_predicted_net_edge_bps,
-                COALESCE(SUM(COALESCE(trading_cost_bps, 0) + COALESCE(slippage_cost_bps, 0)), 0) AS total_cost_bps,
-                AVG(realized_return_bps) AS avg_return_bps,
-                AVG(realized_risk_bps) AS avg_risk_bps,
-                AVG(expected_return_bps) AS avg_expected_return_bps,
-                AVG(expected_risk_bps) AS avg_expected_risk_bps,
-                AVG(net_edge_bps) AS avg_predicted_net_edge_bps,
-                AVG(raw_score) AS avg_raw_score,
-                AVG(composite_score) AS avg_composite_score,
-                AVG(COALESCE(trading_cost_bps, 0) + COALESCE(slippage_cost_bps, 0)) AS avg_cost_bps,
-                AVG(realized_return_bps - expected_return_bps) AS avg_return_error_bps,
-                AVG(ABS(realized_return_bps - expected_return_bps)) AS mae_return_error_bps,
-                AVG(realized_risk_bps - expected_risk_bps) AS avg_risk_error_bps,
-                AVG(ABS(realized_risk_bps - expected_risk_bps)) AS mae_risk_error_bps,
-                AVG(
-                    realized_return_bps - (realized_risk_bps * 0.10)
-                    - COALESCE(trading_cost_bps, 0)
-                    - COALESCE(slippage_cost_bps, 0)
-                    - net_edge_bps
-                ) AS avg_net_edge_error_bps,
-                AVG(ABS(
-                    realized_return_bps - (realized_risk_bps * 0.10)
-                    - COALESCE(trading_cost_bps, 0)
-                    - COALESCE(slippage_cost_bps, 0)
-                    - net_edge_bps
-                )) AS mae_net_edge_error_bps,
-                SUM(CASE WHEN realized_return_bps > 0 THEN 1 ELSE 0 END) AS win_count,
-                SUM(CASE WHEN realized_return_bps < 0 THEN 1 ELSE 0 END) AS loss_count,
-                AVG(CASE WHEN realized_return_bps > 0 THEN realized_return_bps END) AS avg_win_bps,
-                AVG(CASE WHEN realized_return_bps < 0 THEN ABS(realized_return_bps) END) AS avg_loss_bps
-            FROM edge_training_samples
-            WHERE rank IS NOT NULL
-              AND rank <= 10
-              AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
-        """
-        params: tuple[Any, ...] = ()
-        if limit is not None:
-            query = f"""
+        rows = conn.execute(
+            f"""
+            WITH ranked AS (
                 SELECT
-                    COUNT(*) AS sample_count,
-                    COUNT(expected_return_bps) AS metric_sample_count,
-                    COALESCE(SUM(realized_return_bps), 0) AS total_return_bps,
-                    COALESCE(SUM(realized_risk_bps), 0) AS total_risk_bps,
-                    COALESCE(SUM(
-                        realized_return_bps - (realized_risk_bps * 0.10)
-                        - COALESCE(trading_cost_bps, 0)
-                        - COALESCE(slippage_cost_bps, 0)
-                    ), 0) AS total_realized_net_edge_bps,
-                    COALESCE(SUM(expected_return_bps), 0) AS total_expected_return_bps,
-                    COALESCE(SUM(expected_risk_bps), 0) AS total_expected_risk_bps,
-                    COALESCE(SUM(net_edge_bps), 0) AS total_predicted_net_edge_bps,
-                    COALESCE(SUM(COALESCE(trading_cost_bps, 0) + COALESCE(slippage_cost_bps, 0)), 0) AS total_cost_bps,
-                    AVG(realized_return_bps) AS avg_return_bps,
-                    AVG(realized_risk_bps) AS avg_risk_bps,
-                    AVG(expected_return_bps) AS avg_expected_return_bps,
-                    AVG(expected_risk_bps) AS avg_expected_risk_bps,
-                    AVG(net_edge_bps) AS avg_predicted_net_edge_bps,
-                    AVG(raw_score) AS avg_raw_score,
-                    AVG(composite_score) AS avg_composite_score,
-                    AVG(COALESCE(trading_cost_bps, 0) + COALESCE(slippage_cost_bps, 0)) AS avg_cost_bps,
-                    AVG(realized_return_bps - expected_return_bps) AS avg_return_error_bps,
-                    AVG(ABS(realized_return_bps - expected_return_bps)) AS mae_return_error_bps,
-                    AVG(realized_risk_bps - expected_risk_bps) AS avg_risk_error_bps,
-                    AVG(ABS(realized_risk_bps - expected_risk_bps)) AS mae_risk_error_bps,
-                    AVG(
-                        realized_return_bps - (realized_risk_bps * 0.10)
-                        - COALESCE(trading_cost_bps, 0)
-                        - COALESCE(slippage_cost_bps, 0)
-                        - net_edge_bps
-                    ) AS avg_net_edge_error_bps,
-                    AVG(ABS(
-                        realized_return_bps - (realized_risk_bps * 0.10)
-                        - COALESCE(trading_cost_bps, 0)
-                        - COALESCE(slippage_cost_bps, 0)
-                        - net_edge_bps
-                    )) AS mae_net_edge_error_bps,
-                    SUM(CASE WHEN realized_return_bps > 0 THEN 1 ELSE 0 END) AS win_count,
-                    SUM(CASE WHEN realized_return_bps < 0 THEN 1 ELSE 0 END) AS loss_count,
-                    AVG(CASE WHEN realized_return_bps > 0 THEN realized_return_bps END) AS avg_win_bps,
-                    AVG(CASE WHEN realized_return_bps < 0 THEN ABS(realized_return_bps) END) AS avg_loss_bps
-                FROM (
-                    SELECT *
-                    FROM edge_training_samples
-                    WHERE rank IS NOT NULL
-                      AND rank <= 10
-                      AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
-                    ORDER BY observed_at DESC, id DESC
-                    LIMIT ?
-                )
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol, COALESCE(label_horizon_key, symbol || ':' || scan_time)
+                        ORDER BY observed_at ASC, id ASC
+                    ) AS symbol_horizon_rank
+                FROM edge_training_samples
+                WHERE rank IS NOT NULL
+                  AND rank <= 10
+                  AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+            )
+            SELECT
+                id, source_candidate_id, scan_id, label_horizon_key, symbol,
+                scan_time, observed_at, realized_return_bps, realized_risk_bps,
+                expected_return_bps, expected_risk_bps, trading_cost_bps,
+                slippage_cost_bps, net_edge_bps, raw_score, composite_score,
+                rank, status, market_segment, sector, theme, raw_json
+            FROM ranked
+            WHERE symbol_horizon_rank = 1
+            ORDER BY observed_at DESC, id DESC
             """
-            params = (max(1, int(limit)),)
-        row = conn.execute(query, params).fetchone()
-    sample_count = int(row["sample_count"] or 0) if row else 0
-    if sample_count <= 0:
-        return _empty_top10_performance(limit=limit)
-    wins = int(row["win_count"] or 0)
-    losses = int(row["loss_count"] or 0)
-    win_rate = wins / sample_count
-    loss_rate = losses / sample_count
-    avg_win = float(row["avg_win_bps"] or 0.0)
-    avg_loss = float(row["avg_loss_bps"] or 0.0)
-    expectancy = win_rate * avg_win - loss_rate * avg_loss
-    total_realized_net = float(row["total_realized_net_edge_bps"] or 0.0)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _scan_run_units_from_top10_rows(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    max_groups = max(1, int(limit)) if limit is not None else None
+    for row in rows:
+        scan_key = _scan_run_key(row)
+        if scan_key not in grouped:
+            if max_groups is not None and len(grouped) >= max_groups:
+                continue
+            grouped[scan_key] = []
+        grouped[scan_key].append(row)
+    return [
+        _scan_run_unit_from_rows(scan_id=scan_id, rows=items)
+        for scan_id, items in grouped.items()
+        if items
+    ]
+
+
+def _scan_run_unit_from_rows(
+    *,
+    scan_id: str,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    def avg(key: str) -> float | None:
+        values = [_to_float(row.get(key)) for row in rows]
+        values = [value for value in values if value is not None]
+        return sum(values) / len(values) if values else None
+
+    realized_return = avg("realized_return_bps") or 0.0
+    realized_risk = avg("realized_risk_bps") or 0.0
+    trading_cost = avg("trading_cost_bps") or 0.0
+    slippage_cost = avg("slippage_cost_bps") or 0.0
+    net_edge = avg("net_edge_bps")
     return {
+        "scan_id": scan_id,
+        "candidate_count": len(rows),
+        "symbol": _dominant_value(row.get("symbol") for row in rows),
+        "sector": _dominant_value(row.get("sector") for row in rows),
+        "theme": _dominant_value(row.get("theme") for row in rows),
+        "market_segment": _dominant_value(row.get("market_segment") for row in rows),
+        "realized_return_bps": realized_return,
+        "realized_risk_bps": realized_risk,
+        "expected_return_bps": avg("expected_return_bps"),
+        "expected_risk_bps": avg("expected_risk_bps"),
+        "trading_cost_bps": trading_cost,
+        "slippage_cost_bps": slippage_cost,
+        "net_edge_bps": net_edge,
+        "raw_score": avg("raw_score"),
+        "composite_score": avg("composite_score"),
+        "realized_net_edge_bps": (
+            realized_return
+            - realized_risk * REALIZED_RISK_WEIGHT
+            - trading_cost
+            - slippage_cost
+        ),
+    }
+
+
+def _performance_summary_from_rows(
+    rows: list[dict[str, Any]],
+    *,
+    top_count: int,
+    sample_source: str,
+    sample_limit: int | None = None,
+    candidate_sample_count: int | None = None,
+    scan_run_count: int | None = None,
+    concentration: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    sample_count = len(rows)
+    if sample_count <= 0:
+        return _empty_top10_performance(limit=sample_limit)
+
+    def values(key: str) -> list[float]:
+        parsed = [_to_float(row.get(key)) for row in rows]
+        return [value for value in parsed if value is not None]
+
+    def total(key: str) -> float:
+        return sum(values(key))
+
+    def avg(key: str) -> float | None:
+        items = values(key)
+        return sum(items) / len(items) if items else None
+
+    def avg_expr(items: list[float | None]) -> float | None:
+        usable = [value for value in items if value is not None]
+        return sum(usable) / len(usable) if usable else None
+
+    realized_net_values = [
+        _realized_net_edge_from_row(row)
+        for row in rows
+    ]
+    return_errors = [
+        (_to_float(row.get("realized_return_bps")) or 0.0)
+        - _to_float(row.get("expected_return_bps"))
+        if _to_float(row.get("expected_return_bps")) is not None
+        else None
+        for row in rows
+    ]
+    risk_errors = [
+        (_to_float(row.get("realized_risk_bps")) or 0.0)
+        - _to_float(row.get("expected_risk_bps"))
+        if _to_float(row.get("expected_risk_bps")) is not None
+        else None
+        for row in rows
+    ]
+    net_edge_errors = [
+        realized_net - _to_float(row.get("net_edge_bps"))
+        if _to_float(row.get("net_edge_bps")) is not None
+        else None
+        for row, realized_net in zip(rows, realized_net_values, strict=True)
+    ]
+
+    returns = values("realized_return_bps")
+    wins = [value for value in returns if value > 0]
+    losses = [abs(value) for value in returns if value < 0]
+    win_count = len(wins)
+    loss_count = len(losses)
+    win_rate = win_count / sample_count
+    loss_rate = loss_count / sample_count
+    avg_win = sum(wins) / len(wins) if wins else 0.0
+    avg_loss = sum(losses) / len(losses) if losses else 0.0
+    expectancy = win_rate * avg_win - loss_rate * avg_loss
+    total_realized_net = sum(realized_net_values)
+    summary = {
         "status": "ready",
         "sample_count": sample_count,
-        "top_count": 10,
-        "sample_source": "all_stored_top10_samples" if limit is None else "limited_recent_top10_samples",
-        "sample_limit": limit,
-        "metric_sample_count": int(row["metric_sample_count"] or 0),
-        "total_return_bps": _round_optional(row["total_return_bps"]) or 0.0,
-        "total_risk_bps": _round_optional(row["total_risk_bps"]) or 0.0,
+        "top_count": top_count,
+        "sample_source": sample_source,
+        "sample_limit": sample_limit,
+        "scan_run_count": scan_run_count if scan_run_count is not None else sample_count,
+        "candidate_sample_count": candidate_sample_count,
+        "metric_sample_count": len(values("expected_return_bps")),
+        "total_return_bps": round(total("realized_return_bps"), 4),
+        "total_risk_bps": round(total("realized_risk_bps"), 4),
         "total_realized_net_edge_bps": round(total_realized_net, 4),
-        "total_expected_return_bps": _round_optional(row["total_expected_return_bps"]) or 0.0,
-        "total_expected_risk_bps": _round_optional(row["total_expected_risk_bps"]) or 0.0,
-        "total_predicted_net_edge_bps": _round_optional(row["total_predicted_net_edge_bps"]) or 0.0,
-        "total_cost_bps": _round_optional(row["total_cost_bps"]) or 0.0,
-        "avg_return_bps": _round_optional(row["avg_return_bps"]),
-        "avg_risk_bps": _round_optional(row["avg_risk_bps"]),
+        "total_expected_return_bps": round(total("expected_return_bps"), 4),
+        "total_expected_risk_bps": round(total("expected_risk_bps"), 4),
+        "total_predicted_net_edge_bps": round(total("net_edge_bps"), 4),
+        "total_cost_bps": round(
+            sum(
+                (_to_float(row.get("trading_cost_bps")) or 0.0)
+                + (_to_float(row.get("slippage_cost_bps")) or 0.0)
+                for row in rows
+            ),
+            4,
+        ),
+        "avg_return_bps": _round_optional(avg("realized_return_bps")),
+        "avg_risk_bps": _round_optional(avg("realized_risk_bps")),
         "avg_realized_net_edge_bps": round(total_realized_net / sample_count, 4),
-        "avg_expected_return_bps": _round_optional(row["avg_expected_return_bps"]),
-        "avg_expected_risk_bps": _round_optional(row["avg_expected_risk_bps"]),
-        "avg_predicted_net_edge_bps": _round_optional(row["avg_predicted_net_edge_bps"]),
-        "avg_raw_score": _round_optional(row["avg_raw_score"]),
-        "avg_composite_score": _round_optional(row["avg_composite_score"]),
-        "avg_cost_bps": _round_optional(row["avg_cost_bps"]),
-        "avg_return_error_bps": _round_optional(row["avg_return_error_bps"]),
-        "mae_return_error_bps": _round_optional(row["mae_return_error_bps"]),
-        "avg_risk_error_bps": _round_optional(row["avg_risk_error_bps"]),
-        "mae_risk_error_bps": _round_optional(row["mae_risk_error_bps"]),
-        "avg_net_edge_error_bps": _round_optional(row["avg_net_edge_error_bps"]),
-        "mae_net_edge_error_bps": _round_optional(row["mae_net_edge_error_bps"]),
+        "avg_expected_return_bps": _round_optional(avg("expected_return_bps")),
+        "avg_expected_risk_bps": _round_optional(avg("expected_risk_bps")),
+        "avg_predicted_net_edge_bps": _round_optional(avg("net_edge_bps")),
+        "avg_raw_score": _round_optional(avg("raw_score")),
+        "avg_composite_score": _round_optional(avg("composite_score")),
+        "avg_cost_bps": _round_optional(
+            sum(
+                (_to_float(row.get("trading_cost_bps")) or 0.0)
+                + (_to_float(row.get("slippage_cost_bps")) or 0.0)
+                for row in rows
+            )
+            / sample_count
+        ),
+        "avg_return_error_bps": _round_optional(avg_expr(return_errors)),
+        "mae_return_error_bps": _round_optional(
+            avg_expr([abs(value) if value is not None else None for value in return_errors])
+        ),
+        "avg_risk_error_bps": _round_optional(avg_expr(risk_errors)),
+        "mae_risk_error_bps": _round_optional(
+            avg_expr([abs(value) if value is not None else None for value in risk_errors])
+        ),
+        "avg_net_edge_error_bps": _round_optional(avg_expr(net_edge_errors)),
+        "mae_net_edge_error_bps": _round_optional(
+            avg_expr([abs(value) if value is not None else None for value in net_edge_errors])
+        ),
+        "win_count": win_count,
+        "loss_count": loss_count,
         "win_rate": round(win_rate, 6),
         "loss_rate": round(loss_rate, 6),
         "avg_win_bps": round(avg_win, 4),
@@ -2423,6 +2781,271 @@ def _top10_performance_from_store(
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
         "composite_score_formula": COMPOSITE_SCORE_FORMULA,
     }
+    if concentration is not None:
+        summary["concentration"] = concentration
+    return summary
+
+
+def _realized_net_edge_from_row(row: dict[str, Any]) -> float:
+    return (
+        (_to_float(row.get("realized_return_bps")) or 0.0)
+        - ((_to_float(row.get("realized_risk_bps")) or 0.0) * REALIZED_RISK_WEIGHT)
+        - (_to_float(row.get("trading_cost_bps")) or 0.0)
+        - (_to_float(row.get("slippage_cost_bps")) or 0.0)
+    )
+
+
+def _dominant_value(values: Iterator[Any]) -> str | None:
+    clean = [str(value) for value in values if value not in (None, "")]
+    if not clean:
+        return None
+    return Counter(clean).most_common(1)[0][0]
+
+
+def _concentration_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    sample_count = len(rows)
+    if sample_count <= 0:
+        return {
+            "sample_count": 0,
+            "max_symbol_share": None,
+            "max_sector_share": None,
+            "max_theme_share": None,
+        }
+    return {
+        "sample_count": sample_count,
+        **_max_share(rows, "symbol", "symbol"),
+        **_max_share(rows, "sector", "sector"),
+        **_max_share(rows, "theme", "theme"),
+    }
+
+
+def _max_share(
+    rows: list[dict[str, Any]],
+    key: str,
+    label: str,
+) -> dict[str, Any]:
+    values = [str(row.get(key)) for row in rows if row.get(key)]
+    if not values:
+        return {
+            f"max_{label}": None,
+            f"max_{label}_count": 0,
+            f"max_{label}_share": None,
+        }
+    value, count = Counter(values).most_common(1)[0]
+    return {
+        f"max_{label}": value,
+        f"max_{label}_count": count,
+        f"max_{label}_share": round(count / len(rows), 6),
+    }
+
+
+def _unit_performance_summary(
+    *,
+    calibration_path: Path,
+) -> dict[str, Any]:
+    return {
+        CANDIDATE_LABEL_UNIT: _candidate_label_performance_from_store(calibration_path),
+        PAPER_ORDER_UNIT: _paper_order_performance(
+            settings.storage_path(paper_trading.DEFAULT_DB_PATH)
+        ),
+        ACTUAL_BROKER_FILL_UNIT: _actual_broker_fill_performance(
+            outcome_path=settings.storage_path(settings.outcome_attribution_db_path),
+            broker_path=settings.storage_path(settings.broker_sync_db_path),
+        ),
+    }
+
+
+def _empty_unit_performance() -> dict[str, Any]:
+    return {
+        CANDIDATE_LABEL_UNIT: _empty_win_rate(CANDIDATE_LABEL_UNIT),
+        PAPER_ORDER_UNIT: _empty_win_rate(PAPER_ORDER_UNIT),
+        ACTUAL_BROKER_FILL_UNIT: _empty_win_rate(ACTUAL_BROKER_FILL_UNIT),
+    }
+
+
+def _candidate_label_performance_from_store(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return _empty_win_rate(CANDIDATE_LABEL_UNIT)
+    initialize_edge_calibration_db(path)
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            WITH ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol, COALESCE(label_horizon_key, symbol || ':' || scan_time)
+                        ORDER BY observed_at ASC, id ASC
+                    ) AS symbol_horizon_rank
+                FROM edge_training_samples
+                WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+            )
+            SELECT
+                id, scan_id, label_horizon_key, symbol, scan_time, observed_at,
+                realized_return_bps, realized_risk_bps, expected_return_bps,
+                expected_risk_bps, trading_cost_bps, slippage_cost_bps,
+                net_edge_bps, raw_score, composite_score, market_segment,
+                sector, theme, raw_json
+            FROM ranked
+            WHERE symbol_horizon_rank = 1
+            ORDER BY observed_at DESC, id DESC
+            """
+        ).fetchall()
+    if not rows:
+        return _empty_win_rate(CANDIDATE_LABEL_UNIT)
+    performance = _performance_summary_from_rows(
+        [dict(row) for row in rows],
+        top_count=0,
+        sample_source="symbol_horizon_deduped_candidate_labels",
+        concentration=_concentration_from_rows([dict(row) for row in rows]),
+    )
+    return {
+        "status": "ready",
+        "unit": CANDIDATE_LABEL_UNIT,
+        "sample_count": performance["sample_count"],
+        "win_count": performance["win_count"],
+        "loss_count": performance["loss_count"],
+        "win_rate": performance["win_rate"],
+        "avg_return_bps": performance["avg_return_bps"],
+        "avg_realized_net_edge_bps": performance["avg_realized_net_edge_bps"],
+        "sample_source": performance["sample_source"],
+        "concentration": performance.get("concentration"),
+    }
+
+
+def _paper_order_performance(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return _empty_win_rate(PAPER_ORDER_UNIT)
+    try:
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    symbol, side, status, amount, requested_amount,
+                    net_realized_pnl, realized_pnl, gross_realized_pnl
+                FROM paper_orders
+                WHERE UPPER(COALESCE(side, '')) = 'SELL'
+                   OR COALESCE(net_realized_pnl, realized_pnl, gross_realized_pnl, 0) != 0
+                ORDER BY id DESC
+                """
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return {"status": "error", "unit": PAPER_ORDER_UNIT, "message": str(exc)}
+    pnl_values = [
+        _to_float(
+            row["net_realized_pnl"]
+            if row["net_realized_pnl"] is not None
+            else row["realized_pnl"]
+            if row["realized_pnl"] is not None
+            else row["gross_realized_pnl"]
+        )
+        for row in rows
+    ]
+    return _win_rate_from_values(
+        unit=PAPER_ORDER_UNIT,
+        values=[value for value in pnl_values if value is not None],
+        value_name="realized_pnl",
+    )
+
+
+def _actual_broker_fill_performance(
+    *,
+    outcome_path: Path,
+    broker_path: Path,
+) -> dict[str, Any]:
+    outcome = _broker_outcome_performance(outcome_path)
+    if outcome["status"] != "empty":
+        return outcome
+    filled_count = 0
+    if broker_path.exists():
+        try:
+            with sqlite3.connect(broker_path) as conn:
+                filled_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM broker_order_executions
+                        WHERE COALESCE(filled_qty, 0) > 0
+                        """
+                    ).fetchone()[0]
+                    or 0
+                )
+        except sqlite3.Error:
+            filled_count = 0
+    return {
+        **_empty_win_rate(ACTUAL_BROKER_FILL_UNIT),
+        "status": "no_outcome_labels" if filled_count else "empty",
+        "filled_execution_count": filled_count,
+        "message": (
+            "Broker fills exist, but no realized outcome labels are available yet"
+            if filled_count
+            else "No broker fill outcomes are available yet"
+        ),
+    }
+
+
+def _broker_outcome_performance(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return _empty_win_rate(ACTUAL_BROKER_FILL_UNIT)
+    try:
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT realized_net_edge_bps, outcome_label, execution_mode
+                FROM outcome_attribution_events
+                WHERE LOWER(COALESCE(execution_mode, '')) NOT IN ('', 'paper')
+                ORDER BY created_at DESC, id DESC
+                """
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return {
+            "status": "error",
+            "unit": ACTUAL_BROKER_FILL_UNIT,
+            "message": str(exc),
+        }
+    if not rows:
+        return _empty_win_rate(ACTUAL_BROKER_FILL_UNIT)
+    values = [_to_float(row["realized_net_edge_bps"]) for row in rows]
+    return _win_rate_from_values(
+        unit=ACTUAL_BROKER_FILL_UNIT,
+        values=[value for value in values if value is not None],
+        value_name="realized_net_edge_bps",
+    )
+
+
+def _win_rate_from_values(
+    *,
+    unit: str,
+    values: list[float],
+    value_name: str,
+) -> dict[str, Any]:
+    if not values:
+        return _empty_win_rate(unit)
+    wins = [value for value in values if value > 0]
+    losses = [value for value in values if value < 0]
+    return {
+        "status": "ready",
+        "unit": unit,
+        "sample_count": len(values),
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate": round(len(wins) / len(values), 6),
+        f"avg_{value_name}": round(sum(values) / len(values), 4),
+    }
+
+
+def _empty_win_rate(unit: str) -> dict[str, Any]:
+    return {
+        "status": "empty",
+        "unit": unit,
+        "sample_count": 0,
+        "win_count": 0,
+        "loss_count": 0,
+        "win_rate": None,
+    }
 
 
 def _empty_top10_performance(limit: int | None = None) -> dict[str, Any]:
@@ -2430,8 +3053,10 @@ def _empty_top10_performance(limit: int | None = None) -> dict[str, Any]:
         "status": "empty",
         "sample_count": 0,
         "top_count": 10,
-        "sample_source": "all_stored_top10_samples" if limit is None else "limited_recent_top10_samples",
+        "sample_source": TOP10_SAMPLE_SOURCE_SCAN_RUN,
         "sample_limit": limit,
+        "scan_run_count": 0,
+        "candidate_sample_count": 0,
         "metric_sample_count": 0,
         "total_return_bps": 0.0,
         "total_risk_bps": 0.0,
@@ -2455,6 +3080,8 @@ def _empty_top10_performance(limit: int | None = None) -> dict[str, Any]:
         "mae_risk_error_bps": None,
         "avg_net_edge_error_bps": None,
         "mae_net_edge_error_bps": None,
+        "win_count": 0,
+        "loss_count": 0,
         "win_rate": None,
         "loss_rate": None,
         "avg_win_bps": None,
@@ -2463,6 +3090,12 @@ def _empty_top10_performance(limit: int | None = None) -> dict[str, Any]:
         "expectancy_bps": None,
         "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
+        "concentration": {
+            "sample_count": 0,
+            "max_symbol_share": None,
+            "max_sector_share": None,
+            "max_theme_share": None,
+        },
     }
 
 
@@ -2540,7 +3173,7 @@ def _safe_sqlite_scalar(path: Path, query: str) -> Any:
     if not path.exists():
         return 0
     try:
-        with sqlite3.connect(path) as conn:
+        with connect_sqlite(path) as conn:
             return conn.execute(query).fetchone()[0]
     except (sqlite3.Error, TypeError, IndexError):
         return 0
@@ -2849,6 +3482,11 @@ def _default_gate(
             "min_oos_samples": settings.edge_calibration_gate_min_oos_samples,
             "max_mae_return_bps": settings.edge_calibration_gate_max_mae_return_bps,
             "max_mae_risk_bps": settings.edge_calibration_gate_max_mae_risk_bps,
+            "max_mae_net_edge_error_bps": getattr(
+                settings,
+                "edge_calibration_gate_max_mae_net_edge_bps",
+                180.0,
+            ),
             "min_top10_avg_return_bps": _effective_min_top10_avg_return_bps(
                 execution_mode=execution_mode,
             ),
@@ -2903,6 +3541,11 @@ def _gate_from_metrics(
         settings.edge_calibration_gate_min_fill_adjusted_edge_bps or 60.0
     )
 
+    max_net_edge_mae = float(
+        getattr(settings, "edge_calibration_gate_max_mae_net_edge_bps", 180.0)
+        or 180.0
+    )
+
     min_profit_factor = float(
         getattr(settings, "edge_calibration_gate_min_profit_factor", 1.10) or 1.10
     )
@@ -2913,6 +3556,20 @@ def _gate_from_metrics(
 
     min_cost_coverage = float(
         getattr(settings, "edge_calibration_gate_min_cost_coverage", 2.0) or 2.0
+    )
+
+    concentration_min_samples = int(
+        getattr(settings, "edge_calibration_gate_min_concentration_samples", 20)
+        or 20
+    )
+    max_symbol_share = float(
+        getattr(settings, "edge_calibration_gate_max_symbol_share", 0.20) or 0.20
+    )
+    max_sector_share = float(
+        getattr(settings, "edge_calibration_gate_max_sector_share", 0.35) or 0.35
+    )
+    max_theme_share = float(
+        getattr(settings, "edge_calibration_gate_max_theme_share", 0.35) or 0.35
     )
 
     multiplier = _to_float(fill_adjustment.get("multiplier")) or 1.0
@@ -2934,6 +3591,7 @@ def _gate_from_metrics(
     top10_avg_return = _to_float(top10_performance.get("avg_return_bps"))
     top10_expectancy = _to_float(top10_performance.get("expectancy_bps"))
     top10_win_rate = _to_float(top10_performance.get("win_rate"))
+    top10_net_edge_mae = _to_float(top10_performance.get("mae_net_edge_error_bps"))
     top10_profit_factor = estimate_profit_factor_from_top10(top10_performance)
 
     if top10_avg_return is None or top10_avg_return < min_top10_return:
@@ -2955,6 +3613,38 @@ def _gate_from_metrics(
         failures.append(
             f"top10_profit_factor {top10_profit_factor} < {min_profit_factor}"
         )
+
+    if (
+        "mae_net_edge_error_bps" in top10_performance
+        and (top10_net_edge_mae is None or top10_net_edge_mae >= max_net_edge_mae)
+    ):
+        failures.append(
+            f"mae_net_edge_error_bps {top10_net_edge_mae} >= {max_net_edge_mae}"
+        )
+
+    concentration = top10_performance.get("concentration") or {}
+    if isinstance(concentration, dict):
+        concentration_sample_count = int(
+            concentration.get("sample_count")
+            or top10_performance.get("candidate_sample_count")
+            or 0
+        )
+        if concentration_sample_count >= concentration_min_samples:
+            symbol_share = _to_float(concentration.get("max_symbol_share"))
+            sector_share = _to_float(concentration.get("max_sector_share"))
+            theme_share = _to_float(concentration.get("max_theme_share"))
+            if symbol_share is not None and symbol_share > max_symbol_share:
+                failures.append(
+                    f"symbol_concentration {symbol_share} > {max_symbol_share}"
+                )
+            if sector_share is not None and sector_share > max_sector_share:
+                failures.append(
+                    f"sector_concentration {sector_share} > {max_sector_share}"
+                )
+            if theme_share is not None and theme_share > max_theme_share:
+                failures.append(
+                    f"theme_concentration {theme_share} > {max_theme_share}"
+                )
 
     recent_ic = _to_float((ic_metrics or {}).get("ic"))
 
@@ -3039,6 +3729,7 @@ def _gate_from_metrics(
             "min_oos_samples": min_oos,
             "max_mae_return_bps": max_return_mae,
             "max_mae_risk_bps": max_risk_mae,
+            "max_mae_net_edge_error_bps": max_net_edge_mae,
             "min_top10_avg_return_bps": min_top10_return,
             "configured_min_top10_avg_return_bps": configured_min_top10_return,
             "target_top10_win_rate": target_top10_win_rate,
@@ -3047,6 +3738,10 @@ def _gate_from_metrics(
             "min_profit_factor": min_profit_factor,
             "min_recent_ic": min_recent_ic,
             "min_cost_coverage": min_cost_coverage,
+            "min_concentration_samples": concentration_min_samples,
+            "max_symbol_share": max_symbol_share,
+            "max_sector_share": max_sector_share,
+            "max_theme_share": max_theme_share,
         },
     }
 
@@ -3216,6 +3911,11 @@ def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
         "label_observation_span_seconds",
         "INTEGER",
     )
+    _ensure_column(conn, "edge_training_samples", "scan_id", "TEXT")
+    _ensure_column(conn, "edge_training_samples", "label_horizon_key", "TEXT")
+    _ensure_column(conn, "edge_training_samples", "market_segment", "TEXT")
+    _ensure_column(conn, "edge_training_samples", "sector", "TEXT")
+    _ensure_column(conn, "edge_training_samples", "theme", "TEXT")
     for column in (
         "raw_score",
         "expected_return_bps",
@@ -3228,6 +3928,7 @@ def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
         _ensure_column(conn, "edge_training_samples", column, "REAL")
     _backfill_training_sample_metrics(conn)
     _backfill_training_sample_label_spans(conn)
+    _backfill_training_sample_identity(conn)
 
 
 def _ensure_column(
@@ -3335,6 +4036,83 @@ def _backfill_training_sample_label_spans(conn: sqlite3.Connection) -> None:
             """
             UPDATE edge_training_samples
             SET label_observation_span_seconds = ?
+            WHERE id = ?
+            """,
+            updates,
+        )
+
+
+def _backfill_training_sample_identity(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
+    horizon_seconds = int(settings.edge_calibration_horizon_seconds or 86400)
+    last_id = 0
+    while True:
+        rows = conn.execute(
+            """
+            SELECT id, symbol, scan_time, raw_json
+            FROM edge_training_samples
+            WHERE id > ?
+              AND (
+                  scan_id IS NULL
+                  OR label_horizon_key IS NULL
+                  OR market_segment IS NULL
+                  OR sector IS NULL
+                  OR theme IS NULL
+              )
+            ORDER BY id ASC
+            LIMIT 200
+            """,
+            (last_id,),
+        ).fetchall()
+        if not rows:
+            break
+        last_id = int(rows[-1]["id"])
+        updates = []
+        for row in rows:
+            raw = _parse_json(row["raw_json"], {})
+            if not isinstance(raw, dict):
+                raw = {}
+            candidate = raw.get("candidate") if isinstance(raw.get("candidate"), dict) else {}
+            scan_id = raw.get("scan_id") or raw.get("scan_run_id") or candidate.get("scan_id")
+            market_segment = (
+                candidate.get("market_segment")
+                or candidate.get("market")
+                or raw.get("market_segment")
+            )
+            sector = (
+                candidate.get("sector")
+                or candidate.get("industry")
+                or candidate.get("sector_name")
+                or raw.get("sector")
+            )
+            theme = (
+                candidate.get("theme")
+                or candidate.get("strategy_theme")
+                or candidate.get("universe_profile")
+                or raw.get("theme")
+            )
+            updates.append(
+                (
+                    scan_id,
+                    _label_horizon_key(
+                        symbol=str(row["symbol"]),
+                        scan_time=str(row["scan_time"]),
+                        horizon_seconds=horizon_seconds,
+                    ),
+                    market_segment,
+                    sector,
+                    theme,
+                    row["id"],
+                )
+            )
+        conn.executemany(
+            """
+            UPDATE edge_training_samples
+            SET scan_id = COALESCE(scan_id, ?),
+                label_horizon_key = COALESCE(label_horizon_key, ?),
+                market_segment = COALESCE(market_segment, ?),
+                sector = COALESCE(sector, ?),
+                theme = COALESCE(theme, ?)
             WHERE id = ?
             """,
             updates,
@@ -3458,4 +4236,3 @@ def _now() -> str:
 
 def _db_path(db_path: Path | str | None = None) -> Path:
     return settings.storage_path(db_path or settings.edge_calibration_db_path)
-
