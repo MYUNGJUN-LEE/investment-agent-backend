@@ -6,7 +6,17 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
+    domains:
+      - api.autoinvestmentkorea.online
+    disk:
+      name: investment-agent-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
+      - key: DATA_DIR
+        value: "/var/data"
+      - key: RENDER_DISK_MOUNT_PATH
+        value: "/var/data"
       - key: ACTION_SCHEMA_PUBLIC_URL
         value: "https://api.autoinvestmentkorea.online"
       - key: CORS_ALLOW_ORIGINS

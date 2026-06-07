@@ -367,6 +367,7 @@
         <h2>Auto Trading</h2>
         <div class="grid">
           <button data-action="startPaper" class="primary">Start Paper</button>
+          <button data-action="startBrokerPaper" class="danger">Start KIS Paper Orders</button>
           <button data-action="stopAll" class="danger">Stop All</button>
           <button data-action="autoStatus">Status</button>
           <button data-action="sessions">Sessions</button>
@@ -735,6 +736,7 @@
           auto_confirm_paper: true
         }
       },
+      startBrokerPaper: startBrokerPaperAction,
       stopAll: { method: "POST", path: "/gpt/auto-trading/control", body: { command: "stop" } },
       startLive: startLiveAutoAction,
       submitLiveOrder: submitLiveOrderAction,
@@ -848,6 +850,25 @@
       };
     }
 
+    function startBrokerPaperAction() {
+      if (!window.confirm("This starts KIS paper broker order submission. Continue?")) {
+        throw new Error("KIS paper broker action cancelled.");
+      }
+      return {
+        method: "POST",
+        path: "/gpt/auto-trading/control",
+        body: {
+          command: "start",
+          execution_mode: "broker_paper",
+          broker_provider: "kis",
+          auto_discover_symbols: true,
+          force_new: false,
+          interval_seconds: 60,
+          auto_confirm_paper: false
+        }
+      };
+    }
+
     function submitLiveOrderAction() {
       requireLiveAck();
       const price = positiveNumber(els.livePrice.value, "limit price");
@@ -924,7 +945,7 @@
         const result = await request(spec);
         showResult(result);
         if (spec.after) spec.after(result);
-        if (name === "startPaper" || name === "startLive" || name === "stopAll" || name === "stopSession" || name === "restartSession") {
+        if (name === "startPaper" || name === "startBrokerPaper" || name === "startLive" || name === "stopAll" || name === "stopSession" || name === "restartSession") {
           await refreshAutoStatus();
           await refreshRuntimeStatus({ quiet: true });
         }
@@ -1030,7 +1051,11 @@
           : ""
       ].filter(Boolean).join(" | ") || "-";
       els.runtimeExecutionMode.textContent = summary.execution_mode || "-";
-      els.runtimeExecutionMode.className = summary.execution_mode === "live" ? "bad" : "ok";
+      els.runtimeExecutionMode.className = summary.execution_mode === "live"
+        ? "bad"
+        : summary.execution_mode === "broker_paper"
+          ? "warn"
+          : "ok";
       els.runtimeBrokerMode.textContent = executionModeDetail(summary);
       els.plannedEntryCount.textContent = fmtNumber(summary.planned_entry_count, 0);
       els.orderStatus.textContent = stateLabel(summary.order_status || "-");

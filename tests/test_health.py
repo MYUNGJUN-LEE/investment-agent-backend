@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 from app.config import settings
 from app.main import app
@@ -91,6 +93,9 @@ def test_admin_dashboard_is_served():
     assert "/gpt/auto-trading/start-paper" in response.text
     assert "/gpt/broker/kis/account-probe" in response.text
     assert "Start Live Auto" in response.text
+    assert "Start KIS Paper Orders" in response.text
+    assert 'execution_mode: "broker_paper"' in response.text
+    assert 'broker_provider: "kis"' in response.text
     assert "/live/orders" in response.text
     assert "Universe Scan" in response.text
     assert "Runtime Overview" in response.text
@@ -108,6 +113,16 @@ def test_admin_dashboard_is_served():
     alias_response = client.get("/admin")
     assert alias_response.status_code == 200
     assert "Investment Agent Admin" in alias_response.text
+
+
+def test_render_blueprint_declares_dashboard_domain_and_persistent_data_dir():
+    text = Path("render.yaml").read_text(encoding="utf-8")
+
+    assert "domains:\n      - api.autoinvestmentkorea.online" in text
+    assert "disk:\n      name: investment-agent-data" in text
+    assert "mountPath: /var/data" in text
+    assert "key: DATA_DIR\n        value: \"/var/data\"" in text
+    assert "key: RENDER_DISK_MOUNT_PATH\n        value: \"/var/data\"" in text
 
 
 def test_edge_training_samples_endpoint_returns_summary():
