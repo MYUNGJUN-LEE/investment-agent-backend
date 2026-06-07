@@ -18,7 +18,12 @@ from app.models import (
     OrderConfirmRequest,
     OrderPreviewRequest,
 )
-from app.trading.live_trading import LiveTradingError, execute_live_order
+from app.trading.live_trading import (
+    LiveTradingError,
+    broker_paper_safety_check,
+    execute_broker_paper_order,
+    execute_live_order,
+)
 from app.trading.edge_calibration import edge_entry_gate
 from app.trading.order_approval import (
     OrderApprovalError,
@@ -72,6 +77,7 @@ def start_auto_trading(req: AutoTradeStartRequest) -> dict[str, Any]:
                 "status": existing["status"],
                 "account_key": existing.get("account_key"),
                 "execution_mode": req.execution_mode,
+                "broker_provider": req.broker_provider,
                 "interval_seconds": existing["interval_seconds"],
                 "max_cycles": existing["max_cycles"],
                 "started_at": existing["created_at"],
@@ -91,6 +97,7 @@ def start_auto_trading(req: AutoTradeStartRequest) -> dict[str, Any]:
         "status": session["status"],
         "account_key": session.get("account_key") or account_key,
         "execution_mode": req.execution_mode,
+        "broker_provider": req.broker_provider,
         "interval_seconds": req.interval_seconds,
         "max_cycles": req.max_cycles,
         "started_at": session["created_at"],
@@ -232,6 +239,7 @@ def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, 
         universe_candidate_limit=req.universe_candidate_limit,
         universe_final_limit=req.universe_final_limit,
         execution_mode=req.execution_mode,
+        broker_provider=req.broker_provider,
         interval_seconds=req.interval_seconds,
         max_cycles=req.max_cycles,
         run_immediately=True,
@@ -593,7 +601,7 @@ def _run_cycle(
 
 
 def _sync_live_account_if_needed(req: AutoTradeStartRequest) -> dict[str, Any] | None:
-    if req.execution_mode != "live":
+    if req.execution_mode not in ("live", "broker_paper"):
         return None
     try:
         return broker_sync.sync_kis_account()
@@ -1758,7 +1766,7 @@ def _run_symbol_batch(
 
 def _requires_live_exit_confirmation(req: AutoTradeStartRequest) -> bool:
     return bool(
-        req.execution_mode == "live"
+        req.execution_mode in ("live", "broker_paper")
         and settings.live_exit_confirm_before_entry
     )
 
@@ -1975,27 +1983,27 @@ def _prepare_symbols_for_account_balance(
 
 
 def _resolve_account_balance(req: AutoTradeStartRequest) -> dict[str, Any]:
-    if req.execution_mode == "live":
+    if req.execution_mode in ("live", "broker_paper"):
         try:
             sync_result = broker_sync.sync_kis_account()
         except Exception as exc:
             return {
                 "status": "blocked",
-                "mode": "live",
-                "message": f"Live account balance check failed; no orders will be attempted: {exc}",
+                "mode": req.execution_mode,
+                "message": f"Broker account balance check failed; no orders will be attempted: {exc}",
             }
         cash_available = _to_float(sync_result.get("total_cash"))
         account_equity = _to_float(sync_result.get("total_value")) or req.account_equity
         if cash_available is None:
             return {
                 "status": "blocked",
-                "mode": "live",
-                "message": "Live account cash balance is unavailable; no orders will be attempted.",
+                "mode": req.execution_mode,
+                "message": "Broker account cash balance is unavailable; no orders will be attempted.",
                 "broker_sync": sync_result,
             }
         return {
             "status": "ready",
-            "mode": "live",
+            "mode": req.execution_mode,
             "account_equity": float(account_equity),
             "cash_available": max(0.0, float(cash_available)),
             "broker_sync": sync_result,
@@ -2574,6 +2582,30 @@ def _run_symbol(
             )
             return result
 
+        if req.execution_mode == "broker_paper":
+            result["execution"] = execute_broker_paper_order(
+                _to_live_order_request(
+                    req=req,
+                    symbol_cfg=symbol_cfg,
+                    preview=preview,
+                    price=price,
+                    session_id=session_id,
+                )
+            )
+            result["status"] = result["execution"]["status"]
+            _record_fill_quality_for_result(
+                result=result,
+                req=req,
+                symbol_cfg=symbol_cfg,
+            )
+            _record_outcome_attribution_for_result(
+                result=result,
+                req=req,
+                symbol_cfg=symbol_cfg,
+                position_before_exit=position_before_exit,
+            )
+            return result
+
         result["execution"] = execute_live_order(
             _to_live_order_request(
                 req=req,
@@ -2697,19 +2729,20 @@ def _to_live_order_request(
     price: float,
     session_id: str | None = None,
 ) -> LiveOrderRequest:
-    if not req.live_confirm_token:
+    if req.execution_mode == "live" and not req.live_confirm_token:
         raise AutoTradingError("live_confirm_token is required for live auto-trading")
     side = str(preview["side"]).lower()
     return LiveOrderRequest(
         symbol=symbol_cfg.symbol,
         market=symbol_cfg.market,
+        broker_provider=req.broker_provider,
         strategy_type=symbol_cfg.strategy_type,
         risk_level=symbol_cfg.risk_level,
         side=side,
         order_type="limit",
         price=float(preview["price"]),
         quantity=int(preview["quantity"]),
-        confirm_token=req.live_confirm_token,
+        confirm_token=req.live_confirm_token or "broker_paper",
         client_order_id=_auto_client_order_id(
             session_id=session_id,
             symbol=symbol_cfg.symbol,
@@ -2802,7 +2835,7 @@ def _resolve_loop_price(symbol_cfg: AutoTradeSymbolConfig) -> dict[str, Any]:
 
 
 def _open_positions(mode: str) -> dict[str, dict[str, Any]]:
-    if mode == "live":
+    if mode in ("live", "broker_paper"):
         return _open_live_positions()
     return _open_paper_positions()
 
@@ -2911,6 +2944,17 @@ def _validate_start_request(req: AutoTradeStartRequest) -> None:
             )
         if req.live_confirm_token != settings.live_trading_confirm_token:
             raise AutoTradingError("Invalid live_confirm_token", status_code=403)
+    if req.execution_mode == "broker_paper":
+        probe_symbol = req.symbols[0].symbol if req.symbols else "005930"
+        safety = broker_paper_safety_check(req=req, symbol=probe_symbol)
+        if not safety.get("approved"):
+            raise AutoTradingError(
+                str(
+                    safety.get("broker_submit_block_reason")
+                    or "broker_paper safety check failed"
+                ),
+                status_code=403,
+            )
 
 
 def _embedded_worker_status() -> dict[str, Any]:

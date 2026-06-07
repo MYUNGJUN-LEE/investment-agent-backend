@@ -9,6 +9,7 @@ import sqlite3
 from typing import Any
 
 from app.config import settings
+from app.brokers.kis_client import KIS_PAPER_BASE_URL
 from app.trading import edge_calibration, paper_trading
 from app.trading import auto_trading_store
 
@@ -29,12 +30,20 @@ def trading_status_snapshot(
     This intentionally does not initialize missing execution databases. A missing
     DB is itself a diagnostic signal for the dashboard and `/trading/status`.
     """
+    storage = settings.storage_status()
     paths = resolved_storage_paths()
     auto_sessions = _auto_sessions(paths["auto_trading_db_path"])
     latest_session = auto_sessions["latest_session"]
     active_sessions = auto_sessions["active_sessions"]
     mode = _resolve_execution_mode(execution_mode, latest_session)
-    mode_flags = execution_mode_flags(mode)
+    broker_provider = _resolve_broker_provider(latest_session)
+    mode_flags = execution_mode_flags(mode, broker_provider=broker_provider)
+    broker_safety = _broker_submit_static_status(
+        execution_mode=mode,
+        broker_provider=broker_provider,
+    )
+    if broker_safety["broker_submit_blocked"]:
+        mode_flags["submits_to_broker"] = False
 
     planned_entry_count = _planned_entry_count(latest_session)
     paper_orders_count = _table_count(
@@ -66,6 +75,7 @@ def trading_status_snapshot(
         planned_entry_count=planned_entry_count,
         claimed_candidate_count=scanner["claimed_candidate_count"],
         uses_internal_paper_orders=mode_flags["uses_internal_paper_orders"],
+        latest_broker_order_event=order_state.get("latest_broker_order_event"),
     )
     paper_zero_reason = _paper_orders_zero_reason(
         uses_internal_paper_orders=mode_flags["uses_internal_paper_orders"],
@@ -82,7 +92,13 @@ def trading_status_snapshot(
     return {
         "status": "success",
         **mode_flags,
-        "DATA_DIR": str(settings.storage_root()) if settings.storage_root() else None,
+        "DATA_DIR": storage.get("resolved_data_dir"),
+        "configured_data_dir": storage.get("configured_data_dir"),
+        "resolved_data_dir": storage.get("resolved_data_dir"),
+        "data_dir_writable": storage.get("data_dir_writable"),
+        "data_dir_is_persistent": storage.get("data_dir_is_persistent"),
+        "data_dir_warning": storage.get("data_dir_warning"),
+        "storage_root_fallback_used": storage.get("storage_root_fallback_used"),
         "db_paths": {key: str(value) for key, value in paths.items()},
         "auto_trading_db_path": str(paths["auto_trading_db_path"]),
         "order_state_db_path": str(paths["order_state_db_path"]),
@@ -100,6 +116,21 @@ def trading_status_snapshot(
         "broker_executions_count": broker_executions_count,
         "broker_order_id_count": order_state["broker_order_id_count"],
         "pending_order_intent_count": order_state["pending_order_intent_count"],
+        "latest_broker_order_event": order_state.get("latest_broker_order_event"),
+        "last_broker_submit_at": order_state.get("last_broker_submit_at"),
+        "last_broker_submit_error": order_state.get("last_broker_submit_error"),
+        "last_broker_sync_at": _last_broker_sync_at(paths["broker_sync_db_path"]),
+        "broker_submit_blocked": broker_safety["broker_submit_blocked"],
+        "broker_submit_block_reason": broker_safety["broker_submit_block_reason"],
+        "broker_submit_status": _broker_submit_status(
+            broker_safety=broker_safety,
+            latest_event=order_state.get("latest_broker_order_event"),
+        ),
+        "broker_execution_status": (
+            "synced" if broker_executions_count > 0 else "none"
+        ),
+        "candidate_status": _candidate_status(scanner),
+        "planner_status": "planned" if planned_entry_count > 0 else "not_planned",
         "claimed_candidate_count": scanner["claimed_candidate_count"],
         "ready_candidate_count": scanner["ready_candidate_count"],
         "latest_execution_candidate": scanner.get("latest_execution_candidate"),
@@ -123,14 +154,30 @@ def trading_status_snapshot(
 def startup_log_payload(
     *,
     execution_mode: str | None = None,
+    broker_provider: str | None = None,
     auto_trading_worker_enabled: bool | None = None,
     scanner_worker_enabled: bool | None = None,
 ) -> dict[str, Any]:
-    mode = str(execution_mode or "paper").lower()
-    flags = execution_mode_flags(mode)
+    storage = settings.storage_status()
     paths = resolved_storage_paths()
+    latest_session = None
+    if execution_mode is None and paths["auto_trading_db_path"].exists():
+        latest_session = _auto_sessions(paths["auto_trading_db_path"]).get("latest_session")
+    mode = str(execution_mode or _resolve_execution_mode(None, latest_session)).lower()
+    provider = str(broker_provider or _resolve_broker_provider(latest_session)).lower()
+    flags = execution_mode_flags(mode, broker_provider=provider)
+    safety = _broker_submit_static_status(
+        execution_mode=mode,
+        broker_provider=provider,
+    )
     return {
-        "DATA_DIR": str(settings.storage_root()) if settings.storage_root() else None,
+        "DATA_DIR": storage.get("resolved_data_dir"),
+        "configured_data_dir": storage.get("configured_data_dir"),
+        "resolved_data_dir": storage.get("resolved_data_dir"),
+        "data_dir_writable": storage.get("data_dir_writable"),
+        "data_dir_is_persistent": storage.get("data_dir_is_persistent"),
+        "data_dir_warning": storage.get("data_dir_warning"),
+        "storage_root_fallback_used": storage.get("storage_root_fallback_used"),
         "universe_scanner_db_path": str(paths["universe_scanner_db_path"]),
         "edge_calibration_db_path": str(paths["edge_calibration_db_path"]),
         "auto_trading_db_path": str(paths["auto_trading_db_path"]),
@@ -138,8 +185,16 @@ def startup_log_payload(
         "auto_trading_worker_enabled": bool(auto_trading_worker_enabled),
         "scanner_worker_enabled": bool(scanner_worker_enabled),
         "execution_mode": flags["execution_mode"],
+        "broker_provider": flags["broker_provider"],
         "kis_is_paper": flags["kis_is_paper"],
-        "submits_to_broker": flags["submits_to_broker"],
+        "submits_to_broker": False
+        if safety["broker_submit_blocked"]
+        else flags["submits_to_broker"],
+        "uses_internal_paper_orders": flags["uses_internal_paper_orders"],
+        "broker_submit_enabled": bool(
+            flags["submits_to_broker"] and not safety["broker_submit_blocked"]
+        ),
+        "broker_submit_safety_check_result": safety,
     }
 
 
@@ -155,13 +210,18 @@ def print_startup_log(**kwargs: Any) -> None:
     )
 
 
-def execution_mode_flags(execution_mode: str | None = None) -> dict[str, Any]:
+def execution_mode_flags(
+    execution_mode: str | None = None,
+    *,
+    broker_provider: str | None = None,
+) -> dict[str, Any]:
     mode = str(execution_mode or "paper").lower()
+    provider = str(broker_provider or "kis").lower()
     return {
         "execution_mode": mode,
-        "broker_provider": "KIS",
+        "broker_provider": provider,
         "kis_is_paper": bool(settings.kis_is_paper),
-        "submits_to_broker": mode == "live",
+        "submits_to_broker": mode in ("broker_paper", "live"),
         "uses_internal_paper_orders": mode == "paper",
     }
 
@@ -190,6 +250,13 @@ def _resolve_execution_mode(
     if latest_session and latest_session.get("execution_mode"):
         return str(latest_session["execution_mode"]).lower()
     return "paper"
+
+
+def _resolve_broker_provider(latest_session: dict[str, Any] | None) -> str:
+    payload = (latest_session or {}).get("request_payload") or {}
+    if latest_session:
+        return str(payload.get("broker_provider") or latest_session.get("broker_provider") or "kis").lower()
+    return "kis"
 
 
 def _auto_sessions(auto_db_path: Path) -> dict[str, Any]:
@@ -240,44 +307,222 @@ def _order_state_counts(path: Path) -> dict[str, int]:
         "submitted_order_count": 0,
         "broker_order_id_count": 0,
         "pending_order_intent_count": 0,
+        "latest_broker_order_event": None,
+        "last_broker_submit_at": None,
+        "last_broker_submit_error": None,
     }
     if not path.exists():
         return default
     try:
         with sqlite3.connect(path, timeout=2) as conn:
-            if not _table_exists(conn, "order_intents"):
-                return default
-            submitted_order_count = _scalar_int(
+            conn.row_factory = sqlite3.Row
+            intent_submitted_count = 0
+            broker_order_id_count = 0
+            pending_order_intent_count = 0
+            event_submitted_count = 0
+            latest_event = None
+            last_submit_at = None
+            last_submit_error = None
+            if _table_exists(conn, "order_intents"):
+                intent_submitted_count = _scalar_int(
+                    conn,
+                    """
+                    SELECT COUNT(*)
+                    FROM order_intents
+                    WHERE status IN ('SUBMITTED', 'PARTIALLY_FILLED', 'FILLED')
+                    """,
+                )
+                broker_order_id_count = _scalar_int(
+                    conn,
+                    """
+                    SELECT COUNT(*)
+                    FROM order_intents
+                    WHERE COALESCE(broker_order_no, '') <> ''
+                    """,
+                )
+                pending_order_intent_count = _scalar_int(
+                    conn,
+                    """
+                    SELECT COUNT(*)
+                    FROM order_intents
+                    WHERE status IN ('PENDING', 'SUBMITTED', 'PARTIALLY_FILLED')
+                    """,
+                )
+            if not _table_exists(conn, "broker_order_events"):
+                return {
+                    "submitted_order_count": intent_submitted_count,
+                    "broker_order_id_count": broker_order_id_count,
+                    "pending_order_intent_count": pending_order_intent_count,
+                    "latest_broker_order_event": None,
+                    "last_broker_submit_at": None,
+                    "last_broker_submit_error": None,
+                }
+            event_submitted_count = _scalar_int(
                 conn,
                 """
                 SELECT COUNT(*)
-                FROM order_intents
-                WHERE status IN ('SUBMITTED', 'PARTIALLY_FILLED', 'FILLED')
+                FROM broker_order_events
+                WHERE order_status IN (
+                    'submitted', 'accepted', 'unknown_pending',
+                    'filled', 'partially_filled', 'rejected'
+                )
                 """,
             )
-            broker_order_id_count = _scalar_int(
-                conn,
+            broker_order_id_count = max(
+                broker_order_id_count,
+                _scalar_int(
+                    conn,
+                    """
+                    SELECT COUNT(*)
+                    FROM broker_order_events
+                    WHERE COALESCE(broker_order_id, '') <> ''
+                    """,
+                ),
+            )
+            row = conn.execute(
                 """
-                SELECT COUNT(*)
-                FROM order_intents
-                WHERE COALESCE(broker_order_no, '') <> ''
-                """,
-            )
-            pending_order_intent_count = _scalar_int(
-                conn,
+                SELECT *
+                FROM broker_order_events
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
                 """
-                SELECT COUNT(*)
-                FROM order_intents
-                WHERE status IN ('PENDING', 'SUBMITTED', 'PARTIALLY_FILLED')
-                """,
-            )
+            ).fetchone()
+            if row:
+                latest_event = _broker_event_row_to_dict(row)
+                last_submit_at = latest_event.get("created_at")
+            error_row = conn.execute(
+                """
+                SELECT reject_reason, broker_response_message
+                FROM broker_order_events
+                WHERE order_status = 'rejected'
+                   OR COALESCE(reject_reason, '') <> ''
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if error_row:
+                last_submit_error = error_row[0] or error_row[1]
+            return {
+                "submitted_order_count": max(
+                    intent_submitted_count,
+                    event_submitted_count,
+                ),
+                "broker_order_id_count": broker_order_id_count,
+                "pending_order_intent_count": pending_order_intent_count,
+                "latest_broker_order_event": latest_event,
+                "last_broker_submit_at": last_submit_at,
+                "last_broker_submit_error": last_submit_error,
+            }
     except sqlite3.Error:
         return default
+
+
+def _broker_event_row_to_dict(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
+    if isinstance(row, sqlite3.Row):
+        data = dict(row)
+    else:
+        return {}
+    data["kis_is_paper"] = bool(data.get("kis_is_paper"))
+    data["raw_response"] = _parse_json(data.pop("raw_response_json", None), {})
+    return data
+
+
+def _last_broker_sync_at(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        with sqlite3.connect(path, timeout=2) as conn:
+            if _table_exists(conn, "broker_order_executions"):
+                row = conn.execute(
+                    "SELECT MAX(synced_at) FROM broker_order_executions"
+                ).fetchone()
+                if row and row[0]:
+                    return str(row[0])
+            if _table_exists(conn, "broker_balance_snapshots"):
+                row = conn.execute(
+                    "SELECT MAX(created_at) FROM broker_balance_snapshots"
+                ).fetchone()
+                if row and row[0]:
+                    return str(row[0])
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def _broker_submit_static_status(
+    *,
+    execution_mode: str,
+    broker_provider: str,
+) -> dict[str, Any]:
+    if execution_mode != "broker_paper":
+        return {
+            "broker_submit_blocked": False,
+            "broker_submit_block_reason": None,
+        }
+    provider = str(broker_provider or "").lower()
+    if provider != "kis":
+        return {
+            "broker_submit_blocked": True,
+            "broker_submit_block_reason": f"broker_provider must be kis, got {provider}",
+        }
+    if not settings.kis_is_paper:
+        return {
+            "broker_submit_blocked": True,
+            "broker_submit_block_reason": "broker_paper requires KIS_IS_PAPER=true",
+        }
+    storage = settings.storage_status()
+    if not storage.get("data_dir_writable") or not storage.get("data_dir_is_persistent"):
+        return {
+            "broker_submit_blocked": True,
+            "broker_submit_block_reason": "persistent_order_storage_unavailable",
+            "storage": {
+                "resolved_data_dir": storage.get("resolved_data_dir"),
+                "data_dir_writable": storage.get("data_dir_writable"),
+                "data_dir_is_persistent": storage.get("data_dir_is_persistent"),
+                "data_dir_warning": storage.get("data_dir_warning"),
+                "storage_root_fallback_used": storage.get("storage_root_fallback_used"),
+            },
+        }
+    missing = []
+    if not settings.kis_app_key:
+        missing.append("KIS_APP_KEY")
+    if not settings.kis_app_secret:
+        missing.append("KIS_APP_SECRET")
+    if not settings.kis_account_no:
+        missing.append("KIS_ACCOUNT_NO")
+    if not settings.kis_account_product_code:
+        missing.append("KIS_ACCOUNT_PRODUCT_CODE")
+    if missing:
+        return {
+            "broker_submit_blocked": True,
+            "broker_submit_block_reason": "Missing KIS mock account config: "
+            + ", ".join(missing),
+        }
     return {
-        "submitted_order_count": submitted_order_count,
-        "broker_order_id_count": broker_order_id_count,
-        "pending_order_intent_count": pending_order_intent_count,
+        "broker_submit_blocked": False,
+        "broker_submit_block_reason": None,
+        "kis_paper_endpoint": KIS_PAPER_BASE_URL,
     }
+
+
+def _broker_submit_status(
+    *,
+    broker_safety: dict[str, Any],
+    latest_event: dict[str, Any] | None,
+) -> str:
+    if broker_safety.get("broker_submit_blocked"):
+        return "blocked"
+    if latest_event:
+        return str(latest_event.get("order_status") or "unknown_pending")
+    return "idle"
+
+
+def _candidate_status(scanner: dict[str, Any]) -> str:
+    if scanner.get("claimed_candidate_count"):
+        return "claimed"
+    if scanner.get("ready_candidate_count"):
+        return "ready"
+    return "none"
 
 
 def _scanner_execution_state(path: Path) -> dict[str, Any]:
@@ -534,7 +779,10 @@ def _execution_order_status(
     planned_entry_count: int,
     claimed_candidate_count: int,
     uses_internal_paper_orders: bool,
+    latest_broker_order_event: dict[str, Any] | None = None,
 ) -> str:
+    if latest_broker_order_event:
+        return str(latest_broker_order_event.get("order_status") or "unknown_pending")
     if submitted_order_count > 0:
         return "submitted"
     if uses_internal_paper_orders and paper_orders_count > 0:

@@ -50,6 +50,33 @@ CREATE TABLE IF NOT EXISTS position_states (
     updated_at TEXT NOT NULL,
     raw_json TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS broker_order_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    qty INTEGER NOT NULL,
+    order_type TEXT NOT NULL,
+    limit_price REAL,
+    submitted_price REAL,
+    broker_provider TEXT NOT NULL,
+    kis_is_paper INTEGER NOT NULL DEFAULT 0,
+    execution_mode TEXT NOT NULL,
+    broker_order_id TEXT,
+    broker_response_code TEXT,
+    broker_response_message TEXT,
+    order_status TEXT NOT NULL,
+    reject_reason TEXT,
+    raw_response_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_broker_order_events_symbol_created
+ON broker_order_events(symbol, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_broker_order_events_status_created
+ON broker_order_events(order_status, created_at);
 """
 
 
@@ -431,6 +458,99 @@ def reconcile_all_after_broker_sync(
     }
 
 
+def record_broker_order_event(
+    event: dict[str, Any],
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Persist an actual broker submission event for status/dashboard counts."""
+    path = _db_path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = _now()
+    created_at = str(event.get("created_at") or now)
+    updated_at = str(event.get("updated_at") or now)
+    raw_response = event.get("raw_response_json")
+    if not isinstance(raw_response, str):
+        raw_response = _json(event.get("raw_response") or {})
+
+    with sqlite3.connect(path, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA_SQL)
+        _ensure_order_state_columns(conn)
+        cursor = conn.execute(
+            """
+            INSERT INTO broker_order_events (
+                created_at, updated_at, symbol, side, qty, order_type,
+                limit_price, submitted_price, broker_provider, kis_is_paper,
+                execution_mode, broker_order_id, broker_response_code,
+                broker_response_message, order_status, reject_reason,
+                raw_response_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                created_at,
+                updated_at,
+                str(event.get("symbol") or ""),
+                str(event.get("side") or "").lower(),
+                int(event.get("qty") or event.get("quantity") or 0),
+                str(event.get("order_type") or "limit"),
+                event.get("limit_price"),
+                event.get("submitted_price"),
+                str(event.get("broker_provider") or "kis").lower(),
+                1 if bool(event.get("kis_is_paper")) else 0,
+                str(event.get("execution_mode") or ""),
+                event.get("broker_order_id") or event.get("broker_order_no"),
+                event.get("broker_response_code"),
+                event.get("broker_response_message"),
+                str(event.get("order_status") or "unknown_pending").lower(),
+                event.get("reject_reason"),
+                raw_response,
+            ),
+        )
+        conn.commit()
+        event_id = int(cursor.lastrowid)
+    return get_broker_order_event(event_id, db_path=db_path) or {}
+
+
+def get_broker_order_event(
+    event_id: int,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    path = _db_path(db_path)
+    if not path.exists():
+        return None
+    with sqlite3.connect(path, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA_SQL)
+        _ensure_order_state_columns(conn)
+        row = conn.execute(
+            "SELECT * FROM broker_order_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+    return _broker_order_event_to_dict(row) if row else None
+
+
+def latest_broker_order_event(
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    path = _db_path(db_path)
+    if not path.exists():
+        return None
+    with sqlite3.connect(path, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA_SQL)
+        _ensure_order_state_columns(conn)
+        row = conn.execute(
+            """
+            SELECT *
+            FROM broker_order_events
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    return _broker_order_event_to_dict(row) if row else None
+
+
 def get_order_intent(
     intent_id: int,
     db_path: Path | str | None = None,
@@ -712,6 +832,13 @@ def _intent_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["raw_request"] = _parse_json(data.get("raw_request"), {})
     data["raw_response"] = _parse_json(data.get("raw_response"), None)
+    return data
+
+
+def _broker_order_event_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["kis_is_paper"] = bool(data.get("kis_is_paper"))
+    data["raw_response"] = _parse_json(data.pop("raw_response_json", None), {})
     return data
 
 

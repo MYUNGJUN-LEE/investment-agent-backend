@@ -714,6 +714,10 @@ def session_to_status(session: dict[str, Any]) -> dict[str, Any]:
         "status": session["status"],
         "account_key": session.get("account_key"),
         "execution_mode": session["execution_mode"],
+        "broker_provider": (session.get("request_payload") or {}).get(
+            "broker_provider",
+            "kis",
+        ),
         "interval_seconds": session["interval_seconds"],
         "max_cycles": session["max_cycles"],
         "cycle_count": session["cycle_count"],

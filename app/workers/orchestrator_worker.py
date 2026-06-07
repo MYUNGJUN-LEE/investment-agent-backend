@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from app.config import settings
+from app.trading.execution_status import print_startup_log
 from app.trading.trade_orchestrator import run_trade_orchestrator_once
 
 
@@ -21,6 +22,10 @@ def run_forever(
         settings.trade_orchestrator_interval_seconds
         if poll_seconds is None
         else poll_seconds
+    )
+    print_startup_log(
+        auto_trading_worker_enabled=bool(settings.trade_orchestrator_execute_entries),
+        scanner_worker_enabled=bool(settings.universe_full_scan_enabled),
     )
     while True:
         try:

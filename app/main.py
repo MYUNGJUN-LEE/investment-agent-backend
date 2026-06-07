@@ -883,12 +883,28 @@ def _runtime_execution_summary_fields(status: dict[str, Any]) -> dict[str, Any]:
         "kis_is_paper",
         "submits_to_broker",
         "uses_internal_paper_orders",
+        "configured_data_dir",
+        "resolved_data_dir",
+        "data_dir_writable",
+        "data_dir_is_persistent",
+        "data_dir_warning",
+        "storage_root_fallback_used",
         "active_session_count",
         "latest_session",
         "planned_entry_count",
         "submitted_order_count",
         "paper_orders_count",
         "broker_executions_count",
+        "latest_broker_order_event",
+        "last_broker_submit_at",
+        "last_broker_sync_at",
+        "last_broker_submit_error",
+        "broker_submit_blocked",
+        "broker_submit_block_reason",
+        "broker_submit_status",
+        "broker_execution_status",
+        "candidate_status",
+        "planner_status",
         "auto_trading_db_missing",
         "order_state_db_missing",
         "order_status",
@@ -1478,8 +1494,14 @@ def list_auto_trading_sessions_endpoint(
     dependencies=[Depends(verify_api_key)],
     include_in_schema=False,
 )
-def get_trading_execution_status(limit: int = 20):
-    return trading_status_snapshot(sample_limit=limit)
+def get_trading_execution_status(
+    limit: int = 20,
+    execution_mode: str | None = None,
+):
+    return trading_status_snapshot(
+        execution_mode=execution_mode,
+        sample_limit=limit,
+    )
 
 
 @app.get(

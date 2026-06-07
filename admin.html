@@ -1031,12 +1031,7 @@
       ].filter(Boolean).join(" | ") || "-";
       els.runtimeExecutionMode.textContent = summary.execution_mode || "-";
       els.runtimeExecutionMode.className = summary.execution_mode === "live" ? "bad" : "ok";
-      els.runtimeBrokerMode.textContent = [
-        summary.broker_provider || "KIS",
-        summary.kis_is_paper ? "KIS paper" : "KIS live",
-        summary.submits_to_broker ? "broker submit on" : "broker submit off",
-        summary.uses_internal_paper_orders ? "internal paper on" : "internal paper off"
-      ].join(" | ");
+      els.runtimeBrokerMode.textContent = executionModeDetail(summary);
       els.plannedEntryCount.textContent = fmtNumber(summary.planned_entry_count, 0);
       els.orderStatus.textContent = stateLabel(summary.order_status || "-");
       els.orderStatus.className = summary.order_status === "not_submitted" ? "warn" : statusTextClass(summary.order_status || "");
@@ -1045,7 +1040,11 @@
       els.paperOrdersDetail.textContent = summary.paper_orders_zero_reason || "internal paper orders";
       els.brokerExecutionsCount.textContent = fmtNumber(summary.broker_executions_count, 0);
       els.brokerExecutionsCount.className = Number(summary.broker_executions_count || 0) > 0 ? "ok" : "warn";
-      els.submittedOrderDetail.textContent = `${fmtNumber(summary.submitted_order_count, 0)} submitted`;
+      els.submittedOrderDetail.textContent = [
+        `${fmtNumber(summary.submitted_order_count, 0)} submitted`,
+        summary.broker_submit_status ? `submit ${summary.broker_submit_status}` : "",
+        summary.last_broker_sync_at ? `sync ${summary.last_broker_sync_at}` : ""
+      ].filter(Boolean).join(" | ");
       els.candidateLabelWinRate.textContent = displayPercent(summary.candidate_label_win_rate_display, summary.candidate_label_win_rate);
       els.candidateLabelDetail.textContent = `${fmtNumber(summary.candidate_label_sample_count, 0)} label samples`;
       els.paperOrderWinRate.textContent = displayPercent(summary.paper_order_win_rate_display, summary.paper_order_win_rate);
@@ -1317,6 +1316,26 @@
       const rows = workers && Array.isArray(workers.workers) ? workers.workers : [];
       if (!rows.length) return "-";
       return rows.map(row => `${row.name}:${row.alive ? "on" : "off"}`).join(" ");
+    }
+
+    function executionModeDetail(summary) {
+      if (summary.execution_mode === "paper") {
+        return "orders are simulated internally only";
+      }
+      if (summary.execution_mode === "broker_paper") {
+        if (summary.broker_submit_blocked) {
+          return `broker submit blocked: ${summary.broker_submit_block_reason || "-"}`;
+        }
+        return summary.submits_to_broker
+          ? "orders are submitted to the KIS mock trading account"
+          : "KIS mock mode configured but broker submit is off";
+      }
+      return [
+        summary.broker_provider || "kis",
+        summary.kis_is_paper ? "KIS paper" : "KIS live",
+        summary.submits_to_broker ? "broker submit on" : "broker submit off",
+        summary.uses_internal_paper_orders ? "internal paper on" : "internal paper off"
+      ].join(" | ");
     }
 
     function shortId(value) {

@@ -22,6 +22,7 @@ def _auth_headers() -> dict[str, str]:
 
 
 def _use_tmp_data_dir(tmp_path, monkeypatch) -> None:
+    settings.clear_storage_cache()
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
     monkeypatch.setattr(settings, "render_disk_mount_path", None)
 
@@ -152,6 +153,9 @@ def test_trading_status_exposes_missing_auto_trading_db(tmp_path, monkeypatch):
     body = response.json()
     assert body["auto_trading_db_missing"] is True
     assert body["active_session_count"] == 0
+    assert body["resolved_data_dir"] == str(tmp_path)
+    assert body["data_dir_writable"] is True
+    assert body["storage_root_fallback_used"] is False
 
 
 def test_zero_paper_orders_do_not_promote_candidate_label_win_rate(

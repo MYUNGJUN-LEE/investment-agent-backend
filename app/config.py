@@ -1,7 +1,28 @@
 import os
+import logging
 from pathlib import Path
+import sqlite3
+from typing import Any
+from uuid import uuid4
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+logger = logging.getLogger(__name__)
+
+_RENDER_NON_PERSISTENT_WARNING = (
+    "WARNING: using non-persistent fallback storage. Attach a Render persistent "
+    "disk and set DATA_DIR to its mount path."
+)
+_RENDER_VAR_DATA_WARNING = (
+    "WARNING: /var/data is not writable. Check that the persistent disk is "
+    "attached to this Render service and mounted at /var/data."
+)
+_LOCAL_NON_PERSISTENT_WARNING = (
+    "WARNING: using non-persistent fallback storage; data may be lost on restart."
+)
+_STORAGE_STATUS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_STORAGE_WARNING_KEYS: set[tuple[Any, ...]] = set()
 
 
 class Settings(BaseSettings):
@@ -344,35 +365,381 @@ class Settings(BaseSettings):
     embedded_workers_enabled: bool = os.getenv("RENDER_SERVICE_TYPE") == "web"
     embedded_worker_broker_sync_enabled: bool = True
 
-    def storage_root(self) -> Path | None:
-        """Return the persistent storage root when one is configured/attached."""
-        for raw in (
-            self.data_dir,
-            self.render_disk_mount_path,
-            os.getenv("DATA_DIR"),
-            os.getenv("APP_DATA_DIR"),
-            os.getenv("RENDER_DISK_MOUNT_PATH"),
-            os.getenv("RENDER_PERSISTENT_DISK_PATH"),
-            os.getenv("PERSISTENT_DISK_PATH"),
-        ):
-            if raw:
-                return Path(raw).expanduser()
+    def storage_status(self) -> dict[str, Any]:
+        """Resolve and verify the writable storage root used for relative paths."""
+        key = self._storage_cache_key()
+        cached = _STORAGE_STATUS_CACHE.get(key)
+        if cached is not None:
+            return dict(cached)
 
-        if (
-            os.getenv("RENDER")
-            or os.getenv("RENDER_SERVICE_ID")
-            or os.getenv("RENDER_SERVICE_TYPE")
-        ):
-            return Path("/var/data")
-        return None
+        status = self._resolve_storage_status()
+        _STORAGE_STATUS_CACHE[key] = dict(status)
+        self._log_storage_warnings(status, key)
+        return dict(status)
+
+    def storage_root(self) -> Path | None:
+        """Return the verified writable storage root for relative DB/cache paths."""
+        resolved = self.storage_status().get("resolved_data_dir")
+        return Path(str(resolved)) if resolved else None
 
     def storage_path(self, value: str | Path) -> Path:
-        """Resolve relative DB/cache paths onto persistent storage when present."""
+        """Resolve relative DB/cache paths onto the verified storage root."""
         path = Path(value).expanduser()
         if path.is_absolute():
             return path
-        root = self.storage_root()
+        status = self.storage_status()
+        root = Path(str(status["resolved_data_dir"])) if status.get("resolved_data_dir") else None
+        if (
+            root is not None
+            and status.get("storage_root_source") == "local_data"
+            and path.parts
+            and path.parts[0] == "data"
+        ):
+            path = Path(*path.parts[1:]) if len(path.parts) > 1 else Path(".")
         return root / path if root else path
+
+    def clear_storage_cache(self) -> None:
+        """Clear resolved storage diagnostics. Intended for tests and env reloads."""
+        _STORAGE_STATUS_CACHE.clear()
+        _STORAGE_WARNING_KEYS.clear()
+
+    def _resolve_storage_status(self) -> dict[str, Any]:
+        configured_data_dir = os.getenv("DATA_DIR") or self.data_dir
+        configured_render_mount = (
+            os.getenv("RENDER_DISK_MOUNT_PATH") or self.render_disk_mount_path
+        )
+        is_render = self._is_render_runtime()
+        candidates = self._storage_candidates(
+            configured_data_dir=configured_data_dir,
+            configured_render_mount=configured_render_mount,
+            is_render=is_render,
+        )
+        attempts: list[dict[str, Any]] = []
+        selected: dict[str, Any] | None = None
+        failed_before_selected = False
+
+        for candidate in candidates:
+            check = self._check_storage_candidate(
+                candidate["path"],
+                create_dir=candidate["create_dir"],
+                require_exists=candidate["require_exists"],
+            )
+            attempt = {
+                "source": candidate["source"],
+                "path": str(candidate["path"]),
+                "writable": check["writable"],
+                "reason": check.get("reason"),
+            }
+            attempts.append(attempt)
+            if check["writable"]:
+                selected = {**candidate, **check}
+                break
+            if candidate["counts_as_failure"]:
+                failed_before_selected = True
+
+        if selected is None:
+            fallback = self._tmp_fallback_data_dir()
+            check = self._check_storage_candidate(
+                fallback,
+                create_dir=True,
+                require_exists=False,
+            )
+            selected = {
+                "source": "tmp_fallback",
+                "path": fallback,
+                "persistent": False,
+                "create_dir": True,
+                "require_exists": False,
+                "counts_as_failure": True,
+                **check,
+            }
+            attempts.append(
+                {
+                    "source": "tmp_fallback",
+                    "path": str(fallback),
+                    "writable": check["writable"],
+                    "reason": check.get("reason"),
+                }
+            )
+            failed_before_selected = True
+
+        selected_path = Path(selected["path"]).expanduser().resolve()
+        persistent = bool(selected.get("persistent")) and not (
+            is_render and self._is_tmp_path(selected_path)
+        )
+        fallback_used = self._storage_fallback_used(
+            selected_source=str(selected.get("source")),
+            failed_before_selected=failed_before_selected,
+            configured_data_dir=configured_data_dir,
+            configured_render_mount=configured_render_mount,
+            is_render=is_render,
+        )
+        warnings = self._storage_warnings(
+            attempts=attempts,
+            selected_path=selected_path,
+            selected_source=str(selected.get("source")),
+            persistent=persistent,
+            fallback_used=fallback_used,
+            configured_data_dir=configured_data_dir,
+            is_render=is_render,
+        )
+
+        configured = configured_data_dir or configured_render_mount
+        return {
+            "configured_data_dir": str(Path(configured).expanduser()) if configured else None,
+            "resolved_data_dir": str(selected_path),
+            "data_dir_writable": bool(selected.get("writable")),
+            "data_dir_is_persistent": persistent,
+            "data_dir_warning": "; ".join(warnings) if warnings else None,
+            "storage_root_fallback_used": fallback_used,
+            "storage_root_source": str(selected.get("source")),
+            "storage_attempts": attempts,
+        }
+
+    def _storage_candidates(
+        self,
+        *,
+        configured_data_dir: str | None,
+        configured_render_mount: str | None,
+        is_render: bool,
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(
+            source: str,
+            raw_path: str | Path,
+            *,
+            persistent: bool,
+            create_dir: bool,
+            require_exists: bool,
+            counts_as_failure: bool,
+        ) -> None:
+            path = Path(raw_path).expanduser()
+            key = str(path)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(
+                {
+                    "source": source,
+                    "path": path,
+                    "persistent": persistent,
+                    "create_dir": create_dir,
+                    "require_exists": require_exists,
+                    "counts_as_failure": counts_as_failure,
+                }
+            )
+
+        if configured_data_dir:
+            add(
+                "DATA_DIR",
+                configured_data_dir,
+                persistent=True,
+                create_dir=True,
+                require_exists=False,
+                counts_as_failure=True,
+            )
+        if configured_render_mount:
+            add(
+                "RENDER_DISK_MOUNT_PATH",
+                configured_render_mount,
+                persistent=True,
+                create_dir=True,
+                require_exists=False,
+                counts_as_failure=True,
+            )
+        add(
+            "default_var_data",
+            self._default_render_data_dir(),
+            persistent=True,
+            create_dir=False,
+            require_exists=True,
+            counts_as_failure=is_render,
+        )
+        add(
+            "local_data",
+            self._local_data_dir(),
+            persistent=not is_render,
+            create_dir=True,
+            require_exists=False,
+            counts_as_failure=is_render,
+        )
+        add(
+            "tmp_fallback",
+            self._tmp_fallback_data_dir(),
+            persistent=False,
+            create_dir=True,
+            require_exists=False,
+            counts_as_failure=True,
+        )
+        return candidates
+
+    def _check_storage_candidate(
+        self,
+        path: Path,
+        *,
+        create_dir: bool,
+        require_exists: bool,
+    ) -> dict[str, Any]:
+        path = path.expanduser()
+        sqlite_path: Path | None = None
+        try:
+            if require_exists and not path.exists():
+                return {"writable": False, "reason": "path does not exist"}
+            if path.exists() and not path.is_dir():
+                return {"writable": False, "reason": "path is not a directory"}
+            if create_dir:
+                path.mkdir(parents=True, exist_ok=True)
+            elif not path.exists():
+                return {"writable": False, "reason": "path does not exist"}
+
+            write_path = path / f".storage-write-check-{uuid4().hex}.tmp"
+            write_path.write_text("ok", encoding="utf-8")
+            write_path.unlink(missing_ok=True)
+
+            sqlite_path = path / f".storage-sqlite-check-{uuid4().hex}.sqlite3"
+            with sqlite3.connect(sqlite_path) as conn:
+                conn.execute("CREATE TABLE IF NOT EXISTS storage_check (id INTEGER)")
+                conn.execute("INSERT INTO storage_check (id) VALUES (1)")
+                conn.commit()
+            self._remove_sqlite_check_files(sqlite_path)
+            return {"writable": True, "reason": None}
+        except Exception as exc:
+            if sqlite_path is not None:
+                self._remove_sqlite_check_files(sqlite_path)
+            return {"writable": False, "reason": str(exc)}
+
+    def _remove_sqlite_check_files(self, sqlite_path: Path) -> None:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                Path(f"{sqlite_path}{suffix}").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _storage_fallback_used(
+        self,
+        *,
+        selected_source: str,
+        failed_before_selected: bool,
+        configured_data_dir: str | None,
+        configured_render_mount: str | None,
+        is_render: bool,
+    ) -> bool:
+        if failed_before_selected:
+            return True
+        if configured_data_dir and selected_source != "DATA_DIR":
+            return True
+        if (
+            not configured_data_dir
+            and configured_render_mount
+            and selected_source != "RENDER_DISK_MOUNT_PATH"
+        ):
+            return True
+        if is_render and selected_source in {"local_data", "tmp_fallback"}:
+            return True
+        return False
+
+    def _storage_warnings(
+        self,
+        *,
+        attempts: list[dict[str, Any]],
+        selected_path: Path,
+        selected_source: str,
+        persistent: bool,
+        fallback_used: bool,
+        configured_data_dir: str | None,
+        is_render: bool,
+    ) -> list[str]:
+        warnings: list[str] = []
+        var_path = self._default_render_data_dir().expanduser()
+        configured_path = (
+            Path(configured_data_dir).expanduser() if configured_data_dir else None
+        )
+        failed_attempts = [attempt for attempt in attempts if not attempt["writable"]]
+        if any(
+            attempt["source"] in {"DATA_DIR", "RENDER_DISK_MOUNT_PATH"}
+            for attempt in failed_attempts
+        ):
+            warnings.append(
+                "WARNING: configured storage path is not writable; using fallback storage."
+            )
+        if is_render and any(
+            attempt["source"] == "default_var_data" for attempt in failed_attempts
+        ):
+            warnings.append(_RENDER_VAR_DATA_WARNING)
+        if (
+            is_render
+            and configured_path is not None
+            and self._same_path(configured_path, var_path)
+            and any(
+                attempt["source"] == "DATA_DIR" and not attempt["writable"]
+                for attempt in attempts
+            )
+        ):
+            warnings.append(_RENDER_VAR_DATA_WARNING)
+
+        if fallback_used and not persistent:
+            warnings.append(
+                _RENDER_NON_PERSISTENT_WARNING
+                if is_render
+                else _LOCAL_NON_PERSISTENT_WARNING
+            )
+        elif is_render and self._is_tmp_path(selected_path):
+            warnings.append(_RENDER_NON_PERSISTENT_WARNING)
+        return list(dict.fromkeys(warnings))
+
+    def _log_storage_warnings(
+        self,
+        status: dict[str, Any],
+        key: tuple[Any, ...],
+    ) -> None:
+        if key in _STORAGE_WARNING_KEYS:
+            return
+        _STORAGE_WARNING_KEYS.add(key)
+        warning = status.get("data_dir_warning")
+        if not warning:
+            return
+        for item in str(warning).split("; "):
+            if item:
+                logger.warning(item)
+
+    def _storage_cache_key(self) -> tuple[Any, ...]:
+        return (
+            os.getenv("DATA_DIR"),
+            self.data_dir,
+            os.getenv("RENDER_DISK_MOUNT_PATH"),
+            self.render_disk_mount_path,
+            os.getenv("RENDER"),
+            os.getenv("RENDER_SERVICE_ID"),
+            os.getenv("RENDER_SERVICE_TYPE"),
+            str(self._default_render_data_dir()),
+            str(self._local_data_dir()),
+            str(self._tmp_fallback_data_dir()),
+            os.getcwd(),
+        )
+
+    def _is_render_runtime(self) -> bool:
+        return bool(
+            os.getenv("RENDER")
+            or os.getenv("RENDER_SERVICE_ID")
+            or os.getenv("RENDER_SERVICE_TYPE")
+        )
+
+    def _default_render_data_dir(self) -> Path:
+        return Path("/var/data")
+
+    def _local_data_dir(self) -> Path:
+        return Path("data")
+
+    def _tmp_fallback_data_dir(self) -> Path:
+        return Path("/tmp/investment_orchestrator_data")
+
+    def _is_tmp_path(self, path: Path) -> bool:
+        return str(path.expanduser()).replace("\\", "/").startswith("/tmp/")
+
+    def _same_path(self, left: Path, right: Path) -> bool:
+        return str(left.expanduser()).rstrip("\\/") == str(right.expanduser()).rstrip("\\/")
 
     model_config = SettingsConfigDict(
         env_file=".env",

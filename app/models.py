@@ -12,7 +12,8 @@ LiveOrderType = Literal["limit"]
 OrderPreviewAction = Literal["auto", "entry", "exit"]
 OrderPreviewStatus = Literal["pending", "blocked"]
 OrderExecutionMode = Literal["paper"]
-AutoTradeExecutionMode = Literal["paper", "live"]
+BrokerProvider = Literal["kis"]
+AutoTradeExecutionMode = Literal["paper", "broker_paper", "live"]
 AutoTradeSessionStatus = Literal["active", "stopping", "stopped", "error", "not_found"]
 GptAutoTradeCommand = Literal["start", "stop", "status"]
 
@@ -167,6 +168,7 @@ class PaperRunResponse(BaseModel):
 class LiveOrderRequest(BaseModel):
     symbol: str = Field(..., description="Stock ticker code, e.g. 005930")
     market: Market = "KR"
+    broker_provider: BrokerProvider = "kis"
     strategy_type: StrategyType = "daytrade"
     risk_level: RiskLevel = "medium"
     side: LiveOrderSide
@@ -394,6 +396,7 @@ class AutoTradeStartRequest(BaseModel):
         description="Final candidate count passed into the auto-trading analyzer.",
     )
     execution_mode: AutoTradeExecutionMode = "paper"
+    broker_provider: BrokerProvider = "kis"
     interval_seconds: int = Field(
         60,
         ge=10,
@@ -435,6 +438,7 @@ class AutoTradeStartResponse(BaseModel):
     status: AutoTradeSessionStatus
     account_key: str | None = None
     execution_mode: AutoTradeExecutionMode
+    broker_provider: BrokerProvider = "kis"
     interval_seconds: int
     max_cycles: int | None
     started_at: str
@@ -447,6 +451,7 @@ class AutoTradeStatusResponse(BaseModel):
     status: AutoTradeSessionStatus
     account_key: str | None = None
     execution_mode: AutoTradeExecutionMode | None = None
+    broker_provider: BrokerProvider | None = None
     interval_seconds: int | None = None
     max_cycles: int | None = None
     cycle_count: int = 0
@@ -502,6 +507,7 @@ class GptAutoTradeControlRequest(BaseModel):
         description="Use start to turn on auto-trading, stop to stop all active sessions, status to inspect it.",
     )
     execution_mode: AutoTradeExecutionMode = "paper"
+    broker_provider: BrokerProvider = "kis"
     interval_seconds: int = Field(60, ge=10, le=3600)
     max_cycles: int | None = Field(None, ge=1, le=10_000)
     auto_discover_symbols: bool = True
