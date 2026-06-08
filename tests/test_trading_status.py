@@ -8,6 +8,7 @@ from app.config import settings
 from app.main import app
 from app.models import PaperRunRequest
 from app.trading import auto_trading, execution_status, paper_trading, risk_manager
+from app.trading import auto_trading_store
 from app.trading import universe_scanner
 from app.workers import trading_worker
 
@@ -23,6 +24,14 @@ def _auth_headers() -> dict[str, str]:
 
 def _use_tmp_data_dir(tmp_path, monkeypatch) -> None:
     settings.clear_storage_cache()
+    for key in (
+        "EXECUTION_MODE",
+        "TRADING_EXECUTION_MODE",
+        "AUTO_TRADING_EXECUTION_MODE",
+        "DEFAULT_EXECUTION_MODE",
+        "BROKER_PROVIDER",
+    ):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
     monkeypatch.setattr(settings, "render_disk_mount_path", None)
 
@@ -156,6 +165,93 @@ def test_trading_status_exposes_missing_auto_trading_db(tmp_path, monkeypatch):
     assert body["resolved_data_dir"] == str(tmp_path)
     assert body["data_dir_writable"] is True
     assert body["storage_root_fallback_used"] is False
+
+
+def test_execution_mode_env_alias_is_exposed_in_trading_status(tmp_path, monkeypatch):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    monkeypatch.setenv("TRADING_EXECUTION_MODE", "broker_paper")
+    monkeypatch.setenv("BROKER_PROVIDER", "kis")
+    monkeypatch.setattr(settings, "kis_is_paper", True)
+    monkeypatch.setattr(settings, "kis_app_key", "app-key")
+    monkeypatch.setattr(settings, "kis_app_secret", "app-secret")
+    monkeypatch.setattr(settings, "kis_account_no", "12345678")
+    monkeypatch.setattr(settings, "kis_account_product_code", "01")
+
+    status = execution_status.trading_status_snapshot()
+
+    assert status["configured_execution_mode"] == "broker_paper"
+    assert status["resolved_execution_mode"] == "broker_paper"
+    assert status["execution_mode_source"] == "TRADING_EXECUTION_MODE"
+    assert status["execution_mode"] == "broker_paper"
+    assert status["configured_broker_provider"] == "kis"
+    assert status["broker_provider_source"] == "BROKER_PROVIDER"
+    assert status["broker_submit_enabled"] is True
+
+
+def test_active_paper_session_mismatch_requires_restart(tmp_path, monkeypatch):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    auto_trading_store.create_session(
+        auto_trading.AutoTradeStartRequest(
+            execution_mode="paper",
+            auto_discover_symbols=True,
+            run_immediately=True,
+        )
+    )
+    monkeypatch.setenv("EXECUTION_MODE", "broker_paper")
+    monkeypatch.setattr(settings, "kis_is_paper", True)
+    monkeypatch.setattr(settings, "kis_app_key", "app-key")
+    monkeypatch.setattr(settings, "kis_app_secret", "app-secret")
+    monkeypatch.setattr(settings, "kis_account_no", "12345678")
+    monkeypatch.setattr(settings, "kis_account_product_code", "01")
+
+    status = execution_status.trading_status_snapshot()
+
+    assert status["resolved_execution_mode"] == "broker_paper"
+    assert status["active_session_execution_mode"] == "paper"
+    assert status["session_mode_mismatch"] is True
+    assert status["requires_session_restart"] is True
+    assert status["broker_submit_enabled"] is False
+
+
+def test_trading_restart_stops_stale_paper_session_and_starts_broker_paper(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    old = auto_trading_store.create_session(
+        auto_trading.AutoTradeStartRequest(
+            execution_mode="paper",
+            auto_discover_symbols=True,
+            run_immediately=True,
+        )
+    )
+    monkeypatch.setenv("EXECUTION_MODE", "broker_paper")
+    monkeypatch.setenv("BROKER_PROVIDER", "kis")
+    monkeypatch.setattr(settings, "kis_is_paper", True)
+    monkeypatch.setattr(settings, "kis_app_key", "app-key")
+    monkeypatch.setattr(settings, "kis_app_secret", "app-secret")
+    monkeypatch.setattr(settings, "kis_account_no", "12345678")
+    monkeypatch.setattr(settings, "kis_account_product_code", "01")
+    monkeypatch.setattr(
+        auto_trading,
+        "broker_paper_safety_check",
+        lambda **kwargs: {"approved": True, "broker_submit_blocked": False},
+    )
+
+    response = client.post("/trading/restart", headers=_auth_headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["started_session"]["execution_mode"] == "broker_paper"
+    assert body["started_session"]["broker_provider"] == "kis"
+    assert body["stopped_sessions"][0]["old_session_id"] == old["session_id"]
+    assert auto_trading_store.get_session(old["session_id"])["status"] == "stopped"
+
+    status = execution_status.trading_status_snapshot()
+    assert status["active_session_count"] == 1
+    assert status["active_session_execution_mode"] == "broker_paper"
+    assert status["session_mode_mismatch"] is False
 
 
 def test_zero_paper_orders_do_not_promote_candidate_label_win_rate(

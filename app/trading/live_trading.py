@@ -14,9 +14,18 @@ from app.trading import paper_trading, risk_manager
 
 
 class LiveTradingError(ValueError):
-    def __init__(self, message: str, status_code: int = 400) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 400,
+        *,
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+        self.details = details or {}
 
 
 def execute_live_order(
@@ -89,9 +98,15 @@ def execute_broker_paper_order(
     client = client or KisClient(is_paper=True)
     safety = broker_paper_safety_check(req=req, client=client)
     if not safety.get("approved"):
+        reason = str(
+            safety.get("broker_submit_block_reason")
+            or "Broker paper submit blocked"
+        )
         raise LiveTradingError(
-            str(safety.get("broker_submit_block_reason") or "Broker paper submit blocked"),
+            reason,
             status_code=403,
+            code=str(safety.get("broker_submit_block_code") or reason),
+            details=safety,
         )
 
     resolved_db_path = settings.storage_path(db_path or paper_trading.DEFAULT_DB_PATH)
@@ -114,10 +129,27 @@ def execute_broker_paper_order(
             status_code=403,
         )
 
+    guard = order_state.validate_broker_paper_order(req)
+    if not guard.get("approved"):
+        reason = str(
+            guard.get("broker_submit_block_reason")
+            or "Broker paper order blocked"
+        )
+        raise LiveTradingError(
+            reason,
+            status_code=403,
+            code=guard.get("broker_submit_block_code"),
+            details=guard,
+        )
+
     try:
         intent = order_state.begin_order_intent(req)
     except order_state.OrderStateError as exc:
-        raise LiveTradingError(str(exc), status_code=exc.status_code) from exc
+        raise LiveTradingError(
+            str(exc),
+            status_code=exc.status_code,
+            code=exc.code,
+        ) from exc
 
     try:
         kis_result = _submit_with_limited_retries(client, req)
@@ -288,6 +320,12 @@ def broker_paper_safety_check(
         return _broker_submit_block(f"KIS mock account probe failed: {exc}", diagnostics)
     if cash is None:
         return _broker_submit_block("KIS mock cash/buying_power is unavailable", diagnostics)
+    if cash <= 0:
+        return _broker_submit_block(
+            "KIS mock cash/buying_power is zero",
+            diagnostics,
+            code="cash_or_buying_power_zero",
+        )
 
     return {
         "approved": True,
@@ -307,11 +345,14 @@ def broker_paper_safety_check(
 def _broker_submit_block(
     reason: str,
     diagnostics: dict[str, Any] | None = None,
+    *,
+    code: str | None = None,
 ) -> dict[str, Any]:
     return {
         "approved": False,
         "broker_submit_blocked": True,
         "broker_submit_block_reason": reason,
+        "broker_submit_block_code": code or reason,
         "broker_provider": "kis",
         "kis_is_paper": bool(settings.kis_is_paper),
         "submits_to_broker": False,
@@ -351,11 +392,15 @@ def _record_broker_paper_event(
     return order_state.record_broker_order_event(
         {
             "symbol": req.symbol,
+            "name": getattr(req, "name", None),
+            "session_id": req.session_id,
+            "scan_id": req.scan_id,
             "side": req.side,
             "qty": req.quantity,
             "order_type": req.order_type,
             "limit_price": req.price,
             "submitted_price": req.price,
+            "notional_krw": float(req.price) * int(req.quantity),
             "broker_provider": "kis",
             "kis_is_paper": True,
             "execution_mode": "broker_paper",

@@ -12,6 +12,7 @@ from app.config import settings
 from app.brokers.kis_client import KIS_PAPER_BASE_URL
 from app.trading import edge_calibration, paper_trading
 from app.trading import auto_trading_store
+from app.trading import order_state as order_state_store
 
 
 logger = logging.getLogger(__name__)
@@ -35,8 +36,18 @@ def trading_status_snapshot(
     auto_sessions = _auto_sessions(paths["auto_trading_db_path"])
     latest_session = auto_sessions["latest_session"]
     active_sessions = auto_sessions["active_sessions"]
-    mode = _resolve_execution_mode(execution_mode, latest_session)
-    broker_provider = _resolve_broker_provider(latest_session)
+    mode_info = settings.execution_mode_status(execution_mode)
+    provider_info = settings.broker_provider_status()
+    mode = _resolve_execution_mode(
+        execution_mode,
+        latest_session,
+        configured_mode=mode_info,
+    )
+    broker_provider = (
+        provider_info["broker_provider"]
+        if provider_info.get("configured_broker_provider")
+        else _resolve_broker_provider(latest_session)
+    )
     mode_flags = execution_mode_flags(mode, broker_provider=broker_provider)
     broker_safety = _broker_submit_static_status(
         execution_mode=mode,
@@ -51,6 +62,9 @@ def trading_status_snapshot(
         "paper_orders",
     )
     order_state = _order_state_counts(paths["order_state_db_path"])
+    broker_risk = order_state_store.broker_paper_order_risk_snapshot(
+        paths["order_state_db_path"]
+    )
     broker_executions_count = _table_count(
         paths["broker_sync_db_path"],
         "broker_order_executions",
@@ -88,10 +102,29 @@ def trading_status_snapshot(
     )
     if paper_zero_reason:
         logger.warning("paper_orders_count is zero: %s", paper_zero_reason)
+    session_mode = str((latest_session or {}).get("execution_mode") or "") or None
+    session_mismatch = _session_mode_mismatch(
+        resolved_mode=mode,
+        active_sessions=active_sessions,
+    )
+    broker_enabled = bool(
+        mode_flags["submits_to_broker"]
+        and not broker_safety["broker_submit_blocked"]
+        and not session_mismatch["session_mode_mismatch"]
+    )
+    guard_counts = _broker_guard_counts(latest_session)
 
     return {
         "status": "success",
         **mode_flags,
+        **mode_info,
+        **provider_info,
+        "resolved_execution_mode": mode,
+        "active_session_execution_mode": session_mode,
+        "session_mode_mismatch": session_mismatch["session_mode_mismatch"],
+        "session_mode_mismatch_reason": session_mismatch["session_mode_mismatch_reason"],
+        "requires_session_restart": session_mismatch["requires_session_restart"],
+        "broker_submit_enabled": broker_enabled,
         "DATA_DIR": storage.get("resolved_data_dir"),
         "configured_data_dir": storage.get("configured_data_dir"),
         "resolved_data_dir": storage.get("resolved_data_dir"),
@@ -110,6 +143,8 @@ def trading_status_snapshot(
         "order_state_db_missing": not paths["order_state_db_path"].exists(),
         "active_session_count": len(active_sessions),
         "latest_session": latest_session,
+        "latest_session_status": (latest_session or {}).get("status"),
+        "account_key": (latest_session or {}).get("account_key"),
         "planned_entry_count": planned_entry_count,
         "submitted_order_count": submitted_order_count,
         "paper_orders_count": paper_orders_count,
@@ -122,6 +157,8 @@ def trading_status_snapshot(
         "last_broker_sync_at": _last_broker_sync_at(paths["broker_sync_db_path"]),
         "broker_submit_blocked": broker_safety["broker_submit_blocked"],
         "broker_submit_block_reason": broker_safety["broker_submit_block_reason"],
+        "broker_submit_block_code": broker_safety.get("broker_submit_block_code"),
+        "last_broker_sync_error": _last_broker_sync_error(paths["broker_sync_db_path"]),
         "broker_submit_status": _broker_submit_status(
             broker_safety=broker_safety,
             latest_event=order_state.get("latest_broker_order_event"),
@@ -145,6 +182,8 @@ def trading_status_snapshot(
         "execution_layer_issue": bool(
             mode_flags["uses_internal_paper_orders"] and paper_orders_count == 0
         ),
+        **guard_counts,
+        **broker_risk,
         "win_rates": win_rates,
         **_flat_win_rate_fields(win_rates),
         **edge_status["public_fields"],
@@ -163,8 +202,16 @@ def startup_log_payload(
     latest_session = None
     if execution_mode is None and paths["auto_trading_db_path"].exists():
         latest_session = _auto_sessions(paths["auto_trading_db_path"]).get("latest_session")
-    mode = str(execution_mode or _resolve_execution_mode(None, latest_session)).lower()
-    provider = str(broker_provider or _resolve_broker_provider(latest_session)).lower()
+    mode_info = settings.execution_mode_status(execution_mode)
+    provider_info = settings.broker_provider_status(broker_provider)
+    mode = str(
+        _resolve_execution_mode(
+            execution_mode,
+            latest_session,
+            configured_mode=mode_info,
+        )
+    ).lower()
+    provider = str(provider_info["broker_provider"]).lower()
     flags = execution_mode_flags(mode, broker_provider=provider)
     safety = _broker_submit_static_status(
         execution_mode=mode,
@@ -178,6 +225,9 @@ def startup_log_payload(
         "data_dir_is_persistent": storage.get("data_dir_is_persistent"),
         "data_dir_warning": storage.get("data_dir_warning"),
         "storage_root_fallback_used": storage.get("storage_root_fallback_used"),
+        **mode_info,
+        "resolved_execution_mode": mode,
+        **provider_info,
         "universe_scanner_db_path": str(paths["universe_scanner_db_path"]),
         "edge_calibration_db_path": str(paths["edge_calibration_db_path"]),
         "auto_trading_db_path": str(paths["auto_trading_db_path"]),
@@ -244,9 +294,13 @@ def resolved_storage_paths() -> dict[str, Path]:
 def _resolve_execution_mode(
     execution_mode: str | None,
     latest_session: dict[str, Any] | None,
+    configured_mode: dict[str, Any] | None = None,
 ) -> str:
     if execution_mode:
         return str(execution_mode).lower()
+    configured_mode = configured_mode or settings.execution_mode_status()
+    if configured_mode.get("configured_execution_mode"):
+        return str(configured_mode["resolved_execution_mode"]).lower()
     if latest_session and latest_session.get("execution_mode"):
         return str(latest_session["execution_mode"]).lower()
     return "paper"
@@ -274,9 +328,10 @@ def _auto_sessions(auto_db_path: Path) -> dict[str, Any]:
             "active_sessions": [],
             "latest_session": {"status": "error", "last_error": str(exc)},
         }
+    latest_session = active_sessions[0] if active_sessions else (latest[0] if latest else None)
     return {
         "active_sessions": active_sessions,
-        "latest_session": latest[0] if latest else None,
+        "latest_session": latest_session,
     }
 
 
@@ -449,6 +504,73 @@ def _last_broker_sync_at(path: Path) -> str | None:
     return None
 
 
+def _last_broker_sync_error(path: Path) -> str | None:
+    return None
+
+
+def _session_mode_mismatch(
+    *,
+    resolved_mode: str,
+    active_sessions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    mismatched = [
+        session
+        for session in active_sessions
+        if str(session.get("execution_mode") or "paper").lower() != resolved_mode
+    ]
+    if not mismatched:
+        return {
+            "session_mode_mismatch": False,
+            "session_mode_mismatch_reason": None,
+            "requires_session_restart": False,
+        }
+    return {
+        "session_mode_mismatch": True,
+        "session_mode_mismatch_reason": "active_session_execution_mode_differs_from_config",
+        "requires_session_restart": True,
+        "mismatched_session_ids": [session.get("session_id") for session in mismatched],
+    }
+
+
+def _broker_guard_counts(latest_session: dict[str, Any] | None) -> dict[str, Any]:
+    counts = {
+        "dedupe_blocked_count": 0,
+        "open_order_blocked_count": 0,
+        "already_position_blocked_count": 0,
+        "daily_order_limit_blocked_count": 0,
+    }
+    if not latest_session:
+        return counts
+    stack = list(latest_session.get("last_results") or [])
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("results"), list):
+            stack.extend(item["results"])
+        code = str(
+            item.get("broker_submit_block_code")
+            or item.get("broker_order_guard_code")
+            or ""
+        )
+        message = str(item.get("message") or "")
+        if code in {"duplicate_scan_symbol_side", "symbol_cooldown_active"}:
+            counts["dedupe_blocked_count"] += 1
+        if code in {"open_broker_order_exists", "open_order_intent_exists"}:
+            counts["open_order_blocked_count"] += 1
+        if code == "already_position_exists":
+            counts["already_position_blocked_count"] += 1
+        if code in {
+            "daily_order_limit_exceeded",
+            "daily_symbol_order_limit_exceeded",
+            "daily_notional_limit_exceeded",
+        }:
+            counts["daily_order_limit_blocked_count"] += 1
+        if "duplicate" in message.lower():
+            counts["dedupe_blocked_count"] += 1
+    return counts
+
+
 def _broker_submit_static_status(
     *,
     execution_mode: str,
@@ -458,23 +580,27 @@ def _broker_submit_static_status(
         return {
             "broker_submit_blocked": False,
             "broker_submit_block_reason": None,
+            "broker_submit_block_code": None,
         }
     provider = str(broker_provider or "").lower()
     if provider != "kis":
         return {
             "broker_submit_blocked": True,
             "broker_submit_block_reason": f"broker_provider must be kis, got {provider}",
+            "broker_submit_block_code": "broker_provider_not_kis",
         }
     if not settings.kis_is_paper:
         return {
             "broker_submit_blocked": True,
             "broker_submit_block_reason": "broker_paper requires KIS_IS_PAPER=true",
+            "broker_submit_block_code": "kis_is_paper_false",
         }
     storage = settings.storage_status()
     if not storage.get("data_dir_writable") or not storage.get("data_dir_is_persistent"):
         return {
             "broker_submit_blocked": True,
             "broker_submit_block_reason": "persistent_order_storage_unavailable",
+            "broker_submit_block_code": "persistent_order_storage_unavailable",
             "storage": {
                 "resolved_data_dir": storage.get("resolved_data_dir"),
                 "data_dir_writable": storage.get("data_dir_writable"),
@@ -497,10 +623,12 @@ def _broker_submit_static_status(
             "broker_submit_blocked": True,
             "broker_submit_block_reason": "Missing KIS mock account config: "
             + ", ".join(missing),
+            "broker_submit_block_code": "kis_config_missing",
         }
     return {
         "broker_submit_blocked": False,
         "broker_submit_block_reason": None,
+        "broker_submit_block_code": None,
         "kis_paper_endpoint": KIS_PAPER_BASE_URL,
     }
 

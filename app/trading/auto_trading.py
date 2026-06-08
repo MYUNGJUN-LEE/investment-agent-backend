@@ -64,6 +64,7 @@ class AutoTradingError(ValueError):
 
 def start_auto_trading(req: AutoTradeStartRequest) -> dict[str, Any]:
     """Persist an auto-trading session for a separate worker process."""
+    req = _normalize_start_request(req)
     _validate_start_request(req)
     account_key = auto_trading_store.account_key_for_request(req)
     recovery_applied = False
@@ -171,6 +172,16 @@ def stop_auto_trading(session_id: str) -> dict[str, Any]:
 def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, Any]:
     """Simple Custom GPT control surface: start, stop, or status."""
     worker_status = _embedded_worker_status()
+    requested_execution_mode = (
+        req.execution_mode
+        if "execution_mode" in getattr(req, "model_fields_set", set())
+        else settings.resolved_execution_mode()
+    )
+    requested_broker_provider = (
+        req.broker_provider
+        if "broker_provider" in getattr(req, "model_fields_set", set())
+        else settings.resolved_broker_provider()
+    )
     active = [
         auto_trading_store.session_to_status(session)
         for session in auto_trading_store.list_sessions(status="active", limit=500)
@@ -214,6 +225,29 @@ def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, 
             "worker_status": worker_status,
         }
 
+    mismatched_active = [
+        session
+        for session in active
+        if str(session.get("execution_mode") or "paper") != str(requested_execution_mode)
+        or str(session.get("broker_provider") or "kis") != str(requested_broker_provider)
+    ]
+    if active and mismatched_active and req.command == "start":
+        stopped_mismatches = [
+            _stop_session_for_mode_transition(
+                session["session_id"],
+                old_execution_mode=str(session.get("execution_mode") or "paper"),
+                new_execution_mode=str(requested_execution_mode),
+                reason="active_session_execution_mode_differs_from_config",
+            )
+            for session in mismatched_active
+        ]
+        active = [
+            auto_trading_store.session_to_status(session)
+            for session in auto_trading_store.list_sessions(status="active", limit=500)
+        ]
+    else:
+        stopped_mismatches = []
+
     if active and not req.force_new:
         return {
             "status": "already_active",
@@ -226,7 +260,7 @@ def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, 
             "auto_recovery_applied": bool(latest.get("recovery_applied")) if latest else False,
             "active_sessions": active,
             "recent_sessions": recent_sessions,
-            "stopped_sessions": [],
+            "stopped_sessions": stopped_mismatches,
             "started_session": None,
             "worker_status": worker_status,
         }
@@ -238,8 +272,8 @@ def control_auto_trading_from_gpt(req: GptAutoTradeControlRequest) -> dict[str, 
         universe_seed_symbols=req.universe_seed_symbols,
         universe_candidate_limit=req.universe_candidate_limit,
         universe_final_limit=req.universe_final_limit,
-        execution_mode=req.execution_mode,
-        broker_provider=req.broker_provider,
+        execution_mode=requested_execution_mode,
+        broker_provider=requested_broker_provider,
         interval_seconds=req.interval_seconds,
         max_cycles=req.max_cycles,
         run_immediately=True,
@@ -284,13 +318,121 @@ def restart_auto_trading(session_id: str) -> dict[str, Any]:
     }
 
 
+def restart_trading_with_configured_mode() -> dict[str, Any]:
+    """Stop mismatched active sessions and start a new configured-mode session."""
+    mode_info = settings.execution_mode_status()
+    provider_info = settings.broker_provider_status()
+    resolved_mode = str(mode_info["resolved_execution_mode"])
+    resolved_provider = str(provider_info["broker_provider"])
+    active = auto_trading_store.list_sessions(status="active", limit=500)
+    stopped = []
+    template_session = active[0] if active else None
+    for session in active:
+        stopped.append(
+            _stop_session_for_mode_transition(
+                session["session_id"],
+                old_execution_mode=str(session.get("execution_mode") or "paper"),
+                new_execution_mode=resolved_mode,
+                reason="trading_restart_to_configured_execution_mode",
+            )
+        )
+
+    if template_session:
+        template = auto_trading_store.load_request(template_session)
+    else:
+        template = AutoTradeStartRequest()
+    start_req = _normalize_start_request(
+        template.model_copy(
+            update={
+                "execution_mode": resolved_mode,
+                "broker_provider": resolved_provider,
+                "run_immediately": True,
+                "auto_confirm_paper": False
+                if resolved_mode == "broker_paper"
+                else template.auto_confirm_paper,
+            }
+        ),
+        force_config=True,
+    )
+    started = start_auto_trading(start_req)
+    transition = {
+        "status": "success",
+        "message": "Trading restarted using configured execution mode",
+        **mode_info,
+        **provider_info,
+        "stopped_sessions": stopped,
+        "started_session": started,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "reason": "trading_restart_to_configured_execution_mode",
+    }
+    print(
+        {
+            "event": "trading_session_mode_transition",
+            "old_sessions": stopped,
+            "new_session_id": started.get("session_id"),
+            "new_execution_mode": resolved_mode,
+            "timestamp": transition["timestamp"],
+            "reason": transition["reason"],
+        },
+        flush=True,
+    )
+    return transition
+
+
 def run_auto_trading_once(req: AutoTradeStartRequest) -> dict[str, Any]:
     """Run one auto-trading cycle synchronously for tests or one-shot operation."""
+    req = _normalize_start_request(req)
     _validate_start_request(req)
     return {
         "execution_mode": req.execution_mode,
         "results": _run_cycle(req),
     }
+
+
+def _normalize_start_request(
+    req: AutoTradeStartRequest,
+    *,
+    force_config: bool = False,
+) -> AutoTradeStartRequest:
+    fields_set = getattr(req, "model_fields_set", set())
+    mode_explicit = None if force_config or "execution_mode" not in fields_set else req.execution_mode
+    provider_explicit = None if force_config or "broker_provider" not in fields_set else req.broker_provider
+    mode = settings.resolved_execution_mode(mode_explicit)
+    provider = settings.resolved_broker_provider(provider_explicit)
+    updates: dict[str, Any] = {}
+    if req.execution_mode != mode:
+        updates["execution_mode"] = mode
+    if req.broker_provider != provider:
+        updates["broker_provider"] = provider
+    if mode == "broker_paper" and req.auto_confirm_paper:
+        updates["auto_confirm_paper"] = False
+    return req.model_copy(update=updates) if updates else req
+
+
+def _stop_session_for_mode_transition(
+    session_id: str,
+    *,
+    old_execution_mode: str,
+    new_execution_mode: str,
+    reason: str,
+) -> dict[str, Any]:
+    stopped = stop_auto_trading(session_id)
+    event_payload = {
+        "old_session_id": session_id,
+        "old_execution_mode": old_execution_mode,
+        "new_execution_mode": new_execution_mode,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "reason": reason,
+    }
+    auto_trading_store.record_session_event(
+        session_id,
+        event_type="mode_transition",
+        status="stopped",
+        message="Session stopped because configured execution mode changed",
+        results=[event_payload],
+        update_last_results=False,
+    )
+    return {**stopped, **event_payload}
 
 
 def process_due_sessions(
@@ -305,6 +447,42 @@ def process_due_sessions(
     for session in sessions:
         try:
             req = auto_trading_store.load_request(session)
+            configured = settings.execution_mode_status()
+            if (
+                configured.get("configured_execution_mode")
+                and str(req.execution_mode) != configured["resolved_execution_mode"]
+            ):
+                stopped = auto_trading_store.stop_session(session["session_id"])
+                auto_trading_store.record_session_event(
+                    session["session_id"],
+                    event_type="mode_mismatch_stopped",
+                    status="stopped",
+                    message=(
+                        "Stopped active session because execution_mode differs "
+                        "from configured EXECUTION_MODE"
+                    ),
+                    results=[
+                        {
+                            "old_session_id": session["session_id"],
+                            "old_execution_mode": req.execution_mode,
+                            "new_execution_mode": configured["resolved_execution_mode"],
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "reason": "active_session_execution_mode_differs_from_config",
+                        }
+                    ],
+                    update_last_results=False,
+                )
+                processed.append(
+                    {
+                        "session_id": session["session_id"],
+                        "status": "stopped",
+                        "old_execution_mode": req.execution_mode,
+                        "new_execution_mode": configured["resolved_execution_mode"],
+                        "reason": "active_session_execution_mode_differs_from_config",
+                        "stopped_session": stopped,
+                    }
+                )
+                continue
             _validate_start_request(req)
             results = _run_cycle(req, session_id=session["session_id"])
             sync_result = _sync_live_account_if_needed(req)
@@ -2494,6 +2672,11 @@ def _run_symbol(
             price,
             price_result.get("price_data") or {},
         )
+        if req.execution_mode == "broker_paper" and symbol_cfg.requested_action != "exit":
+            cap = _cap_broker_paper_symbol_quantity(symbol_cfg, price)
+            if cap.get("status") == "blocked":
+                return cap
+            symbol_cfg = cap["symbol_cfg"]
         orderbook_check: dict[str, Any] | None = None
         if (
             settings.pretrade_orderbook_check_enabled
@@ -2629,11 +2812,28 @@ def _run_symbol(
         )
         return result
     except (OrderApprovalError, LiveTradingError, AutoTradingError) as exc:
-        return {
+        result = {
             "symbol": symbol_cfg.symbol,
             "status": "error",
             "message": str(exc),
         }
+        code = getattr(exc, "code", None)
+        if code:
+            result["broker_submit_block_code"] = code
+            result["broker_order_guard_code"] = code
+        details = getattr(exc, "details", None)
+        if isinstance(details, dict):
+            if details.get("broker_submit_blocked") is not None:
+                result["broker_submit_blocked"] = details.get("broker_submit_blocked")
+            if details.get("broker_submit_block_reason") is not None:
+                result["broker_submit_block_reason"] = details.get(
+                    "broker_submit_block_reason"
+                )
+            if details.get("broker_order_risk_limits") is not None:
+                result["broker_order_risk_limits"] = details.get(
+                    "broker_order_risk_limits"
+                )
+        return result
     except Exception as exc:
         return {
             "symbol": symbol_cfg.symbol,
@@ -2734,6 +2934,7 @@ def _to_live_order_request(
     side = str(preview["side"]).lower()
     return LiveOrderRequest(
         symbol=symbol_cfg.symbol,
+        name=symbol_cfg.name,
         market=symbol_cfg.market,
         broker_provider=req.broker_provider,
         strategy_type=symbol_cfg.strategy_type,
@@ -2751,6 +2952,7 @@ def _to_live_order_request(
             quantity=int(preview["quantity"]),
         ),
         session_id=session_id,
+        scan_id=symbol_cfg.scan_id,
         reason=f"auto-trading {preview.get('message')}",
         decision_price=symbol_cfg.decision_price or price,
         order_price=symbol_cfg.order_price or price,
@@ -2794,6 +2996,35 @@ def _auto_client_order_id(
     if not session_id:
         return None
     return f"auto:{session_id}:{symbol}:{side}:{int(price)}:{quantity}"
+
+
+def _cap_broker_paper_symbol_quantity(
+    symbol_cfg: AutoTradeSymbolConfig,
+    price: float,
+) -> dict[str, Any]:
+    max_order_krw = float(settings.broker_paper_risk_limits()["max_order_krw"])
+    if max_order_krw <= 0 or price <= 0:
+        return {"status": "ready", "symbol_cfg": symbol_cfg}
+    capped_qty = int(max_order_krw // float(price))
+    if capped_qty <= 0:
+        return {
+            "symbol": symbol_cfg.symbol,
+            "status": "blocked",
+            "message": "Broker paper max order KRW is below one share",
+            "broker_submit_blocked": True,
+            "broker_submit_block_reason": "broker_paper_max_order_below_minimum",
+            "broker_order_risk_limits": settings.broker_paper_risk_limits(),
+        }
+    if symbol_cfg.quantity is None or int(symbol_cfg.quantity) <= capped_qty:
+        return {"status": "ready", "symbol_cfg": symbol_cfg}
+    return {
+        "status": "ready",
+        "symbol_cfg": symbol_cfg.model_copy(update={"quantity": capped_qty}),
+        "broker_paper_quantity_capped": True,
+        "original_quantity": symbol_cfg.quantity,
+        "capped_quantity": capped_qty,
+        "max_order_krw": max_order_krw,
+    }
 
 
 def _resolve_loop_price(symbol_cfg: AutoTradeSymbolConfig) -> dict[str, Any]:

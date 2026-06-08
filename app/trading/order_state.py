@@ -55,12 +55,16 @@ CREATE TABLE IF NOT EXISTS broker_order_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    session_id TEXT,
+    scan_id TEXT,
     symbol TEXT NOT NULL,
+    name TEXT,
     side TEXT NOT NULL,
     qty INTEGER NOT NULL,
     order_type TEXT NOT NULL,
     limit_price REAL,
     submitted_price REAL,
+    notional_krw REAL,
     broker_provider TEXT NOT NULL,
     kis_is_paper INTEGER NOT NULL DEFAULT 0,
     execution_mode TEXT NOT NULL,
@@ -77,11 +81,27 @@ ON broker_order_events(symbol, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_broker_order_events_status_created
 ON broker_order_events(order_status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_broker_order_events_scan_symbol_side
+ON broker_order_events(scan_id, symbol, side, order_status);
 """
 
 
 PENDING_INTENT_STATUSES = ("PENDING", "SUBMITTED", "PARTIALLY_FILLED")
 PENDING_POSITION_STATES = ("ENTRY_PENDING", "EXIT_PENDING", "PARTIAL")
+ACTIVE_BROKER_ORDER_STATUSES = (
+    "submitted",
+    "accepted",
+    "unknown_pending",
+    "partially_filled",
+)
+COUNTED_BROKER_ORDER_STATUSES = (
+    "submitted",
+    "accepted",
+    "unknown_pending",
+    "partially_filled",
+    "filled",
+)
 
 
 class OrderStateError(ValueError):
@@ -479,23 +499,30 @@ def record_broker_order_event(
         cursor = conn.execute(
             """
             INSERT INTO broker_order_events (
-                created_at, updated_at, symbol, side, qty, order_type,
-                limit_price, submitted_price, broker_provider, kis_is_paper,
-                execution_mode, broker_order_id, broker_response_code,
+                created_at, updated_at, session_id, scan_id, symbol, name,
+                side, qty, order_type, limit_price, submitted_price, notional_krw,
+                broker_provider, kis_is_paper, execution_mode, broker_order_id,
+                broker_response_code,
                 broker_response_message, order_status, reject_reason,
                 raw_response_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created_at,
                 updated_at,
+                event.get("session_id"),
+                event.get("scan_id"),
                 str(event.get("symbol") or ""),
+                event.get("name"),
                 str(event.get("side") or "").lower(),
                 int(event.get("qty") or event.get("quantity") or 0),
                 str(event.get("order_type") or "limit"),
                 event.get("limit_price"),
                 event.get("submitted_price"),
+                event.get("notional_krw")
+                if event.get("notional_krw") is not None
+                else _event_notional(event),
                 str(event.get("broker_provider") or "kis").lower(),
                 1 if bool(event.get("kis_is_paper")) else 0,
                 str(event.get("execution_mode") or ""),
@@ -579,6 +606,129 @@ def get_position_state(
         _ensure_order_state_columns(conn)
         row = _get_position_state_row(conn, symbol)
     return _position_state_to_dict(row) if row else None
+
+
+def broker_paper_order_risk_limits() -> dict[str, Any]:
+    return settings.broker_paper_risk_limits()
+
+
+def validate_broker_paper_order(
+    req: LiveOrderRequest,
+    *,
+    name: str | None = None,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Return whether a broker_paper order passes DB-backed duplicate/risk limits."""
+    path = _db_path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = _now_dt()
+    today_start = datetime(now.year, now.month, now.day)
+    limits = broker_paper_order_risk_limits()
+    notional = float(req.price) * int(req.quantity)
+
+    with sqlite3.connect(path, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA_SQL)
+        _ensure_order_state_columns(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        block = _broker_paper_order_block(
+            conn=conn,
+            req=req,
+            notional=notional,
+            now=now,
+            today_start=today_start,
+            limits=limits,
+        )
+        conn.commit()
+
+    status = {
+        "approved": block is None,
+        "broker_submit_blocked": block is not None,
+        "broker_submit_block_reason": None if block is None else block["reason"],
+        "broker_submit_block_code": None if block is None else block["code"],
+        "notional_krw": notional,
+        "broker_order_risk_limits": limits,
+        "symbol": req.symbol,
+        "side": req.side,
+        "scan_id": req.scan_id,
+        "session_id": req.session_id,
+        "name": name,
+    }
+    if block:
+        status.update(block.get("details") or {})
+    return status
+
+
+def broker_paper_order_risk_snapshot(
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    path = _db_path(db_path)
+    limits = broker_paper_order_risk_limits()
+    default = {
+        "broker_order_risk_limits": limits,
+        "last_order_by_symbol": {},
+        "open_broker_order_count": 0,
+        "today_broker_order_count": 0,
+        "today_broker_notional_krw": 0.0,
+    }
+    if not path.exists():
+        return default
+    try:
+        now = _now_dt()
+        today_start = _format_dt(datetime(now.year, now.month, now.day))
+        active_statuses = ",".join("?" for _ in ACTIVE_BROKER_ORDER_STATUSES)
+        counted_statuses = ",".join("?" for _ in COUNTED_BROKER_ORDER_STATUSES)
+        with sqlite3.connect(path, timeout=2) as conn:
+            conn.row_factory = sqlite3.Row
+            if not _table_exists(conn, "broker_order_events"):
+                return default
+            _ensure_order_state_columns(conn)
+            open_count = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM broker_order_events
+                WHERE execution_mode = 'broker_paper'
+                  AND order_status IN ({active_statuses})
+                """,
+                ACTIVE_BROKER_ORDER_STATUSES,
+            ).fetchone()[0]
+            today = conn.execute(
+                f"""
+                SELECT COUNT(*), COALESCE(SUM(notional_krw), 0)
+                FROM broker_order_events
+                WHERE execution_mode = 'broker_paper'
+                  AND order_status IN ({counted_statuses})
+                  AND created_at >= ?
+                """,
+                (*COUNTED_BROKER_ORDER_STATUSES, today_start),
+            ).fetchone()
+            rows = conn.execute(
+                """
+                SELECT symbol, created_at, side, qty, submitted_price,
+                       notional_krw, broker_order_id, order_status, scan_id
+                FROM broker_order_events
+                WHERE execution_mode = 'broker_paper'
+                  AND symbol IS NOT NULL
+                  AND symbol <> ''
+                ORDER BY created_at DESC, id DESC
+                LIMIT 200
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return default
+    last_by_symbol: dict[str, Any] = {}
+    for row in rows:
+        symbol = str(row["symbol"])
+        if symbol in last_by_symbol:
+            continue
+        last_by_symbol[symbol] = dict(row)
+    return {
+        "broker_order_risk_limits": limits,
+        "last_order_by_symbol": last_by_symbol,
+        "open_broker_order_count": int(open_count or 0),
+        "today_broker_order_count": int(today[0] or 0) if today else 0,
+        "today_broker_notional_krw": float(today[1] or 0.0) if today else 0.0,
+    }
 
 
 def _update_intent(
@@ -718,12 +868,229 @@ def _transition_rejection(
     return None
 
 
+def _broker_paper_order_block(
+    *,
+    conn: sqlite3.Connection,
+    req: LiveOrderRequest,
+    notional: float,
+    now: datetime,
+    today_start: datetime,
+    limits: dict[str, Any],
+) -> dict[str, Any] | None:
+    if notional <= 0:
+        return _broker_block("notional_zero", "Order notional is zero")
+
+    max_order = float(limits.get("max_order_krw") or 0.0)
+    if max_order and notional > max_order:
+        return _broker_block(
+            "max_order_notional_exceeded",
+            "Broker paper max order notional exceeded",
+            {"notional_krw": notional, "max_order_krw": max_order},
+        )
+
+    if req.side == "buy":
+        active_statuses = ",".join("?" for _ in ACTIVE_BROKER_ORDER_STATUSES)
+        open_event = conn.execute(
+            f"""
+            SELECT *
+            FROM broker_order_events
+            WHERE execution_mode = 'broker_paper'
+              AND symbol = ?
+              AND side = 'buy'
+              AND order_status IN ({active_statuses})
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (req.symbol, *ACTIVE_BROKER_ORDER_STATUSES),
+        ).fetchone()
+        if open_event:
+            return _broker_block(
+                "open_broker_order_exists",
+                "Open broker order already exists for this symbol",
+                {"existing_broker_order_id": open_event["broker_order_id"]},
+            )
+
+        intent_statuses = ",".join("?" for _ in PENDING_INTENT_STATUSES)
+        open_intent = conn.execute(
+            f"""
+            SELECT *
+            FROM order_intents
+            WHERE symbol = ?
+              AND side = 'buy'
+              AND status IN ({intent_statuses})
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (req.symbol, *PENDING_INTENT_STATUSES),
+        ).fetchone()
+        if open_intent:
+            return _broker_block(
+                "open_order_intent_exists",
+                "Open order intent already exists for this symbol",
+                {"existing_intent_id": open_intent["id"]},
+            )
+
+        position_state = _get_position_state_row(conn, req.symbol)
+        if (
+            position_state
+            and str(position_state["state"]) == "LONG"
+            and not settings.allow_position_additions
+        ):
+            return _broker_block(
+                "already_position_exists",
+                "Position is already LONG; additions are disabled",
+                {"current_quantity": int(position_state["current_quantity"] or 0)},
+            )
+
+    if req.scan_id:
+        duplicate_scan = conn.execute(
+            """
+            SELECT *
+            FROM broker_order_events
+            WHERE scan_id = ?
+              AND symbol = ?
+              AND side = ?
+              AND order_status IN (
+                'submitted', 'accepted', 'unknown_pending',
+                'partially_filled', 'filled'
+              )
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (req.scan_id, req.symbol, req.side),
+        ).fetchone()
+        if duplicate_scan:
+            return _broker_block(
+                "duplicate_scan_symbol_side",
+                "Broker order already exists for this scan, symbol, and side",
+                {"scan_id": req.scan_id},
+            )
+
+    cooldown_days = int(limits.get("symbol_cooldown_days") or 0)
+    if cooldown_days > 0 and req.side == "buy":
+        since = _format_dt(now - timedelta(days=cooldown_days))
+        recent_symbol = conn.execute(
+            """
+            SELECT *
+            FROM broker_order_events
+            WHERE execution_mode = 'broker_paper'
+              AND symbol = ?
+              AND side = 'buy'
+              AND order_status IN (
+                'submitted', 'accepted', 'unknown_pending',
+                'partially_filled', 'filled'
+              )
+              AND created_at >= ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (req.symbol, since),
+        ).fetchone()
+        if recent_symbol:
+            return _broker_block(
+                "symbol_cooldown_active",
+                "Broker paper symbol cooldown is active",
+                {
+                    "cooldown_days": cooldown_days,
+                    "last_order_at": recent_symbol["created_at"],
+                },
+            )
+
+    today_text = _format_dt(today_start)
+    counted_statuses = ",".join("?" for _ in COUNTED_BROKER_ORDER_STATUSES)
+    daily = conn.execute(
+        f"""
+        SELECT COUNT(*), COALESCE(SUM(notional_krw), 0)
+        FROM broker_order_events
+        WHERE execution_mode = 'broker_paper'
+          AND order_status IN ({counted_statuses})
+          AND created_at >= ?
+        """,
+        (*COUNTED_BROKER_ORDER_STATUSES, today_text),
+    ).fetchone()
+    daily_count = int(daily[0] or 0) if daily else 0
+    daily_notional = float(daily[1] or 0.0) if daily else 0.0
+    max_daily_orders = int(limits.get("max_daily_orders") or 0)
+    if max_daily_orders and daily_count >= max_daily_orders:
+        return _broker_block(
+            "daily_order_limit_exceeded",
+            "Broker paper daily order limit reached",
+            {"today_broker_order_count": daily_count, "max_daily_orders": max_daily_orders},
+        )
+
+    max_daily_notional = float(limits.get("max_daily_notional_krw") or 0.0)
+    if max_daily_notional and daily_notional + notional > max_daily_notional:
+        return _broker_block(
+            "daily_notional_limit_exceeded",
+            "Broker paper daily notional limit exceeded",
+            {
+                "today_broker_notional_krw": daily_notional,
+                "order_notional_krw": notional,
+                "max_daily_notional_krw": max_daily_notional,
+            },
+        )
+
+    per_symbol = conn.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM broker_order_events
+        WHERE execution_mode = 'broker_paper'
+          AND symbol = ?
+          AND order_status IN ({counted_statuses})
+          AND created_at >= ?
+        """,
+        (req.symbol, *COUNTED_BROKER_ORDER_STATUSES, today_text),
+    ).fetchone()
+    per_symbol_count = int(per_symbol[0] or 0) if per_symbol else 0
+    max_per_symbol = int(limits.get("max_daily_orders_per_symbol") or 0)
+    if max_per_symbol and per_symbol_count >= max_per_symbol:
+        return _broker_block(
+            "daily_symbol_order_limit_exceeded",
+            "Broker paper daily per-symbol order limit reached",
+            {
+                "today_symbol_order_count": per_symbol_count,
+                "max_daily_orders_per_symbol": max_per_symbol,
+            },
+        )
+
+    return None
+
+
+def _broker_block(
+    code: str,
+    reason: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {"code": code, "reason": reason, "details": details or {}}
+
+
+def _event_notional(event: dict[str, Any]) -> float | None:
+    price = event.get("submitted_price") or event.get("limit_price")
+    qty = event.get("qty") or event.get("quantity")
+    try:
+        return float(price) * int(qty)
+    except (TypeError, ValueError):
+        return None
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return bool(row)
+
+
 def _ensure_order_state_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "order_intents", "quantity_before", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "order_intents", "quantity_after", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "order_intents", "filled_quantity", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "order_intents", "remaining_quantity", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "order_intents", "broker_order_no", "TEXT")
+    _ensure_column(conn, "broker_order_events", "session_id", "TEXT")
+    _ensure_column(conn, "broker_order_events", "scan_id", "TEXT")
+    _ensure_column(conn, "broker_order_events", "name", "TEXT")
+    _ensure_column(conn, "broker_order_events", "notional_krw", "REAL")
 
 
 def _ensure_column(
@@ -858,6 +1225,7 @@ def _request_fingerprint(req: LiveOrderRequest, now: datetime) -> str:
         "side": req.side,
         "price": req.price,
         "quantity": req.quantity,
+        "scan_id": req.scan_id,
     }
     digest = hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
     return f"live:{digest[:32]}"

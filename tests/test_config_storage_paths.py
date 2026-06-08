@@ -159,5 +159,10 @@ def _clear_storage_env(monkeypatch) -> None:
         "RENDER",
         "RENDER_SERVICE_ID",
         "RENDER_SERVICE_TYPE",
+        "EXECUTION_MODE",
+        "TRADING_EXECUTION_MODE",
+        "AUTO_TRADING_EXECUTION_MODE",
+        "DEFAULT_EXECUTION_MODE",
+        "BROKER_PROVIDER",
     ):
         monkeypatch.delenv(key, raising=False)

@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     # RENDER_DISK_MOUNT_PATH. If unset, common Render disk paths are detected.
     data_dir: str | None = None
     render_disk_mount_path: str | None = None
+    execution_mode: str | None = None
+    broker_provider: str | None = None
 
     # External APIs
     opendart_api_key: str | None = None
@@ -254,6 +256,11 @@ class Settings(BaseSettings):
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120
     allow_position_additions: bool = False
+    broker_paper_max_order_krw: float = 100_000.0
+    broker_paper_max_daily_orders: int = 3
+    broker_paper_max_daily_orders_per_symbol: int = 1
+    broker_paper_symbol_cooldown_days: int = 1
+    broker_paper_max_daily_notional_krw: float = 300_000.0
     dynamic_risk_limits_enabled: bool = True
     dynamic_risk_min_multiplier: float = 0.35
     dynamic_risk_max_multiplier: float = 1.15
@@ -397,6 +404,91 @@ class Settings(BaseSettings):
         ):
             path = Path(*path.parts[1:]) if len(path.parts) > 1 else Path(".")
         return root / path if root else path
+
+    def execution_mode_status(self, explicit: str | None = None) -> dict[str, Any]:
+        raw: str | None = None
+        source = "default"
+        if explicit:
+            raw = explicit
+            source = "request"
+        else:
+            for key in (
+                "EXECUTION_MODE",
+                "TRADING_EXECUTION_MODE",
+                "AUTO_TRADING_EXECUTION_MODE",
+                "DEFAULT_EXECUTION_MODE",
+            ):
+                value = os.getenv(key)
+                if value:
+                    raw = value
+                    source = key
+                    break
+            if raw is None and self.execution_mode:
+                raw = self.execution_mode
+                source = "settings.execution_mode"
+
+        mode = str(raw or "paper").strip().lower()
+        if mode not in {"paper", "broker_paper", "live"}:
+            logger.warning("Unknown EXECUTION_MODE=%s; falling back to paper", raw)
+            mode = "paper"
+            source = f"{source}:invalid"
+
+        return {
+            "configured_execution_mode": str(raw).strip().lower() if raw else None,
+            "resolved_execution_mode": mode,
+            "execution_mode_source": source,
+        }
+
+    def resolved_execution_mode(self, explicit: str | None = None) -> str:
+        return str(self.execution_mode_status(explicit).get("resolved_execution_mode"))
+
+    def broker_provider_status(self, explicit: str | None = None) -> dict[str, Any]:
+        raw: str | None = None
+        source = "default"
+        if explicit:
+            raw = explicit
+            source = "request"
+        else:
+            value = os.getenv("BROKER_PROVIDER")
+            if value:
+                raw = value
+                source = "BROKER_PROVIDER"
+            elif self.broker_provider:
+                raw = self.broker_provider
+                source = "settings.broker_provider"
+
+        provider = str(raw or "kis").strip().lower()
+        if provider != "kis":
+            logger.warning("Unknown BROKER_PROVIDER=%s; falling back to kis", raw)
+            provider = "kis"
+            source = f"{source}:invalid"
+        return {
+            "configured_broker_provider": str(raw).strip().lower() if raw else None,
+            "broker_provider": provider,
+            "broker_provider_source": source,
+        }
+
+    def resolved_broker_provider(self, explicit: str | None = None) -> str:
+        return str(self.broker_provider_status(explicit).get("broker_provider"))
+
+    def broker_paper_risk_limits(self) -> dict[str, Any]:
+        return {
+            "max_order_krw": max(0.0, float(self.broker_paper_max_order_krw or 0.0)),
+            "max_daily_orders": max(0, int(self.broker_paper_max_daily_orders or 0)),
+            "max_daily_orders_per_symbol": max(
+                0,
+                int(self.broker_paper_max_daily_orders_per_symbol or 0),
+            ),
+            "symbol_cooldown_days": max(
+                0,
+                int(self.broker_paper_symbol_cooldown_days or 0),
+            ),
+            "max_daily_notional_krw": max(
+                0.0,
+                float(self.broker_paper_max_daily_notional_krw or 0.0),
+            ),
+            "allow_position_additions": bool(self.allow_position_additions),
+        }
 
     def clear_storage_cache(self) -> None:
         """Clear resolved storage diagnostics. Intended for tests and env reloads."""

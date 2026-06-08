@@ -3165,6 +3165,7 @@ def _to_symbol_config(
             float(settings.universe_scanner_default_slippage_bps or 0.0),
         ),
         expected_holding_days=5.0,
+        scan_id=str(candidate.get("scan_id") or ""),
     )
 
 

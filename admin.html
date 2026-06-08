@@ -386,6 +386,7 @@
             <button data-action="events">Events</button>
             <button data-action="stopSession" class="danger">Stop Session</button>
             <button data-action="restartSession">Restart</button>
+            <button data-action="restartConfigured">Restart Config Mode</button>
           </div>
         </div>
       </section>
@@ -777,6 +778,7 @@
       events: () => ({ method: "GET", path: `/auto-trading/events/${sessionId()}?limit=50` }),
       stopSession: () => ({ method: "POST", path: `/auto-trading/stop/${sessionId()}` }),
       restartSession: () => ({ method: "POST", path: `/auto-trading/restart/${sessionId()}` }),
+      restartConfigured: { method: "POST", path: "/trading/restart", after: renderRestartConfigured },
       custom: customAction
     };
 
@@ -1115,6 +1117,13 @@
       renderSessions(data.sessions || []);
     }
 
+    function renderRestartConfigured(data) {
+      if (data && data.started_session && data.started_session.session_id) {
+        els.sessionId.value = data.started_session.session_id;
+      }
+      refreshRuntimeStatus({ quiet: true });
+    }
+
     function renderUniverse(data) {
       const storedCandidates = data.candidates || [];
       const candidates = storedCandidates.length ? storedCandidates : (data.final_candidates || []);
@@ -1344,6 +1353,9 @@
     }
 
     function executionModeDetail(summary) {
+      if (summary.session_mode_mismatch) {
+        return `restart required: active ${summary.active_session_execution_mode || "-"} vs configured ${summary.resolved_execution_mode || summary.execution_mode || "-"}`;
+      }
       if (summary.execution_mode === "paper") {
         return "orders are simulated internally only";
       }

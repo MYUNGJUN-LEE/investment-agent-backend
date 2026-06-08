@@ -47,6 +47,7 @@ from app.trading.auto_trading import (
     list_auto_trading_events,
     list_auto_trading_sessions,
     restart_auto_trading,
+    restart_trading_with_configured_mode,
     run_auto_trading_once,
     start_auto_trading,
     stop_auto_trading,
@@ -879,10 +880,20 @@ def admin_runtime_status(limit: int = 20):
 def _runtime_execution_summary_fields(status: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "execution_mode",
+        "configured_execution_mode",
+        "resolved_execution_mode",
+        "execution_mode_source",
         "broker_provider",
+        "configured_broker_provider",
+        "broker_provider_source",
         "kis_is_paper",
         "submits_to_broker",
         "uses_internal_paper_orders",
+        "active_session_execution_mode",
+        "session_mode_mismatch",
+        "session_mode_mismatch_reason",
+        "requires_session_restart",
+        "broker_submit_enabled",
         "configured_data_dir",
         "resolved_data_dir",
         "data_dir_writable",
@@ -898,11 +909,22 @@ def _runtime_execution_summary_fields(status: dict[str, Any]) -> dict[str, Any]:
         "latest_broker_order_event",
         "last_broker_submit_at",
         "last_broker_sync_at",
+        "last_broker_sync_error",
         "last_broker_submit_error",
         "broker_submit_blocked",
         "broker_submit_block_reason",
+        "broker_submit_block_code",
         "broker_submit_status",
         "broker_execution_status",
+        "dedupe_blocked_count",
+        "open_order_blocked_count",
+        "already_position_blocked_count",
+        "daily_order_limit_blocked_count",
+        "broker_order_risk_limits",
+        "last_order_by_symbol",
+        "open_broker_order_count",
+        "today_broker_order_count",
+        "today_broker_notional_krw",
         "candidate_status",
         "planner_status",
         "auto_trading_db_missing",
@@ -1502,6 +1524,24 @@ def get_trading_execution_status(
         execution_mode=execution_mode,
         sample_limit=limit,
     )
+
+
+@app.post(
+    "/trading/restart",
+    dependencies=[Depends(verify_api_key)],
+    operation_id="restartTradingUsingConfiguredMode",
+    summary="Restart trading sessions using the configured execution mode",
+)
+@app.post(
+    "/trading/restart/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+def restart_trading_configured_mode():
+    try:
+        return restart_trading_with_configured_mode()
+    except AutoTradingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 @app.get(

@@ -167,6 +167,7 @@ class PaperRunResponse(BaseModel):
 
 class LiveOrderRequest(BaseModel):
     symbol: str = Field(..., description="Stock ticker code, e.g. 005930")
+    name: str | None = Field(None, description="Company name")
     market: Market = "KR"
     broker_provider: BrokerProvider = "kis"
     strategy_type: StrategyType = "daytrade"
@@ -186,6 +187,10 @@ class LiveOrderRequest(BaseModel):
     session_id: str | None = Field(
         None,
         description="Optional auto-trading session id for order-state tracing.",
+    )
+    scan_id: str | None = Field(
+        None,
+        description="Optional universe scanner run id for broker order dedupe.",
     )
     reason: str | None = None
     signal_time: str | None = None
@@ -367,6 +372,7 @@ class AutoTradeSymbolConfig(BaseModel):
     regime_gate: dict[str, Any] | None = None
     signal_decay: dict[str, Any] | None = None
     final_entry_edge: float | None = None
+    scan_id: str | None = None
 
 
 class AutoTradeStartRequest(BaseModel):
