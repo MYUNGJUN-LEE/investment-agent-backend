@@ -91,6 +91,185 @@ def test_kospi_loader_falls_back_to_cache_when_configured_csv_missing(tmp_path, 
     assert {item["source_detail"] for item in symbols} == {"pytest"}
 
 
+def test_kospi_loader_uses_builtin_fallback_when_csv_and_cache_missing(
+    tmp_path,
+    monkeypatch,
+):
+    missing_csv = tmp_path / "missing_kospi_symbols.csv"
+    missing_cache = tmp_path / "missing_kospi.sqlite3"
+    monkeypatch.setattr(kospi_universe.settings, "universe_include_kospi", True)
+    monkeypatch.setattr(kospi_universe.settings, "universe_kospi_symbol_source", "csv")
+    monkeypatch.setattr(kospi_universe.settings, "universe_kospi_csv_path", str(missing_csv))
+    monkeypatch.setattr(kospi_universe.settings, "universe_kospi_cache_path", str(missing_cache))
+    monkeypatch.setattr(
+        kospi_universe.settings,
+        "universe_kospi_builtin_fallback_enabled",
+        True,
+    )
+
+    symbols = kospi_universe.load_kospi_symbols(scan_all=True)
+
+    assert len(symbols) >= 20
+    assert symbols[0]["source_detail"] == "builtin"
+    assert {"005930", "000660", "005380"}.issubset(
+        {item["symbol"] for item in symbols}
+    )
+    assert {item["market"] for item in symbols} == {"KOSPI"}
+
+
+def test_default_auto_discover_sources_include_kospi_and_kosdaq_without_files(
+    tmp_path,
+    monkeypatch,
+):
+    missing_csv = tmp_path / "missing_kospi_symbols.csv"
+    missing_cache = tmp_path / "missing_kospi.sqlite3"
+    monkeypatch.setattr(universe_scanner.settings, "universe_include_kospi", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_symbol_source", "csv")
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_scan_all", True)
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_kospi_builtin_fallback_enabled",
+        True,
+    )
+    monkeypatch.setattr(universe_scanner.settings, "universe_full_scan_enabled", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_full_scan_max_symbols", 0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_csv_path", str(missing_csv))
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_cache_path", str(missing_cache))
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 1)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_seed_symbols", "")
+    monkeypatch.setattr(universe_scanner.settings, "monitor_watchlist_symbols", "")
+
+    source_symbols, diagnostics = universe_scanner._resolve_source_symbols_with_diagnostics(
+        AutoTradeStartRequest(auto_discover_symbols=True)
+    )
+
+    assert diagnostics["kospi_symbols_loaded"] >= 20
+    assert diagnostics["kospi_source_symbol_count"] >= 20
+    assert diagnostics["kosdaq_source_symbol_count"] == len(universe_scanner.DEFAULT_UNIVERSE)
+    assert diagnostics["full_kospi_scan"] is True
+    assert diagnostics["max_source_cap_bypassed_for_full_kospi"] is True
+    assert diagnostics["source_detail_counts"]["builtin"] >= 20
+    assert "005930" in source_symbols
+    assert "035900" in source_symbols
+
+
+def test_auto_discover_scan_applies_builtin_kospi_fallback_to_trade_plan(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "universe.sqlite3"
+    missing_csv = tmp_path / "missing_kospi_symbols.csv"
+    missing_cache = tmp_path / "missing_kospi.sqlite3"
+    builtin_kospi = {
+        "005930": "Samsung Electronics",
+        "000660": "SK hynix",
+    }
+    monkeypatch.setattr(kospi_universe, "BUILTIN_KOSPI_UNIVERSE", builtin_kospi)
+    monkeypatch.setattr(universe_scanner.settings, "universe_include_kospi", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_symbol_source", "csv")
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_scan_all", True)
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "universe_kospi_builtin_fallback_enabled",
+        True,
+    )
+    monkeypatch.setattr(universe_scanner.settings, "universe_full_scan_enabled", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_full_scan_max_symbols", 4)
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_csv_path", str(missing_csv))
+    monkeypatch.setattr(universe_scanner.settings, "universe_kospi_cache_path", str(missing_cache))
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_candidate_limit", 4)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_final_limit", 2)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_symbol_interval_seconds", 0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_worker_hurdle_rate_bps", 0)
+    monkeypatch.setattr(universe_scanner, "_is_kr_regular_market_open", lambda: True)
+    monkeypatch.setattr(universe_scanner, "_paper_average_realized_return_bps", lambda: None)
+    monkeypatch.setattr(
+        universe_scanner,
+        "edge_entry_gate",
+        lambda candidates=None: {
+            "status": "approved",
+            "approved": True,
+            "message": "test gate approved",
+        },
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "estimate_expected_edges",
+        lambda candidate, raw_score, model=None: {
+            "expected_return": 700.0,
+            "expected_risk": 90.0,
+            "edge_model": "pytest",
+        },
+    )
+
+    def fake_fetch_price_data(symbol: str, *, include_intraday=True) -> dict:
+        is_kospi = symbol in builtin_kospi
+        price = 70_000 if is_kospi else 30_000
+        return {
+            "symbol": symbol,
+            "name": builtin_kospi.get(symbol) or universe_scanner.DEFAULT_UNIVERSE.get(symbol),
+            "current_price": price,
+            "change_rate": 2.4 if is_kospi else 1.8,
+            "volume": 3_000_000,
+            "volume_ratio": 2.2,
+            "turnover_value": 90_000_000_000,
+            "market_cap": 1_000_000_000_000,
+            "market_segment": "KOSPI" if is_kospi else "KOSDAQ",
+            "intraday": {"minute_volume_ratio": 1.6},
+            "latest_technical_features": {
+                "close": price,
+                "return_5d": 0.04,
+                "return_20d": 0.08,
+                "return_60d": 0.15,
+                "high_breakout_20d": True,
+                "low_breakdown_20d": False,
+                "ma5": price,
+                "ma20": price * 0.98,
+                "ma60": price * 0.94,
+                "ma20_slope": 120,
+                "atr_14": price * 0.025,
+                "atr_14_pct": 0.025,
+            },
+            "technical_features": [
+                {"close": price * 0.99, "atr_14": price * 0.025},
+                {"close": price, "atr_14": price * 0.025},
+            ],
+            "overheated": False,
+            "source": "pytest",
+        }
+
+    monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
+    monkeypatch.setattr(
+        universe_scanner,
+        "search_naver_news",
+        lambda query, display=5, sort="date": {"items": [{"title": query}]},
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "fetch_opendart_disclosures",
+        lambda symbol, lookback_hours: [],
+    )
+
+    result = universe_scanner.scan_universe_for_auto_trade(
+        AutoTradeStartRequest(
+            auto_discover_symbols=True,
+            universe_candidate_limit=4,
+            universe_final_limit=2,
+        ),
+        db_path=db_path,
+    )
+
+    assert result["kospi_source_symbol_count"] == 2
+    assert result["kosdaq_source_symbol_count"] == 2
+    assert result["kospi_snapshot_count"] == 2
+    assert result["kosdaq_snapshot_count"] == 2
+    assert result["symbols"]
+    assert {item["market_segment"] for item in result["final_candidates"]}.issubset(
+        {"KOSPI", "KOSDAQ"}
+    )
+    assert any(item["market_segment"] == "KOSPI" for item in result["candidates"])
+
+
 def test_auto_discover_scan_includes_known_kospi_common_stocks(tmp_path, monkeypatch):
     db_path = tmp_path / "universe.sqlite3"
     csv_path = tmp_path / "kospi_symbols.csv"
@@ -242,6 +421,7 @@ def test_auto_discover_scan_includes_known_kospi_common_stocks(tmp_path, monkeyp
 
 def test_universe_scanner_scores_stores_and_returns_final_symbols(tmp_path, monkeypatch):
     db_path = tmp_path / "universe.sqlite3"
+    monkeypatch.setattr(universe_scanner.settings, "universe_include_kospi", False)
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_seed_symbols", "")
     monkeypatch.setattr(universe_scanner.settings, "monitor_watchlist_symbols", "")
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 3)
@@ -887,6 +1067,7 @@ def test_universe_scanner_excludes_missing_current_price_before_scoring(
     monkeypatch,
 ):
     db_path = tmp_path / "universe.sqlite3"
+    monkeypatch.setattr(universe_scanner.settings, "universe_include_kospi", False)
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_seed_symbols", "")
     monkeypatch.setattr(universe_scanner.settings, "monitor_watchlist_symbols", "")
     monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 1)

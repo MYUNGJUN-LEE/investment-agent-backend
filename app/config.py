@@ -319,6 +319,7 @@ class Settings(BaseSettings):
     universe_kospi_symbol_source: str = "csv"
     universe_kospi_scan_all: bool = True
     universe_kospi_symbol_limit: int = 0
+    universe_kospi_builtin_fallback_enabled: bool = True
     universe_kospi_cache_path: str = "data/kospi_symbols.sqlite3"
     universe_kospi_csv_path: str = "data/kospi_symbols.csv"
     universe_kospi_cache_ttl_seconds: int = 86400

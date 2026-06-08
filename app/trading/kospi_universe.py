@@ -31,6 +31,75 @@ CREATE TABLE IF NOT EXISTS kospi_symbols_meta (
 );
 """
 
+BUILTIN_KOSPI_UNIVERSE: dict[str, str] = {
+    "005930": "Samsung Electronics",
+    "000660": "SK hynix",
+    "373220": "LG Energy Solution",
+    "207940": "Samsung Biologics",
+    "005380": "Hyundai Motor",
+    "000270": "Kia",
+    "068270": "Celltrion",
+    "105560": "KB Financial Group",
+    "055550": "Shinhan Financial Group",
+    "035420": "NAVER",
+    "035720": "Kakao",
+    "012330": "Hyundai Mobis",
+    "005490": "POSCO Holdings",
+    "028260": "Samsung C&T",
+    "051910": "LG Chem",
+    "006400": "Samsung SDI",
+    "086790": "Hana Financial Group",
+    "032830": "Samsung Life Insurance",
+    "033780": "KT&G",
+    "066570": "LG Electronics",
+    "003550": "LG Corp",
+    "096770": "SK Innovation",
+    "034730": "SK Inc",
+    "015760": "Korea Electric Power",
+    "017670": "SK Telecom",
+    "009150": "Samsung Electro-Mechanics",
+    "010130": "Korea Zinc",
+    "018260": "Samsung SDS",
+    "011200": "HMM",
+    "009540": "HD Korea Shipbuilding & Offshore Engineering",
+    "010140": "Samsung Heavy Industries",
+    "267260": "HD Hyundai Electric",
+    "042660": "Hanwha Ocean",
+    "047810": "Korea Aerospace Industries",
+    "000810": "Samsung Fire & Marine Insurance",
+    "024110": "Industrial Bank of Korea",
+    "316140": "Woori Financial Group",
+    "086280": "Hyundai Glovis",
+    "090430": "Amorepacific",
+    "251270": "Netmarble",
+    "010950": "S-Oil",
+    "010060": "OCI Holdings",
+    "000720": "Hyundai Engineering & Construction",
+    "011070": "LG Innotek",
+    "003670": "POSCO Future M",
+    "034020": "Doosan Enerbility",
+    "005830": "DB Insurance",
+    "071050": "Korea Investment Holdings",
+    "078930": "GS Holdings",
+    "030200": "KT",
+    "021240": "Coway",
+    "032640": "LG Uplus",
+    "011780": "Kumho Petrochemical",
+    "006800": "Mirae Asset Securities",
+    "138040": "Meritz Financial Group",
+    "402340": "SK Square",
+    "259960": "Krafton",
+    "035250": "Kangwon Land",
+    "161390": "Hankook Tire & Technology",
+    "271560": "Orion",
+    "028050": "Samsung E&A",
+    "000100": "Yuhan",
+    "097950": "CJ CheilJedang",
+    "241560": "Doosan Bobcat",
+    "047050": "POSCO International",
+    "006260": "LS Corp",
+}
+
 
 def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
@@ -306,6 +375,10 @@ def kospi_universe_cache_status(
         "cache_path": str(cache_path),
         "csv_path": str(csv_file),
         "csv_exists": csv_file.exists(),
+        "builtin_fallback_enabled": bool(
+            settings.universe_kospi_builtin_fallback_enabled
+        ),
+        "builtin_count": len(BUILTIN_KOSPI_UNIVERSE),
     }
 
     if not cache_path.exists():
@@ -377,6 +450,25 @@ def _load_from_existing_kis_helper(limit: int | None) -> list[dict[str, Any]]:
     return items
 
 
+def load_builtin_kospi_symbols(
+    *,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    if not bool(settings.universe_kospi_builtin_fallback_enabled):
+        return []
+    items = [
+        {
+            "symbol": symbol,
+            "name": name,
+            "market": "KOSPI",
+            "source": "kospi",
+            "source_detail": "builtin",
+        }
+        for symbol, name in BUILTIN_KOSPI_UNIVERSE.items()
+    ]
+    return _apply_limit(items, limit)
+
+
 def load_kospi_symbols(
     *,
     limit: int | None = None,
@@ -418,9 +510,9 @@ def _kospi_source_order(source: str) -> list[str]:
     source = str(source or "").strip().lower()
     if source == "disabled":
         return []
-    preferred = source if source in {"cache", "csv", "kis"} else "cache"
+    preferred = source if source in {"cache", "csv", "kis", "builtin"} else "cache"
     ordered = [preferred]
-    for fallback in ("cache", "csv", "kis"):
+    for fallback in ("cache", "csv", "kis", "builtin"):
         if fallback not in ordered:
             ordered.append(fallback)
     return ordered
@@ -436,4 +528,6 @@ def _load_kospi_symbols_from_source(
         return load_kospi_symbols_from_csv(limit=limit)
     if source == "kis":
         return _load_from_existing_kis_helper(limit)
+    if source == "builtin":
+        return load_builtin_kospi_symbols(limit=limit)
     return []
