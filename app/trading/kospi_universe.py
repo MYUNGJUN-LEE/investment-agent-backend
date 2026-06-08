@@ -382,6 +382,15 @@ def kospi_universe_cache_status(
     }
 
     if not cache_path.exists():
+        if bool(settings.universe_kospi_builtin_fallback_enabled):
+            return {
+                **cache_status,
+                "status": "builtin_fallback",
+                "cached_count": 0,
+                "message": (
+                    "KOSPI CSV/cache is missing; using built-in KOSPI fallback universe."
+                ),
+            }
         return {**cache_status, "status": "missing", "cached_count": 0}
 
     try:

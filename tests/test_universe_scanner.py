@@ -108,8 +108,11 @@ def test_kospi_loader_uses_builtin_fallback_when_csv_and_cache_missing(
     )
 
     symbols = kospi_universe.load_kospi_symbols(scan_all=True)
+    status = kospi_universe.kospi_universe_cache_status()
 
     assert len(symbols) >= 20
+    assert status["status"] == "builtin_fallback"
+    assert status["builtin_fallback_enabled"] is True
     assert symbols[0]["source_detail"] == "builtin"
     assert {"005930", "000660", "005380"}.issubset(
         {item["symbol"] for item in symbols}
