@@ -1007,6 +1007,109 @@ def test_broker_paper_observe_only_final_candidate_path_counts_executable(monkey
     assert executable_count == 1
 
 
+def test_latest_universe_scan_broker_paper_overlay_marks_stale_psk_ready(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "universe.sqlite3"
+    monkeypatch.setattr(
+        universe_scanner,
+        "edge_entry_gate",
+        lambda candidates=None, execution_mode=None: {
+            "status": "bootstrap_observe_only",
+            "approved": True,
+            "message": (
+                "Candidate label calibration gate failed, but broker_paper "
+                "bootstrap observe-only mode allowed entry because "
+                "broker_paper_fill_sample_count 0/200."
+            ),
+            "broker_paper_bootstrap_allowed": True,
+            "broker_paper_candidate_label_gate_mode": "observe_only",
+            "candidate_label_gate_failed": True,
+            "candidate_label_gate_hard_blocking": False,
+            "broker_paper_fill_sample_count": 0,
+            "broker_paper_min_fill_samples": 200,
+            "broker_paper_fill_gate_blocked": False,
+            "calibration_gate_mode": (
+                "broker_paper_bootstrap_candidate_label_observe_only"
+            ),
+        },
+    )
+    stale_psk = {
+        "symbol": "319660",
+        "name": "PSK",
+        "rank": 1,
+        "score": 92.0,
+        "raw_score": 92.0,
+        "expected_return": 360.0,
+        "expected_risk": 60.0,
+        "trading_cost": 20.0,
+        "slippage_cost": 10.0,
+        "net_edge": 330.0,
+        "composite_score": 92.0,
+        "decision": "buy_candidate",
+        "status": "SKIPPED",
+        "reason": (
+            "composite momentum; Calibration performance gate blocked entries: "
+            "sample_count 281/600"
+        ),
+        "current_price": 20_000,
+        "change_rate": 3.0,
+        "volume": 1_000_000,
+        "volume_ratio": 2.0,
+        "turnover_value": 80_000_000_000,
+        "expires_at": "2026-06-10T15:00:00",
+        "large_cap_top10_gate": {"passed": True},
+        "edge_reward_risk": {
+            "expected_value_after_cost_bps": 100.0,
+            "reward_risk_ratio": 2.0,
+        },
+    }
+    universe_scanner.initialize_universe_db(db_path)
+    result = {
+        "scan_id": "scan-pytest-stale-psk",
+        "created_at": "2026-06-10T09:00:00",
+        "source_symbol_count": 1,
+        "candidate_limit": 1,
+        "final_limit": 1,
+        "status": "success",
+        "candidate_count": 1,
+        "final_count": 1,
+        "executable_count": 0,
+        "candidates": [stale_psk],
+        "final_candidates": [stale_psk],
+        "ready_candidates": [],
+        "symbols": [],
+    }
+    universe_scanner._record_scan_run(db_path, result)
+    universe_scanner._record_scanner_candidates(
+        path=db_path,
+        scan_id=result["scan_id"],
+        scan_time=result["created_at"],
+        candidates=[stale_psk],
+        execution_limit=1,
+    )
+
+    stored = universe_scanner.get_latest_universe_scan(db_path)
+    overlaid = universe_scanner.get_latest_universe_scan(
+        db_path,
+        execution_mode="broker_paper",
+    )
+
+    assert stored["executable_count"] == 0
+    assert stored["final_candidates"][0]["status"] == "SKIPPED"
+    assert overlaid["stored_executable_count"] == 0
+    assert overlaid["executable_count"] == 1
+    assert overlaid["ready_candidates"][0]["symbol"] == "319660"
+    assert overlaid["final_candidates"][0]["status"] == "READY"
+    assert overlaid["final_candidates"][0]["broker_paper_executable"] is True
+    assert (
+        overlaid["final_candidates"][0]["calibration_gate_mode"]
+        == "broker_paper_bootstrap_candidate_label_observe_only"
+    )
+    assert "broker_paper executable" in overlaid["final_candidates"][0]["reason"]
+
+
 def test_paper_promotes_safe_exclude_to_watch_only(monkeypatch):
     monkeypatch.setattr(
         universe_scanner.settings,

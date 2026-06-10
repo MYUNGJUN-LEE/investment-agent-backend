@@ -700,8 +700,8 @@ def scan_universe_and_refresh_samples(
     operation_id="getLatestUniverseScan",
     summary="Get the latest stored universe scanner result",
 )
-def latest_trading_universe():
-    return get_latest_universe_scan()
+def latest_trading_universe(execution_mode: str | None = None):
+    return get_latest_universe_scan(execution_mode=execution_mode)
 
 @app.post(
     "/edge-calibration/reset",
@@ -850,11 +850,13 @@ def admin_runtime_status(limit: int = 20):
         GptAutoTradeControlRequest(command="status")
     )
     samples = get_edge_training_sample_summary(limit=limit)
-    latest_universe = get_latest_universe_scan()
     workers = embedded_worker_status()
     raw_active_sessions = auto_trading_store.list_sessions(status="active", limit=50)
     auto_tuning = latest_auto_tuning_recommendation()
     trading_status = trading_status_snapshot(sample_limit=limit)
+    latest_universe = get_latest_universe_scan(
+        execution_mode=trading_status.get("execution_mode")
+    )
     summary = _admin_runtime_summary(
         generated_at=generated_at,
         auto_status=auto_status,

@@ -375,7 +375,10 @@ def scan_universe_for_auto_trade(
     return result
 
 
-def get_latest_universe_scan(db_path: Path | str | None = None) -> dict[str, Any]:
+def get_latest_universe_scan(
+    db_path: Path | str | None = None,
+    execution_mode: str | None = None,
+) -> dict[str, Any]:
     path = _db_path(db_path)
     initialize_universe_db(path)
     with _connect(path, row_factory=True) as conn:
@@ -405,7 +408,113 @@ def get_latest_universe_scan(db_path: Path | str | None = None) -> dict[str, Any
         ).fetchall()
     raw = _parse_json(run["raw_json"], {})
     raw["candidates"] = [dict(row) for row in candidates]
-    return raw
+    return _apply_runtime_execution_overlay(raw, execution_mode=execution_mode)
+
+
+def _apply_runtime_execution_overlay(
+    scan: dict[str, Any],
+    *,
+    execution_mode: str | None,
+) -> dict[str, Any]:
+    mode = str(execution_mode or "").strip().lower()
+    if mode not in {"broker_paper", "live", "paper"}:
+        return scan
+    if mode != "broker_paper":
+        return scan
+
+    final_candidates = [
+        dict(item)
+        for item in (
+            scan.get("final_candidates")
+            or scan.get("candidates")
+            or []
+        )
+        if isinstance(item, dict)
+    ]
+    if not final_candidates:
+        return scan
+
+    try:
+        entry_gate = _edge_entry_gate_for_mode(
+            final_candidates,
+            execution_mode=mode,
+        )
+    except Exception as exc:
+        return {
+            **scan,
+            "runtime_execution_mode": mode,
+            "execution_mode_overlay_applied": False,
+            "execution_mode_overlay_error": str(exc),
+        }
+
+    final_limit = max(
+        1,
+        int(
+            _to_int(scan.get("final_limit"))
+            or len(final_candidates)
+            or settings.universe_scanner_final_limit
+            or 10
+        ),
+    )
+    hurdle_rate = _worker_hurdle_rate_bps(mode)
+    overlaid: list[dict[str, Any]] = []
+    for index, candidate in enumerate(final_candidates, start=1):
+        rank = _to_int(candidate.get("rank")) or index
+        status, reason = _execution_status_for_candidate(
+            candidate,
+            rank=rank,
+            execution_limit=final_limit,
+            hurdle_rate=hurdle_rate,
+            entry_gate=entry_gate,
+            execution_mode=mode,
+        )
+        overlaid.append(
+            {
+                **candidate,
+                "rank": rank,
+                "status": status,
+                "reason": reason,
+                "broker_paper_bootstrap_allowed": bool(
+                    entry_gate.get("broker_paper_bootstrap_allowed")
+                ),
+                "candidate_label_calibration_gate_mode": entry_gate.get(
+                    "broker_paper_candidate_label_gate_mode"
+                ),
+                "candidate_label_calibration_gate_failed": bool(
+                    entry_gate.get("candidate_label_gate_failed")
+                ),
+                "candidate_label_calibration_gate_hard_blocking": bool(
+                    entry_gate.get("candidate_label_gate_hard_blocking")
+                ),
+                "broker_paper_fill_gate_blocked": bool(
+                    entry_gate.get("broker_paper_fill_gate_blocked")
+                ),
+                "broker_paper_fill_sample_count": entry_gate.get(
+                    "broker_paper_fill_sample_count"
+                ),
+                "broker_paper_min_fill_samples": entry_gate.get(
+                    "broker_paper_min_fill_samples"
+                ),
+                "broker_paper_executable": bool(status == "READY"),
+                "calibration_gate_mode": entry_gate.get("calibration_gate_mode"),
+            }
+        )
+
+    ready_candidates = [item for item in overlaid if item.get("status") == "READY"]
+    return {
+        **scan,
+        "runtime_execution_mode": mode,
+        "execution_mode_overlay_applied": True,
+        "stored_executable_count": scan.get("executable_count"),
+        "executable_count": len(ready_candidates),
+        "final_candidates": _compact_candidates(overlaid),
+        "ready_candidates": _compact_candidates(ready_candidates),
+        "active_candidate_symbols": [
+            item.get("symbol")
+            for item in overlaid
+            if item.get("status") in {"READY", "CLAIMED"}
+        ],
+    }
 
 
 def _reuse_recent_scan_if_fresh(
@@ -3275,6 +3384,29 @@ def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
                 "corporate_event_check": item.get("corporate_event_check"),
                 "paper_bootstrap_soft_pass": item.get("paper_bootstrap_soft_pass"),
                 "paper_promoted_to_watch": item.get("paper_promoted_to_watch"),
+                "broker_paper_bootstrap_allowed": item.get(
+                    "broker_paper_bootstrap_allowed"
+                ),
+                "candidate_label_calibration_gate_mode": item.get(
+                    "candidate_label_calibration_gate_mode"
+                ),
+                "candidate_label_calibration_gate_failed": item.get(
+                    "candidate_label_calibration_gate_failed"
+                ),
+                "candidate_label_calibration_gate_hard_blocking": item.get(
+                    "candidate_label_calibration_gate_hard_blocking"
+                ),
+                "broker_paper_fill_gate_blocked": item.get(
+                    "broker_paper_fill_gate_blocked"
+                ),
+                "broker_paper_fill_sample_count": item.get(
+                    "broker_paper_fill_sample_count"
+                ),
+                "broker_paper_min_fill_samples": item.get(
+                    "broker_paper_min_fill_samples"
+                ),
+                "broker_paper_executable": item.get("broker_paper_executable"),
+                "calibration_gate_mode": item.get("calibration_gate_mode"),
                 "claimed_by_worker": item.get("claimed_by_worker"),
                 "expires_at": item.get("expires_at"),
             }
