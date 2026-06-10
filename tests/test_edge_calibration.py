@@ -802,6 +802,156 @@ def test_paper_and_live_gate_use_two_bps_top10_average(monkeypatch):
     assert live_gate["required"]["min_top10_avg_return_bps"] == 2
 
 
+def test_broker_paper_bootstrap_makes_candidate_label_gate_observe_only(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(edge_calibration.settings, "kis_is_paper", True)
+    monkeypatch.setattr(edge_calibration.settings, "broker_paper_bootstrap_enabled", True)
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "broker_paper_calibration_source",
+        "broker_fills",
+    )
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "broker_paper_candidate_label_gate_mode",
+        "observe_only",
+    )
+    monkeypatch.setattr(edge_calibration.settings, "broker_paper_min_fill_samples", 200)
+    monkeypatch.setattr(edge_calibration.settings, "broker_paper_min_oos_fill_samples", 50)
+    monkeypatch.setattr(edge_calibration.settings, "broker_sync_db_path", str(tmp_path / "broker.sqlite3"))
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "outcome_attribution_db_path",
+        str(tmp_path / "outcomes.sqlite3"),
+    )
+
+    gate = edge_calibration.edge_entry_gate(
+        calibration_db_path=tmp_path / "missing_edge.sqlite3",
+        execution_mode="broker_paper",
+    )
+
+    assert gate["approved"] is True
+    assert gate["status"] == "bootstrap_observe_only"
+    assert gate["candidate_label_gate_failed"] is True
+    assert gate["candidate_label_gate_hard_blocking"] is False
+    assert gate["broker_paper_fill_sample_count"] == 0
+    assert gate["broker_paper_fill_gate_ready"] is False
+    assert gate["broker_paper_fill_gate_hard_blocking"] is False
+    assert (
+        gate["calibration_gate_mode"]
+        == "broker_paper_bootstrap_candidate_label_observe_only"
+    )
+    assert "broker_paper bootstrap observe-only" in gate["message"]
+
+
+def test_broker_paper_bootstrap_disabled_keeps_candidate_label_hard_blocking(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(edge_calibration.settings, "kis_is_paper", True)
+    monkeypatch.setattr(edge_calibration.settings, "broker_paper_bootstrap_enabled", False)
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "broker_paper_calibration_source",
+        "broker_fills",
+    )
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "broker_paper_candidate_label_gate_mode",
+        "observe_only",
+    )
+    monkeypatch.setattr(edge_calibration.settings, "broker_sync_db_path", str(tmp_path / "broker.sqlite3"))
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "outcome_attribution_db_path",
+        str(tmp_path / "outcomes.sqlite3"),
+    )
+
+    gate = edge_calibration.edge_entry_gate(
+        calibration_db_path=tmp_path / "missing_edge.sqlite3",
+        execution_mode="broker_paper",
+    )
+
+    assert gate["approved"] is False
+    assert gate["candidate_label_gate_failed"] is True
+    assert gate["candidate_label_gate_hard_blocking"] is True
+    assert gate["calibration_gate_mode"] == "candidate_label_hard_blocking"
+
+
+def test_live_mode_keeps_candidate_label_gate_hard_blocking(tmp_path, monkeypatch):
+    monkeypatch.setattr(edge_calibration.settings, "kis_is_paper", True)
+    monkeypatch.setattr(edge_calibration.settings, "broker_paper_bootstrap_enabled", True)
+    monkeypatch.setattr(edge_calibration.settings, "broker_sync_db_path", str(tmp_path / "broker.sqlite3"))
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "outcome_attribution_db_path",
+        str(tmp_path / "outcomes.sqlite3"),
+    )
+
+    gate = edge_calibration.edge_entry_gate(
+        calibration_db_path=tmp_path / "missing_edge.sqlite3",
+        execution_mode="live",
+    )
+
+    assert gate["approved"] is False
+    assert gate["candidate_label_gate_failed"] is True
+    assert gate["candidate_label_gate_hard_blocking"] is True
+
+
+def test_broker_paper_fill_gate_hard_blocks_after_enough_bad_fills(monkeypatch):
+    monkeypatch.setattr(edge_calibration.settings, "kis_is_paper", True)
+    monkeypatch.setattr(edge_calibration.settings, "broker_paper_bootstrap_enabled", True)
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "broker_paper_calibration_source",
+        "broker_fills",
+    )
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "broker_paper_candidate_label_gate_mode",
+        "observe_only",
+    )
+    monkeypatch.setattr(edge_calibration.settings, "broker_paper_min_fill_samples", 2)
+    monkeypatch.setattr(edge_calibration.settings, "broker_paper_min_oos_fill_samples", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_win_rate", 0.50)
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "edge_calibration_gate_max_mae_net_edge_bps",
+        180.0,
+    )
+    monkeypatch.setattr(
+        edge_calibration,
+        "broker_paper_fill_gate_metrics",
+        lambda **kwargs: {
+            "broker_paper_fill_sample_count": 2,
+            "broker_paper_oos_fill_sample_count": 1,
+            "broker_paper_fill_outcome_sample_count": 2,
+            "broker_paper_fill_win_rate": 0.0,
+            "broker_paper_fill_profit_factor": 0.0,
+            "broker_paper_fill_avg_realized_net_edge_bps": -25.0,
+            "broker_paper_fill_mae_edge_error_bps": 250.0,
+        },
+    )
+
+    gate = edge_calibration._apply_broker_paper_calibration_policy(
+        {
+            "status": "blocked",
+            "approved": False,
+            "message": "candidate label calibration failed",
+            "sample_count": 6,
+        },
+        execution_mode="broker_paper",
+    )
+
+    assert gate["approved"] is False
+    assert gate["candidate_label_gate_hard_blocking"] is False
+    assert gate["broker_paper_fill_gate_ready"] is True
+    assert gate["broker_paper_fill_gate_hard_blocking"] is True
+    assert "Broker-paper fill calibration gate blocked entries" in gate["message"]
+
+
 def _insert_candidate(
     conn: sqlite3.Connection,
     *,

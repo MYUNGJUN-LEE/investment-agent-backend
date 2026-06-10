@@ -281,6 +281,9 @@ TOP10_SAMPLE_SOURCE_SCAN_RUN = "scan_run_deduped_top10_samples"
 CANDIDATE_LABEL_UNIT = "candidate_label"
 PAPER_ORDER_UNIT = "paper_order"
 ACTUAL_BROKER_FILL_UNIT = "actual_broker_fill"
+BROKER_PAPER_OBSERVE_ONLY_REASON = (
+    "broker_paper bootstrap observe-only candidate-label calibration"
+)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS edge_calibration_runs (
@@ -1430,10 +1433,13 @@ def edge_entry_gate(
 
     path = _db_path(calibration_db_path)
     if not path.exists():
-        return _default_gate(
-            status="collecting",
-            approved=False,
-            message="No edge calibration DB has been created yet",
+        return _apply_broker_paper_calibration_policy(
+            _default_gate(
+                status="collecting",
+                approved=False,
+                message="No edge calibration DB has been created yet",
+                execution_mode=execution_mode,
+            ),
             execution_mode=execution_mode,
         )
 
@@ -1458,11 +1464,14 @@ def edge_entry_gate(
         ).fetchone()
 
     if not run:
-        return _default_gate(
-            status="collecting",
-            approved=False,
-            message="No edge calibration run has completed yet",
-            sample_count=int(stored_sample_count or 0),
+        return _apply_broker_paper_calibration_policy(
+            _default_gate(
+                status="collecting",
+                approved=False,
+                message="No edge calibration run has completed yet",
+                sample_count=int(stored_sample_count or 0),
+                execution_mode=execution_mode,
+            ),
             execution_mode=execution_mode,
         )
 
@@ -1485,15 +1494,18 @@ def edge_entry_gate(
         limit=300,
     )
 
-    return _gate_from_metrics(
-        sample_count=int(stored_sample_count or run["sample_count"] or 0),
-        oos_sample_count=int(raw.get("oos_sample_count") or run["oos_sample_count"] or 0),
-        mae_return_bps=_to_float(run["mae_return_bps"]),
-        mae_risk_bps=_to_float(run["mae_risk_bps"]),
-        top10_performance=top10_performance,
-        fill_adjustment=fill_adjustment,
-        ic_metrics=ic_metrics,
-        candidates=candidates,
+    return _apply_broker_paper_calibration_policy(
+        _gate_from_metrics(
+            sample_count=int(stored_sample_count or run["sample_count"] or 0),
+            oos_sample_count=int(raw.get("oos_sample_count") or run["oos_sample_count"] or 0),
+            mae_return_bps=_to_float(run["mae_return_bps"]),
+            mae_risk_bps=_to_float(run["mae_risk_bps"]),
+            top10_performance=top10_performance,
+            fill_adjustment=fill_adjustment,
+            ic_metrics=ic_metrics,
+            candidates=candidates,
+            execution_mode=execution_mode,
+        ),
         execution_mode=execution_mode,
     )
 
@@ -3494,6 +3506,318 @@ def _default_gate(
             "min_top10_expectancy_bps": settings.edge_calibration_gate_min_top10_expectancy_bps,
             "min_fill_adjusted_edge_bps": settings.edge_calibration_gate_min_fill_adjusted_edge_bps,
         },
+    }
+
+
+def broker_paper_fill_gate_metrics(
+    *,
+    broker_db_path: Path | str | None = None,
+    outcome_db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    broker_path = settings.storage_path(broker_db_path or settings.broker_sync_db_path)
+    outcome_path = settings.storage_path(
+        outcome_db_path or settings.outcome_attribution_db_path
+    )
+    filled_count = _broker_paper_filled_execution_count(broker_path)
+    outcome_rows = _broker_paper_outcome_rows(outcome_path)
+    values = [
+        _to_float(row.get("realized_net_edge_bps"))
+        for row in outcome_rows
+    ]
+    realized_values = [value for value in values if value is not None]
+    wins = [value for value in realized_values if value > 0]
+    losses = [value for value in realized_values if value < 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else None
+    )
+    errors = []
+    for row in outcome_rows:
+        realized = _to_float(row.get("realized_net_edge_bps"))
+        predicted = _to_float(row.get("predicted_net_edge_bps"))
+        if predicted is None:
+            predicted = _to_float(row.get("final_entry_edge_bps"))
+        if realized is not None and predicted is not None:
+            errors.append(abs(realized - predicted))
+
+    return {
+        "broker_paper_fill_sample_count": filled_count,
+        "broker_paper_oos_fill_sample_count": _broker_paper_oos_count(outcome_rows),
+        "broker_paper_fill_outcome_sample_count": len(realized_values),
+        "broker_paper_fill_win_rate": (
+            round(len(wins) / len(realized_values), 6)
+            if realized_values
+            else None
+        ),
+        "broker_paper_fill_profit_factor": (
+            round(profit_factor, 6)
+            if profit_factor is not None
+            else None
+        ),
+        "broker_paper_fill_avg_realized_net_edge_bps": (
+            round(sum(realized_values) / len(realized_values), 4)
+            if realized_values
+            else None
+        ),
+        "broker_paper_fill_mae_edge_error_bps": (
+            round(sum(errors) / len(errors), 4)
+            if errors
+            else None
+        ),
+        "broker_sync_db_path": str(broker_path),
+        "outcome_attribution_db_path": str(outcome_path),
+    }
+
+
+def _broker_paper_filled_execution_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        with sqlite3.connect(path, timeout=2) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM broker_order_executions
+                WHERE COALESCE(filled_qty, 0) > 0
+                """
+            ).fetchone()
+            return int((row or [0])[0] or 0)
+    except sqlite3.Error:
+        return 0
+
+
+def _broker_paper_outcome_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        with sqlite3.connect(path, timeout=2) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT created_at, realized_net_edge_bps,
+                       predicted_net_edge_bps, final_entry_edge_bps
+                FROM outcome_attribution_events
+                WHERE LOWER(COALESCE(execution_mode, '')) = 'broker_paper'
+                ORDER BY created_at ASC, id ASC
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except sqlite3.Error:
+        return []
+
+
+def _broker_paper_oos_count(rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    split_index = int(len(rows) * 0.75)
+    return max(1, len(rows) - split_index)
+
+
+def _broker_paper_fill_gate_from_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    min_fill = int(settings.broker_paper_min_fill_samples or 0)
+    min_oos = int(settings.broker_paper_min_oos_fill_samples or 0)
+    fill_count = int(metrics.get("broker_paper_fill_sample_count") or 0)
+    oos_count = int(metrics.get("broker_paper_oos_fill_sample_count") or 0)
+    ready_failures: list[str] = []
+    if fill_count < min_fill:
+        ready_failures.append(
+            f"broker_paper_fill_sample_count {fill_count}/{min_fill}"
+        )
+    if oos_count < min_oos:
+        ready_failures.append(
+            f"broker_paper_oos_fill_sample_count {oos_count}/{min_oos}"
+        )
+
+    ready = not ready_failures
+    failures: list[str] = []
+    if ready:
+        min_win_rate = float(settings.edge_calibration_gate_min_top10_win_rate or 0.50)
+        min_profit_factor = float(
+            getattr(settings, "edge_calibration_gate_min_profit_factor", 1.10)
+            or 1.10
+        )
+        max_mae = float(
+            getattr(settings, "edge_calibration_gate_max_mae_net_edge_bps", 180.0)
+            or 180.0
+        )
+        win_rate = _to_float(metrics.get("broker_paper_fill_win_rate"))
+        profit_factor = _to_float(metrics.get("broker_paper_fill_profit_factor"))
+        avg_edge = _to_float(
+            metrics.get("broker_paper_fill_avg_realized_net_edge_bps")
+        )
+        mae = _to_float(metrics.get("broker_paper_fill_mae_edge_error_bps"))
+        if win_rate is None or win_rate < min_win_rate:
+            failures.append(
+                f"broker_paper_fill_win_rate {win_rate} < {min_win_rate}"
+            )
+        if profit_factor is None or profit_factor < min_profit_factor:
+            failures.append(
+                f"broker_paper_fill_profit_factor {profit_factor} < {min_profit_factor}"
+            )
+        if avg_edge is None or avg_edge <= 0:
+            failures.append(
+                f"broker_paper_fill_avg_realized_net_edge_bps {avg_edge} <= 0"
+            )
+        if mae is not None and mae >= max_mae:
+            failures.append(
+                f"broker_paper_fill_mae_edge_error_bps {mae} >= {max_mae}"
+            )
+
+    approved = ready and not failures
+    blocked = ready and not approved
+    return {
+        "status": "approved" if approved else "collecting" if not ready else "blocked",
+        "approved": approved,
+        "ready": ready,
+        "blocked": blocked,
+        "message": (
+            "Broker-paper fill calibration gate passed"
+            if approved
+            else "Broker-paper fill calibration gate collecting: "
+            + "; ".join(ready_failures)
+            if not ready
+            else "Broker-paper fill calibration gate blocked entries: "
+            + "; ".join(failures)
+        ),
+        "required": {
+            "min_fill_samples": min_fill,
+            "min_oos_fill_samples": min_oos,
+            "min_win_rate": float(settings.edge_calibration_gate_min_top10_win_rate or 0.50),
+            "min_profit_factor": float(
+                getattr(settings, "edge_calibration_gate_min_profit_factor", 1.10)
+                or 1.10
+            ),
+            "max_mae_edge_error_bps": float(
+                getattr(settings, "edge_calibration_gate_max_mae_net_edge_bps", 180.0)
+                or 180.0
+            ),
+        },
+    }
+
+
+def _apply_broker_paper_calibration_policy(
+    gate: dict[str, Any],
+    *,
+    execution_mode: str | None,
+) -> dict[str, Any]:
+    mode = str(execution_mode or "").lower()
+    candidate_failed = not bool(gate.get("approved", False))
+    overlay: dict[str, Any] = {
+        "broker_paper_bootstrap_enabled": bool(
+            settings.broker_paper_bootstrap_enabled
+        ),
+        "broker_paper_calibration_source": str(
+            settings.broker_paper_calibration_source or "candidate_labels"
+        ).lower(),
+        "broker_paper_candidate_label_gate_mode": str(
+            settings.broker_paper_candidate_label_gate_mode or "hard_block"
+        ).lower(),
+        "broker_paper_min_fill_samples": int(
+            settings.broker_paper_min_fill_samples or 0
+        ),
+        "broker_paper_min_oos_fill_samples": int(
+            settings.broker_paper_min_oos_fill_samples or 0
+        ),
+        "candidate_label_gate_failed": candidate_failed,
+        "candidate_label_gate_hard_blocking": candidate_failed,
+        "broker_paper_bootstrap_allowed": False,
+        "broker_paper_fill_gate_ready": False,
+        "broker_paper_fill_gate_blocked": False,
+        "broker_paper_fill_gate_hard_blocking": False,
+        "calibration_gate_mode": (
+            "candidate_label_hard_blocking"
+            if candidate_failed
+            else "candidate_label_approved"
+        ),
+    }
+
+    if mode != "broker_paper":
+        return {**gate, **overlay}
+
+    metrics = broker_paper_fill_gate_metrics()
+    fill_gate = _broker_paper_fill_gate_from_metrics(metrics)
+    source = overlay["broker_paper_calibration_source"]
+    label_mode = overlay["broker_paper_candidate_label_gate_mode"]
+    overlay.update(
+        {
+            **metrics,
+            "broker_paper_fill_gate": fill_gate,
+            "broker_paper_fill_gate_ready": bool(fill_gate["ready"]),
+            "broker_paper_fill_gate_blocked": bool(fill_gate["blocked"]),
+            "broker_paper_fill_gate_hard_blocking": bool(fill_gate["blocked"]),
+        }
+    )
+
+    if source != "broker_fills":
+        return {**gate, **overlay}
+
+    overlay["candidate_label_gate_hard_blocking"] = False
+
+    if fill_gate["ready"]:
+        overlay["calibration_gate_mode"] = "broker_paper_fill_gate"
+        if fill_gate["approved"]:
+            message = str(fill_gate["message"])
+            if candidate_failed:
+                message += (
+                    "; candidate label calibration failed but is observe-only "
+                    "because broker_paper uses broker fill calibration"
+                )
+            return {
+                **gate,
+                **overlay,
+                "status": "approved",
+                "approved": True,
+                "message": message,
+            }
+        return {
+            **gate,
+            **overlay,
+            "status": "blocked",
+            "approved": False,
+            "message": str(fill_gate["message"]),
+        }
+
+    bootstrap_observe_only = (
+        bool(settings.broker_paper_bootstrap_enabled)
+        and bool(settings.kis_is_paper)
+        and label_mode == "observe_only"
+    )
+    if not bootstrap_observe_only:
+        overlay["candidate_label_gate_hard_blocking"] = candidate_failed
+        overlay["calibration_gate_mode"] = (
+            "candidate_label_hard_blocking"
+            if candidate_failed
+            else "candidate_label_approved"
+        )
+        return {**gate, **overlay}
+
+    overlay["broker_paper_bootstrap_allowed"] = True
+    overlay["broker_paper_fill_gate_hard_blocking"] = False
+    overlay["calibration_gate_mode"] = (
+        "broker_paper_bootstrap_candidate_label_observe_only"
+    )
+    if not candidate_failed:
+        return {**gate, **overlay}
+
+    fill_count = int(metrics.get("broker_paper_fill_sample_count") or 0)
+    min_fill = int(settings.broker_paper_min_fill_samples or 0)
+    message = (
+        "Candidate label calibration gate failed, but "
+        "broker_paper bootstrap observe-only mode allowed entry because "
+        f"broker_paper_fill_sample_count {fill_count}/{min_fill}. "
+        "KIS mock broker order can proceed if all non-calibration guards pass. "
+        f"{BROKER_PAPER_OBSERVE_ONLY_REASON}. "
+        f"Original candidate label gate: {gate.get('message') or ''}"
+    ).strip()
+    return {
+        **gate,
+        **overlay,
+        "status": "bootstrap_observe_only",
+        "approved": True,
+        "message": message,
     }
 
 

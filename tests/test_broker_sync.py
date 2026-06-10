@@ -207,6 +207,35 @@ def test_sync_kis_account_returns_config_error_for_invalid_kis_account():
     assert "paper/live KIS app key" in result["message"]
 
 
+def test_sync_kis_account_returns_token_backoff_for_egw00133():
+    class FakeClient:
+        account_no = "50189471"
+        account_product_code = "01"
+        is_paper = True
+
+        def get_balance(self):
+            raise KisApiError(
+                "KIS HTTP error: 403 EGW00133",
+                status_code=403,
+                error_code="EGW00133",
+                error_description="token issuance limited",
+            )
+
+        def token_status(self):
+            return {
+                "kis_token_cached": False,
+                "kis_token_status": "backoff",
+                "kis_token_refresh_blocked_by_rate_limit": True,
+            }
+
+    result = sync_kis_account(client=FakeClient())
+
+    assert result["status"] == "token_backoff"
+    assert result["message"] == "kis_token_rate_limited"
+    assert result["recoverable"] is True
+    assert result["kis_token"]["kis_token_status"] == "backoff"
+
+
 def test_broker_sync_once_does_not_reconcile_when_sync_has_config_error(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
@@ -225,3 +254,16 @@ def test_broker_sync_once_does_not_reconcile_when_sync_has_config_error(monkeypa
     assert result["status"] == "config_error"
     assert result["order_state_reconcile"] is None
     assert calls == []
+
+
+def test_broker_sync_worker_backs_off_on_token_backoff(monkeypatch):
+    monkeypatch.setattr(
+        broker_sync_worker.settings,
+        "broker_sync_config_error_backoff_seconds",
+        900,
+    )
+
+    assert broker_sync_worker._next_sleep_seconds(
+        {"status": "token_backoff"},
+        60,
+    ) == 900

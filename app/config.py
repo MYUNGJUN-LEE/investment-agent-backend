@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     kis_is_paper: bool = True
     kis_token_cache_path: str = "data/kis_token_cache.json"
     kis_token_issue_cooldown_seconds: int = 70
+    kis_token_refresh_buffer_seconds: int = 600
     kis_request_min_interval_seconds: float = 1.5
 
     # Optional JSON feed used by app.data_sources.market_context.
@@ -261,6 +262,11 @@ class Settings(BaseSettings):
     broker_paper_max_daily_orders_per_symbol: int = 1
     broker_paper_symbol_cooldown_days: int = 1
     broker_paper_max_daily_notional_krw: float = 300_000.0
+    broker_paper_bootstrap_enabled: bool = True
+    broker_paper_calibration_source: str = "broker_fills"
+    broker_paper_candidate_label_gate_mode: str = "observe_only"
+    broker_paper_min_fill_samples: int = 200
+    broker_paper_min_oos_fill_samples: int = 50
     dynamic_risk_limits_enabled: bool = True
     dynamic_risk_min_multiplier: float = 0.35
     dynamic_risk_max_multiplier: float = 1.15

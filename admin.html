@@ -1073,13 +1073,27 @@
         summary.last_broker_sync_at ? `sync ${summary.last_broker_sync_at}` : ""
       ].filter(Boolean).join(" | ");
       els.candidateLabelWinRate.textContent = displayPercent(summary.candidate_label_win_rate_display, summary.candidate_label_win_rate);
-      els.candidateLabelDetail.textContent = `${fmtNumber(summary.candidate_label_sample_count, 0)} label samples`;
+      els.candidateLabelDetail.textContent = [
+        `${fmtNumber(summary.candidate_label_sample_count, 0)} scanner/future labels`,
+        `avg ${fmtBps(summary.candidate_label_avg_return_bps)}`
+      ].join(" | ");
       els.paperOrderWinRate.textContent = displayPercent(summary.paper_order_win_rate_display, summary.paper_order_win_rate);
       els.paperOrderWinRate.className = summary.paper_order_win_rate === null || summary.paper_order_win_rate === undefined ? "warn" : "ok";
-      els.paperOrderDetail.textContent = `${fmtNumber(summary.paper_order_sample_count, 0)} paper orders`;
-      els.brokerFillWinRate.textContent = displayPercent(summary.broker_execution_win_rate_display, summary.broker_execution_win_rate);
-      els.brokerFillWinRate.className = summary.broker_execution_win_rate === null || summary.broker_execution_win_rate === undefined ? "warn" : "ok";
-      els.brokerFillDetail.textContent = `${fmtNumber(summary.broker_execution_sample_count, 0)} broker fills`;
+      els.paperOrderDetail.textContent = [
+        `${fmtNumber(summary.internal_paper_order_sample_count ?? summary.paper_order_sample_count, 0)} internal paper samples`,
+        `edge ${fmtBps(summary.paper_order_avg_realized_net_edge_bps)}`
+      ].join(" | ");
+      const brokerFillWinRate = summary.broker_paper_fill_win_rate ?? summary.broker_execution_win_rate;
+      els.brokerFillWinRate.textContent = displayPercent(
+        brokerFillWinRate === null || brokerFillWinRate === undefined ? "N/A" : null,
+        brokerFillWinRate
+      );
+      els.brokerFillWinRate.className = brokerFillWinRate === null || brokerFillWinRate === undefined ? "warn" : "ok";
+      els.brokerFillDetail.textContent = [
+        `${fmtNumber(summary.broker_paper_fill_sample_count ?? summary.broker_execution_sample_count, 0)} KIS mock fills`,
+        `${fmtNumber(summary.broker_paper_order_count ?? summary.submitted_order_count, 0)} submitted`,
+        `gate ${summary.calibration_gate_mode || "-"}`
+      ].join(" | ");
       els.edgeMetricFreshness.textContent = summary.stale_reason ? "stale reason" : "current";
       els.edgeMetricFreshness.className = summary.stale_reason ? "bad" : "ok";
       els.edgeMetricDetail.textContent = [
@@ -1370,9 +1384,10 @@
       return [
         summary.broker_provider || "kis",
         summary.kis_is_paper ? "KIS paper" : "KIS live",
+        summary.kis_token_status ? `token ${summary.kis_token_status}` : "",
         summary.submits_to_broker ? "broker submit on" : "broker submit off",
         summary.uses_internal_paper_orders ? "internal paper on" : "internal paper off"
-      ].join(" | ");
+      ].filter(Boolean).join(" | ");
     }
 
     function shortId(value) {

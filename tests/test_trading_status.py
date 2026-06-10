@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+import json
 import sqlite3
 
 from fastapi.testclient import TestClient
@@ -7,6 +9,7 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.main import app
 from app.models import PaperRunRequest
+from app.brokers.kis_client import KisClient
 from app.trading import auto_trading, execution_status, paper_trading, risk_manager
 from app.trading import auto_trading_store
 from app.trading import universe_scanner
@@ -291,6 +294,119 @@ def test_zero_paper_orders_do_not_promote_candidate_label_win_rate(
     assert status["actual_trading_win_rate"] is None
     assert status["actual_trading_win_rate_display"] == "N/A"
     assert status["candidate_label_win_rate_is_actual_trading_win_rate"] is False
+
+
+def test_broker_paper_status_separates_candidate_labels_from_broker_fills(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    edge_path = settings.storage_path(settings.edge_calibration_db_path)
+    edge_path.parent.mkdir(parents=True, exist_ok=True)
+    edge_path.touch()
+
+    monkeypatch.setattr(
+        execution_status.edge_calibration,
+        "edge_entry_gate",
+        lambda **kwargs: {
+            "status": "bootstrap_observe_only",
+            "approved": True,
+            "sample_count": 6,
+            "broker_paper_bootstrap_enabled": True,
+            "broker_paper_calibration_source": "broker_fills",
+            "broker_paper_candidate_label_gate_mode": "observe_only",
+            "candidate_label_gate_failed": True,
+            "candidate_label_gate_hard_blocking": False,
+            "broker_paper_fill_sample_count": 0,
+            "broker_paper_oos_fill_sample_count": 0,
+            "broker_paper_fill_win_rate": None,
+            "broker_paper_fill_avg_realized_net_edge_bps": None,
+            "broker_paper_min_fill_samples": 200,
+            "broker_paper_fill_gate_ready": False,
+            "broker_paper_fill_gate_hard_blocking": False,
+            "calibration_gate_mode": (
+                "broker_paper_bootstrap_candidate_label_observe_only"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        execution_status.edge_calibration,
+        "get_edge_training_sample_summary",
+        lambda **kwargs: {
+            "summary": {
+                "sample_count": 6,
+                "mae_net_edge_error_bps": 1681.5105,
+            },
+            "unit_performance": {
+                execution_status.edge_calibration.CANDIDATE_LABEL_UNIT: {
+                    "unit": execution_status.edge_calibration.CANDIDATE_LABEL_UNIT,
+                    "sample_count": 6,
+                    "win_rate": 0.0,
+                    "avg_return_bps": -1207.8665,
+                    "status": "ready",
+                }
+            },
+        },
+    )
+
+    status = execution_status.trading_status_snapshot(execution_mode="broker_paper")
+
+    assert status["candidate_label_sample_count"] == 6
+    assert status["candidate_label_win_rate"] == 0.0
+    assert status["candidate_label_avg_return_bps"] == -1207.8665
+    assert status["submitted_order_count"] == 0
+    assert status["broker_paper_order_count"] == 0
+    assert status["broker_paper_fill_sample_count"] == 0
+    assert status["broker_paper_fill_win_rate"] is None
+    assert status["broker_execution_win_rate"] is None
+    assert status["broker_execution_win_rate_display"] == "N/A"
+    assert status["candidate_label_gate_hard_blocking"] is False
+    assert (
+        status["calibration_gate_mode"]
+        == "broker_paper_bootstrap_candidate_label_observe_only"
+    )
+
+
+def test_broker_paper_status_blocks_submit_during_kis_token_backoff(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "kis_is_paper", True)
+    monkeypatch.setattr(settings, "kis_app_key", "token-app-key")
+    monkeypatch.setattr(settings, "kis_app_secret", "token-app-secret")
+    monkeypatch.setattr(settings, "kis_account_no", "12345678")
+    monkeypatch.setattr(settings, "kis_account_product_code", "01")
+    token_client = KisClient(is_paper=True)
+    cache_path = settings.storage_path(settings.kis_token_cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                token_client._token_cache_key(): {
+                    "cooldown_until": (
+                        datetime.now() + timedelta(seconds=65)
+                    ).isoformat(timespec="seconds"),
+                    "last_refresh_attempt_at": datetime.now().isoformat(
+                        timespec="seconds"
+                    ),
+                    "last_refresh_error": "kis_token_rate_limited",
+                    "last_error_code": "EGW00133",
+                    "is_paper": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = execution_status.trading_status_snapshot(execution_mode="broker_paper")
+
+    assert status["kis_token_cached"] is False
+    assert status["kis_token_status"] == "backoff"
+    assert status["kis_token_refresh_blocked_by_rate_limit"] is True
+    assert status["broker_submit_blocked"] is True
+    assert status["broker_submit_block_reason"] == "kis_token_unavailable_rate_limited"
+    assert status["submits_to_broker"] is False
 
 
 def test_claimed_candidate_without_submission_is_not_submitted(

@@ -3179,6 +3179,11 @@ def _validate_start_request(req: AutoTradeStartRequest) -> None:
         probe_symbol = req.symbols[0].symbol if req.symbols else "005930"
         safety = broker_paper_safety_check(req=req, symbol=probe_symbol)
         if not safety.get("approved"):
+            if (
+                safety.get("broker_submit_block_code")
+                == "kis_token_unavailable_rate_limited"
+            ):
+                return
             raise AutoTradingError(
                 str(
                     safety.get("broker_submit_block_reason")

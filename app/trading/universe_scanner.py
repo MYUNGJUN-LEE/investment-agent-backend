@@ -22,6 +22,7 @@ from app.trading.kospi_universe import (
     load_kospi_symbols,
 )
 from app.trading.edge_calibration import (
+    BROKER_PAPER_OBSERVE_ONLY_REASON,
     edge_entry_gate,
     estimate_expected_edges,
     load_edge_model,
@@ -2127,6 +2128,31 @@ def _rank_execution_candidates(
                 "paper_bootstrap_soft_pass": (
                     "paper bootstrap soft-pass for collecting calibration gate" in reason
                 ),
+                "broker_paper_bootstrap_allowed": bool(
+                    entry_gate.get("broker_paper_bootstrap_allowed")
+                ),
+                "candidate_label_calibration_gate_mode": entry_gate.get(
+                    "broker_paper_candidate_label_gate_mode"
+                ),
+                "candidate_label_calibration_gate_failed": bool(
+                    entry_gate.get("candidate_label_gate_failed")
+                ),
+                "candidate_label_calibration_gate_hard_blocking": bool(
+                    entry_gate.get("candidate_label_gate_hard_blocking")
+                ),
+                "broker_paper_fill_gate_blocked": bool(
+                    entry_gate.get("broker_paper_fill_gate_blocked")
+                ),
+                "broker_paper_fill_sample_count": entry_gate.get(
+                    "broker_paper_fill_sample_count"
+                ),
+                "broker_paper_min_fill_samples": entry_gate.get(
+                    "broker_paper_min_fill_samples"
+                ),
+                "broker_paper_executable": bool(
+                    execution_mode == "broker_paper" and status == "READY"
+                ),
+                "calibration_gate_mode": entry_gate.get("calibration_gate_mode"),
             }
         )
     return prepared
@@ -2245,6 +2271,18 @@ def _is_collecting_entry_gate(entry_gate: dict[str, Any] | None) -> bool:
     )
 
     return any(token in message for token in collecting_tokens)
+
+
+def _is_broker_paper_observe_only_entry_gate(
+    entry_gate: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(entry_gate, dict):
+        return False
+    return bool(
+        entry_gate.get("broker_paper_bootstrap_allowed")
+        and entry_gate.get("candidate_label_gate_failed")
+        and not entry_gate.get("candidate_label_gate_hard_blocking")
+    )
 
 
 def _has_explicit_safety_block(candidate: dict[str, Any]) -> bool:
@@ -2654,11 +2692,20 @@ def _execution_status_for_candidate(
             reasons.append(gate_message)
             return "SKIPPED", _join_reasons(reasons)
 
-    reasons.append(
-        "paper bootstrap executable"
-        if paper_bootstrap
-        else "executable"
-    )
+    elif _is_broker_paper_observe_only_entry_gate(entry_gate):
+        reasons.append(
+            "Candidate label calibration failed but observe-only during "
+            "broker_paper bootstrap; awaiting KIS mock broker order/fill samples. "
+            f"{BROKER_PAPER_OBSERVE_ONLY_REASON}: "
+            f"{entry_gate.get('message') or ''}"
+        )
+
+    if paper_bootstrap:
+        reasons.append("paper bootstrap executable")
+    elif str(execution_mode or "").lower() == "broker_paper":
+        reasons.append("broker_paper executable")
+    else:
+        reasons.append("executable")
     return "READY", _join_reasons(reasons)
 
 

@@ -848,6 +848,165 @@ def test_paper_bootstrap_soft_pass_collecting_gate_only(monkeypatch):
     assert mature_status == "SKIPPED"
 
 
+def test_broker_paper_bootstrap_observe_only_candidate_label_gate(monkeypatch):
+    candidate = {
+        "symbol": "123456",
+        "decision": "buy_candidate",
+        "current_price": 10_000,
+        "score": 70.0,
+        "composite_score": 70.0,
+        "net_edge": 120.0,
+        "expected_return": 250.0,
+        "edge_reward_risk": {
+            "expected_value_after_cost_bps": 40.0,
+            "reward_risk_ratio": 2.0,
+        },
+        "large_cap_top10_gate": {"passed": True},
+    }
+    observe_only_gate = {
+        "status": "bootstrap_observe_only",
+        "approved": True,
+        "message": (
+            "Candidate label calibration gate failed, but broker_paper "
+            "bootstrap observe-only mode allowed entry because "
+            "broker_paper_fill_sample_count 0/200."
+        ),
+        "broker_paper_bootstrap_allowed": True,
+        "broker_paper_candidate_label_gate_mode": "observe_only",
+        "candidate_label_gate_failed": True,
+        "candidate_label_gate_hard_blocking": False,
+        "broker_paper_fill_gate_blocked": False,
+        "calibration_gate_mode": (
+            "broker_paper_bootstrap_candidate_label_observe_only"
+        ),
+    }
+    hard_block_gate = {
+        **observe_only_gate,
+        "approved": False,
+        "candidate_label_gate_hard_blocking": True,
+        "broker_paper_bootstrap_allowed": False,
+    }
+
+    status, reason = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate=observe_only_gate,
+        execution_mode="broker_paper",
+    )
+    blocked_status, _ = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate=hard_block_gate,
+        execution_mode="broker_paper",
+    )
+
+    assert status == "READY"
+    assert "broker_paper bootstrap observe-only candidate-label calibration" in reason
+    assert "broker_paper executable" in reason
+    assert blocked_status == "SKIPPED"
+
+
+def test_broker_paper_observe_only_final_candidate_path_counts_executable(monkeypatch):
+    monkeypatch.setattr(
+        universe_scanner,
+        "market_safety_check",
+        lambda symbol, execution_mode="paper": {
+            "block": False,
+            "penalty_bps": 0.0,
+            "message": "ok",
+        },
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "corporate_event_check",
+        lambda symbol, execution_mode="paper": {
+            "block": False,
+            "penalty_bps": 0.0,
+            "message": "ok",
+        },
+    )
+    monkeypatch.setattr(universe_scanner, "load_edge_model", lambda: None)
+    monkeypatch.setattr(
+        universe_scanner,
+        "estimate_expected_edges",
+        lambda candidate, raw_score, model=None: {
+            "expected_return": 360.0,
+            "expected_risk": 60.0,
+            "edge_model": "pytest",
+        },
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "edge_entry_gate",
+        lambda candidates=None, execution_mode=None: {
+            "status": "bootstrap_observe_only",
+            "approved": True,
+            "message": (
+                "Candidate label calibration gate failed, but broker_paper "
+                "bootstrap observe-only mode allowed entry because "
+                "broker_paper_fill_sample_count 0/200."
+            ),
+            "broker_paper_bootstrap_allowed": True,
+            "broker_paper_candidate_label_gate_mode": "observe_only",
+            "candidate_label_gate_failed": True,
+            "candidate_label_gate_hard_blocking": False,
+            "broker_paper_fill_sample_count": 0,
+            "broker_paper_min_fill_samples": 200,
+            "broker_paper_fill_gate_blocked": False,
+            "calibration_gate_mode": (
+                "broker_paper_bootstrap_candidate_label_observe_only"
+            ),
+        },
+    )
+
+    ranked = universe_scanner._rank_execution_candidates(
+        [
+            {
+                "symbol": "319660",
+                "name": "PSK",
+                "score": 92.0,
+                "decision": "buy_candidate",
+                "current_price": 20_000,
+                "change_rate": 3.0,
+                "volume_ratio": 3.0,
+                "turnover_value": 80_000_000_000,
+                "latest_technical_features": {
+                    "close": 20_000,
+                    "return_5d": 0.05,
+                    "return_20d": 0.10,
+                    "return_60d": 0.15,
+                    "high_breakout_20d": True,
+                    "atr_14": 600,
+                    "atr_14_pct": 0.03,
+                    "ma5": 20_000,
+                    "ma20": 19_000,
+                    "ma60": 18_500,
+                    "ma20_slope": 120,
+                },
+                "intraday": {"minute_volume_ratio": 2.0},
+                "overheated": False,
+            }
+        ],
+        scan_time="2026-06-10T09:00:00",
+        final_limit=10,
+        hurdle_rate=40.0,
+        execution_mode="broker_paper",
+    )
+    executable_count = len([item for item in ranked if item["status"] == "READY"])
+
+    assert ranked[0]["symbol"] == "319660"
+    assert ranked[0]["status"] == "READY"
+    assert ranked[0]["broker_paper_executable"] is True
+    assert ranked[0]["candidate_label_calibration_gate_hard_blocking"] is False
+    assert ranked[0]["broker_paper_fill_sample_count"] == 0
+    assert "broker_paper bootstrap observe-only" in ranked[0]["reason"]
+    assert executable_count == 1
+
+
 def test_paper_promotes_safe_exclude_to_watch_only(monkeypatch):
     monkeypatch.setattr(
         universe_scanner.settings,

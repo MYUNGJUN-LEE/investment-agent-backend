@@ -24,7 +24,7 @@ def run_forever(
         sleep_seconds = float(poll_seconds)
         try:
             result = run_once(reconcile_order_state=reconcile_order_state)
-            if result.get("status") == "config_error":
+            if result.get("status") in {"config_error", "token_backoff"}:
                 sleep_seconds = max(
                     sleep_seconds,
                     float(settings.broker_sync_config_error_backoff_seconds or 0),

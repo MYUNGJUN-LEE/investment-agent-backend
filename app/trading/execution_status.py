@@ -9,7 +9,7 @@ import sqlite3
 from typing import Any
 
 from app.config import settings
-from app.brokers.kis_client import KIS_PAPER_BASE_URL
+from app.brokers.kis_client import KIS_PAPER_BASE_URL, KisClient
 from app.trading import edge_calibration, paper_trading
 from app.trading import auto_trading_store
 from app.trading import order_state as order_state_store
@@ -53,6 +53,7 @@ def trading_status_snapshot(
         execution_mode=mode,
         broker_provider=broker_provider,
     )
+    kis_token = _kis_token_status(mode=mode, broker_provider=broker_provider)
     if broker_safety["broker_submit_blocked"]:
         mode_flags["submits_to_broker"] = False
 
@@ -74,6 +75,7 @@ def trading_status_snapshot(
         calibration_path=paths["edge_calibration_db_path"],
         latest_candidate=scanner.get("latest_execution_candidate"),
         sample_limit=sample_limit,
+        execution_mode=mode,
     )
     win_rates = _win_rate_status(
         edge_status.get("sample_summary") or {},
@@ -147,6 +149,7 @@ def trading_status_snapshot(
         "account_key": (latest_session or {}).get("account_key"),
         "planned_entry_count": planned_entry_count,
         "submitted_order_count": submitted_order_count,
+        "broker_paper_order_count": submitted_order_count,
         "paper_orders_count": paper_orders_count,
         "broker_executions_count": broker_executions_count,
         "broker_order_id_count": order_state["broker_order_id_count"],
@@ -155,6 +158,7 @@ def trading_status_snapshot(
         "last_broker_submit_at": order_state.get("last_broker_submit_at"),
         "last_broker_submit_error": order_state.get("last_broker_submit_error"),
         "last_broker_sync_at": _last_broker_sync_at(paths["broker_sync_db_path"]),
+        **kis_token,
         "broker_submit_blocked": broker_safety["broker_submit_blocked"],
         "broker_submit_block_reason": broker_safety["broker_submit_block_reason"],
         "broker_submit_block_code": broker_safety.get("broker_submit_block_code"),
@@ -186,6 +190,12 @@ def trading_status_snapshot(
         **broker_risk,
         "win_rates": win_rates,
         **_flat_win_rate_fields(win_rates),
+        "candidate_label_mae_edge_error_bps": (
+            (edge_status.get("sample_summary") or {}).get("summary") or {}
+        ).get("mae_net_edge_error_bps"),
+        "broker_paper_avg_realized_net_edge_bps": edge_status[
+            "public_fields"
+        ].get("broker_paper_fill_avg_realized_net_edge_bps"),
         **edge_status["public_fields"],
     }
 
@@ -571,6 +581,35 @@ def _broker_guard_counts(latest_session: dict[str, Any] | None) -> dict[str, Any
     return counts
 
 
+def _kis_token_status(*, mode: str, broker_provider: str) -> dict[str, Any]:
+    defaults = {
+        "kis_token_cached": False,
+        "kis_token_status": "not_applicable",
+        "kis_token_expires_at": None,
+        "kis_token_seconds_to_expiry": None,
+        "kis_token_last_refresh_at": None,
+        "kis_token_last_refresh_attempt_at": None,
+        "kis_token_last_refresh_error": None,
+        "kis_token_refresh_blocked_by_rate_limit": False,
+        "kis_token_next_refresh_allowed_at": None,
+    }
+    if str(broker_provider or "").lower() != "kis":
+        return defaults
+    if str(mode or "").lower() not in {"broker_paper", "live"}:
+        return defaults
+    try:
+        return {
+            **defaults,
+            **KisClient(is_paper=bool(settings.kis_is_paper)).token_status(),
+        }
+    except Exception as exc:
+        return {
+            **defaults,
+            "kis_token_status": "error",
+            "kis_token_last_refresh_error": str(exc),
+        }
+
+
 def _broker_submit_static_status(
     *,
     execution_mode: str,
@@ -594,6 +633,20 @@ def _broker_submit_static_status(
             "broker_submit_blocked": True,
             "broker_submit_block_reason": "broker_paper requires KIS_IS_PAPER=true",
             "broker_submit_block_code": "kis_is_paper_false",
+        }
+    token_status = _kis_token_status(
+        mode=execution_mode,
+        broker_provider=broker_provider,
+    )
+    if (
+        token_status.get("kis_token_refresh_blocked_by_rate_limit")
+        and not token_status.get("kis_token_cached")
+    ):
+        return {
+            "broker_submit_blocked": True,
+            "broker_submit_block_reason": "kis_token_unavailable_rate_limited",
+            "broker_submit_block_code": "kis_token_unavailable_rate_limited",
+            "kis_token": token_status,
         }
     storage = settings.storage_status()
     if not storage.get("data_dir_writable") or not storage.get("data_dir_is_persistent"):
@@ -697,6 +750,7 @@ def _edge_metric_status(
     calibration_path: Path,
     latest_candidate: dict[str, Any] | None,
     sample_limit: int,
+    execution_mode: str | None,
 ) -> dict[str, Any]:
     public = {
         "gate_calibration_db_path": str(calibration_path),
@@ -708,14 +762,70 @@ def _edge_metric_status(
         "candidate_reason_sample_count": None,
         "candidate_reason_required_sample_count": None,
         "stale_reason": False,
+        "broker_paper_bootstrap_enabled": bool(
+            settings.broker_paper_bootstrap_enabled
+        ),
+        "broker_paper_calibration_source": settings.broker_paper_calibration_source,
+        "broker_paper_candidate_label_gate_mode": (
+            settings.broker_paper_candidate_label_gate_mode
+        ),
+        "candidate_label_gate_failed": None,
+        "candidate_label_gate_hard_blocking": None,
+        "broker_paper_fill_sample_count": 0,
+        "broker_paper_oos_fill_sample_count": 0,
+        "broker_paper_fill_win_rate": None,
+        "broker_paper_fill_profit_factor": None,
+        "broker_paper_fill_avg_realized_net_edge_bps": None,
+        "broker_paper_fill_mae_edge_error_bps": None,
+        "broker_paper_min_fill_samples": settings.broker_paper_min_fill_samples,
+        "broker_paper_min_oos_fill_samples": settings.broker_paper_min_oos_fill_samples,
+        "broker_paper_fill_gate_ready": False,
+        "broker_paper_fill_gate_hard_blocking": False,
+        "broker_paper_fill_gate_blocked": False,
+        "calibration_gate_mode": None,
     }
     summary: dict[str, Any] = {}
-    if calibration_path.exists():
+    try:
+        gate = edge_calibration.edge_entry_gate(
+            calibration_db_path=calibration_path,
+            execution_mode=execution_mode,
+        )
+    except TypeError:
         try:
             gate = edge_calibration.edge_entry_gate(
                 calibration_db_path=calibration_path,
             )
-            public["gate_sample_count"] = gate.get("sample_count")
+        except Exception as exc:
+            gate = None
+            public["gate_error"] = str(exc)
+    except Exception as exc:
+        gate = None
+        public["gate_error"] = str(exc)
+    if gate:
+        public["gate_sample_count"] = gate.get("sample_count")
+        for key in (
+            "broker_paper_bootstrap_enabled",
+            "broker_paper_calibration_source",
+            "broker_paper_candidate_label_gate_mode",
+            "candidate_label_gate_failed",
+            "candidate_label_gate_hard_blocking",
+            "broker_paper_fill_sample_count",
+            "broker_paper_oos_fill_sample_count",
+            "broker_paper_fill_win_rate",
+            "broker_paper_fill_profit_factor",
+            "broker_paper_fill_avg_realized_net_edge_bps",
+            "broker_paper_fill_mae_edge_error_bps",
+            "broker_paper_min_fill_samples",
+            "broker_paper_min_oos_fill_samples",
+            "broker_paper_fill_gate_ready",
+            "broker_paper_fill_gate_hard_blocking",
+            "broker_paper_fill_gate_blocked",
+            "calibration_gate_mode",
+        ):
+            if key in gate:
+                public[key] = gate.get(key)
+    if calibration_path.exists():
+        try:
             public["gate_metric_snapshot_timestamp"] = _latest_edge_run_created_at(
                 calibration_path
             )
@@ -876,6 +986,10 @@ def _unit_win_rate(unit: dict[str, Any] | None) -> dict[str, Any]:
         "display": _format_percent(win_rate),
         "status": unit.get("status") or ("ready" if sample_count else "empty"),
         "unit": unit.get("unit"),
+        "avg_return_bps": unit.get("avg_return_bps"),
+        "avg_realized_net_edge_bps": unit.get("avg_realized_net_edge_bps"),
+        "mae_net_edge_error_bps": unit.get("mae_net_edge_error_bps"),
+        "profit_factor": unit.get("profit_factor"),
     }
 
 
@@ -888,12 +1002,22 @@ def _flat_win_rate_fields(win_rates: dict[str, Any]) -> dict[str, Any]:
         "candidate_label_win_rate": candidate.get("win_rate"),
         "candidate_label_win_rate_display": candidate.get("display"),
         "candidate_label_sample_count": candidate.get("sample_count"),
+        "candidate_label_avg_return_bps": candidate.get("avg_return_bps"),
+        "candidate_label_mae_edge_error_bps": candidate.get("mae_net_edge_error_bps"),
+        "internal_paper_order_sample_count": paper.get("sample_count"),
+        "internal_paper_order_win_rate": paper.get("win_rate"),
         "paper_order_win_rate": paper.get("win_rate"),
         "paper_order_win_rate_display": paper.get("display"),
         "paper_order_sample_count": paper.get("sample_count"),
+        "paper_order_avg_realized_net_edge_bps": paper.get(
+            "avg_realized_net_edge_bps"
+        ),
         "broker_execution_win_rate": broker.get("win_rate"),
         "broker_execution_win_rate_display": broker.get("display"),
         "broker_execution_sample_count": broker.get("sample_count"),
+        "broker_execution_avg_realized_net_edge_bps": broker.get(
+            "avg_realized_net_edge_bps"
+        ),
         "actual_trading_win_rate": actual.get("win_rate"),
         "actual_trading_win_rate_display": actual.get("display"),
         "candidate_label_win_rate_is_actual_trading_win_rate": False,

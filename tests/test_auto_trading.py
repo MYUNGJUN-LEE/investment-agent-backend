@@ -518,6 +518,76 @@ def test_orchestrated_entries_follow_net_edge_priority(monkeypatch):
     assert run_calls[:2] == ["000660", "005930"]
 
 
+def test_broker_paper_observe_only_gate_creates_planned_entry(monkeypatch):
+    monkeypatch.setattr(auto_trading, "_open_positions", lambda mode: {})
+    monkeypatch.setattr(
+        auto_trading,
+        "edge_entry_gate",
+        lambda candidates=None: {
+            "status": "bootstrap_observe_only",
+            "approved": True,
+            "message": "broker_paper bootstrap observe-only candidate-label calibration",
+            "broker_paper_bootstrap_allowed": True,
+            "candidate_label_gate_failed": True,
+            "candidate_label_gate_hard_blocking": False,
+            "broker_paper_fill_gate_ready": False,
+            "broker_paper_fill_gate_hard_blocking": False,
+            "calibration_gate_mode": (
+                "broker_paper_bootstrap_candidate_label_observe_only"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "regime_gate_for_mode",
+        lambda **kwargs: {
+            "approved": True,
+            "regime_adjusted_hurdle_bps": 40.0,
+            "position_multiplier": 1.0,
+        },
+    )
+    monkeypatch.setattr(auto_trading.settings, "portfolio_penalty_enabled", False)
+    monkeypatch.setattr(
+        auto_trading,
+        "fill_quality_adjustment_for_candidate",
+        lambda candidate, execution_mode: {
+            "approved": True,
+            "fill_probability": 1.0,
+            "total_fill_quality_penalty_bps": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "_signal_decay_for_candidate",
+        lambda candidate, execution_mode: {
+            "approved": True,
+            "signal_decay_adjusted_edge": candidate["fill_quality_adjusted_edge"],
+        },
+    )
+
+    plan = auto_trading.build_orchestrated_symbol_plan(
+        AutoTradeStartRequest(execution_mode="broker_paper"),
+        active_candidates=[
+            {
+                "symbol": "005930",
+                "rank": 1,
+                "status": "READY",
+                "current_price": 70000,
+                "net_edge": 120,
+                "composite_score": 80,
+                "expires_at": "2999-01-01T00:00:00",
+            }
+        ],
+    )
+
+    assert plan["entry_gate"]["approved"] is True
+    assert (
+        plan["entry_gate"]["calibration_gate_mode"]
+        == "broker_paper_bootstrap_candidate_label_observe_only"
+    )
+    assert [symbol.symbol for symbol in plan["entry_symbols"]] == ["005930"]
+
+
 def test_orchestrator_caps_position_near_ten_percent_and_weights_edge(monkeypatch):
     monkeypatch.setattr(
         auto_trading.risk_manager,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import json
+import threading
+import time
 
 import httpx
 import pytest
@@ -84,6 +86,142 @@ def test_issue_access_token_reuses_shared_file_cache_across_clients(tmp_path):
     assert [request.url.path for request in calls] == ["/oauth2/tokenP"]
 
 
+def test_valid_cached_token_reused_without_issue_call(tmp_path):
+    cache_path = tmp_path / "kis_token_cache.json"
+    seed = KisClient(
+        app_key="cached-app-key",
+        app_secret="cached-app-secret",
+        account_no="12345678",
+        account_product_code="01",
+        is_paper=True,
+        token_cache_path=cache_path,
+    )
+    cache_path.write_text(
+        json.dumps(
+            {
+                seed._token_cache_key(): {
+                    "access_token": "cached-token",
+                    "expires_at": (
+                        datetime.now() + timedelta(hours=2)
+                    ).isoformat(timespec="seconds"),
+                    "is_paper": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("token endpoint should not be called")
+
+    client = KisClient(
+        app_key="cached-app-key",
+        app_secret="cached-app-secret",
+        account_no="12345678",
+        account_product_code="01",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=cache_path,
+    )
+
+    assert client.issue_access_token() == "cached-token"
+    assert client.token_status()["kis_token_cached"] is True
+
+
+def test_near_expiry_cached_token_refreshes_once(tmp_path, monkeypatch):
+    cache_path = tmp_path / "kis_token_cache.json"
+    monkeypatch.setattr(kis_client.settings, "kis_token_refresh_buffer_seconds", 600)
+    seed = KisClient(
+        app_key="refresh-app-key",
+        app_secret="refresh-app-secret",
+        account_no="12345678",
+        account_product_code="01",
+        is_paper=True,
+        token_cache_path=cache_path,
+    )
+    cache_path.write_text(
+        json.dumps(
+            {
+                seed._token_cache_key(): {
+                    "access_token": "stale-token",
+                    "expires_at": (
+                        datetime.now() + timedelta(minutes=5)
+                    ).isoformat(timespec="seconds"),
+                    "is_paper": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "fresh-token",
+                "expires_in": 86400,
+            },
+        )
+
+    client = KisClient(
+        app_key="refresh-app-key",
+        app_secret="refresh-app-secret",
+        account_no="12345678",
+        account_product_code="01",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=cache_path,
+    )
+
+    assert client.issue_access_token() == "fresh-token"
+    assert [request.url.path for request in calls] == ["/oauth2/tokenP"]
+
+
+def test_concurrent_token_requests_issue_only_once(tmp_path):
+    cache_path = tmp_path / "kis_token_cache.json"
+    calls: list[httpx.Request] = []
+    calls_lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with calls_lock:
+            calls.append(request)
+        time.sleep(0.05)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "thread-token",
+                "expires_in": 86400,
+            },
+        )
+
+    clients = [
+        KisClient(
+            app_key="thread-app-key",
+            app_secret="thread-app-secret",
+            account_no="12345678",
+            account_product_code="01",
+            is_paper=True,
+            transport=httpx.MockTransport(handler),
+            token_cache_path=cache_path,
+        )
+        for _ in range(2)
+    ]
+    results: list[str] = []
+    threads = [
+        threading.Thread(target=lambda client=client: results.append(client.issue_access_token()))
+        for client in clients
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results == ["thread-token", "thread-token"]
+    assert [request.url.path for request in calls] == ["/oauth2/tokenP"]
+
+
 def test_http_error_exposes_kis_error_body():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -148,6 +286,12 @@ def test_token_rate_limit_sets_shared_cooldown(tmp_path):
     assert exc_info.value.error_code == "EGW00133"
     assert "cooling down" in str(exc_info.value)
     assert [request.url.path for request in calls] == ["/oauth2/tokenP"]
+    status = second_client.token_status()
+    assert status["kis_token_cached"] is False
+    assert status["kis_token_status"] == "backoff"
+    assert status["kis_token_refresh_blocked_by_rate_limit"] is True
+    assert status["kis_token_next_refresh_allowed_at"]
+    assert status["kis_token_last_refresh_error"] == "kis_token_rate_limited"
 
 
 def test_get_current_price_requests_domestic_stock_quote():

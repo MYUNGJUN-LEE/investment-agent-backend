@@ -22,6 +22,8 @@ _REQUEST_THROTTLE_LOCK = threading.RLock()
 _LAST_REQUEST_AT = 0.0
 _INVALID_ACCOUNT_ERROR_CODES = {"OPSQ2000"}
 _TOKEN_EXPIRED_ERROR_CODES = {"EGW00123"}
+_TOKEN_FILE_LOCK_STALE_SECONDS = 120.0
+_TOKEN_FILE_LOCK_WAIT_SECONDS = 10.0
 
 
 class KisConfigError(ValueError):
@@ -113,7 +115,21 @@ class KisClient:
             "appsecret": self.app_secret,
         }
 
-        with _TOKEN_CACHE_LOCK:
+        lock_context = (
+            _token_file_lock(self._token_cache_path)
+            if self._shared_token_cache_enabled()
+            else _noop_token_file_lock()
+        )
+        with _TOKEN_CACHE_LOCK, lock_context as file_lock:
+            if not file_lock.acquired:
+                cached_token = self._load_shared_access_token()
+                if cached_token:
+                    return cached_token
+                raise KisApiError(
+                    "KIS token refresh lock is busy; retry after current refresh",
+                    error_code="kis_token_refresh_lock_busy",
+                    error_description="Another worker is refreshing the KIS token",
+                )
             if not force_refresh:
                 cached_token = self._load_shared_access_token()
                 if cached_token:
@@ -131,6 +147,7 @@ class KisClient:
                     )
 
             try:
+                self._store_shared_refresh_attempt()
                 data = self._post(
                     "/oauth2/tokenP",
                     json=payload,
@@ -151,18 +168,23 @@ class KisClient:
                     cached_token = self._load_shared_access_token()
                     if cached_token:
                         return cached_token
+                    raise
+                self._store_shared_refresh_error(str(exc))
                 raise
-        token = data.get("access_token")
-        if not token:
-            raise KisApiError("KIS token response did not include access_token")
+            token = data.get("access_token")
+            if not token:
+                self._store_shared_refresh_error(
+                    "KIS token response did not include access_token"
+                )
+                raise KisApiError("KIS token response did not include access_token")
 
-        self._access_token = str(token)
-        self._access_token_expires_at = self._parse_token_expiry(data)
-        self._store_shared_access_token(
-            token=self._access_token,
-            expires_at=self._access_token_expires_at,
-        )
-        return self._access_token
+            self._access_token = str(token)
+            self._access_token_expires_at = self._parse_token_expiry(data)
+            self._store_shared_access_token(
+                token=self._access_token,
+                expires_at=self._access_token_expires_at,
+            )
+            return self._access_token
 
     def get_current_price(
         self,
@@ -504,7 +526,7 @@ class KisClient:
     def _has_valid_token(self) -> bool:
         if not self._access_token or not self._access_token_expires_at:
             return False
-        return datetime.now() < self._access_token_expires_at - timedelta(minutes=1)
+        return datetime.now() < self._access_token_expires_at - _token_refresh_buffer()
 
     def _base_headers(self) -> dict[str, str]:
         return {
@@ -794,7 +816,7 @@ class KisClient:
             expires_at = _parse_cached_datetime(row.get("expires_at"))
             if not token or not expires_at:
                 return None
-            if datetime.now() >= expires_at - timedelta(minutes=1):
+            if datetime.now() >= expires_at - _token_refresh_buffer():
                 return None
             self._access_token = str(token)
             self._access_token_expires_at = expires_at
@@ -805,16 +827,55 @@ class KisClient:
             return
         with _TOKEN_CACHE_LOCK:
             cache = _read_token_cache(self._token_cache_path)
+            now = datetime.now().isoformat(timespec="seconds")
             cache[self._token_cache_key()] = {
                 "access_token": token,
+                "issued_at": now,
                 "expires_at": expires_at.isoformat(timespec="seconds"),
                 "base_url": self.base_url,
                 "is_paper": self.is_paper,
+                "app_key_hash": _fingerprint(self.app_key),
+                "account_id": self._safe_account_id(),
                 "cooldown_until": None,
+                "last_refresh_at": now,
+                "last_refresh_attempt_at": now,
+                "last_refresh_error": None,
                 "last_error_code": None,
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "updated_at": now,
             }
             _write_token_cache(self._token_cache_path, cache)
+
+    def _store_shared_refresh_attempt(self) -> None:
+        if not self._shared_token_cache_enabled():
+            return
+        cache = _read_token_cache(self._token_cache_path)
+        row = cache.get(self._token_cache_key())
+        if not isinstance(row, dict):
+            row = {}
+        row.update(
+            {
+                "base_url": self.base_url,
+                "is_paper": self.is_paper,
+                "app_key_hash": _fingerprint(self.app_key),
+                "account_id": self._safe_account_id(),
+                "last_refresh_attempt_at": datetime.now().isoformat(timespec="seconds"),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        cache[self._token_cache_key()] = row
+        _write_token_cache(self._token_cache_path, cache)
+
+    def _store_shared_refresh_error(self, error: str) -> None:
+        if not self._shared_token_cache_enabled():
+            return
+        cache = _read_token_cache(self._token_cache_path)
+        row = cache.get(self._token_cache_key())
+        if not isinstance(row, dict):
+            row = {}
+        row["last_refresh_error"] = _sanitize_token_error(error)
+        row["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        cache[self._token_cache_key()] = row
+        _write_token_cache(self._token_cache_path, cache)
 
     def _load_shared_issue_cooldown(self) -> datetime | None:
         if not self._shared_token_cache_enabled():
@@ -832,9 +893,16 @@ class KisClient:
         row = cache.get(self._token_cache_key())
         if not isinstance(row, dict):
             row = {}
+        now = datetime.now().isoformat(timespec="seconds")
         row["cooldown_until"] = cooldown_until.isoformat(timespec="seconds")
+        row["last_refresh_attempt_at"] = now
+        row["last_refresh_error"] = "kis_token_rate_limited"
         row["last_error_code"] = "EGW00133"
-        row["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        row["base_url"] = self.base_url
+        row["is_paper"] = self.is_paper
+        row["app_key_hash"] = _fingerprint(self.app_key)
+        row["account_id"] = self._safe_account_id()
+        row["updated_at"] = now
         cache[self._token_cache_key()] = row
         _write_token_cache(self._token_cache_path, cache)
 
@@ -850,8 +918,58 @@ class KisClient:
         )
         return sha256(raw.encode("utf-8")).hexdigest()
 
+    def _safe_account_id(self) -> str:
+        raw = f"{self.account_no or ''}:{self.account_product_code or ''}"
+        return sha256(raw.encode("utf-8")).hexdigest()[:12] if raw.strip(":") else ""
+
+    def token_status(self) -> dict[str, Any]:
+        now = datetime.now()
+        row: dict[str, Any] = {}
+        if self._shared_token_cache_enabled():
+            cache = _read_token_cache(self._token_cache_path)
+            raw_row = cache.get(self._token_cache_key())
+            if isinstance(raw_row, dict):
+                row = raw_row
+        expires_at = _parse_cached_datetime(row.get("expires_at"))
+        cooldown_until = _parse_cached_datetime(row.get("cooldown_until"))
+        seconds_to_expiry = (
+            int((expires_at - now).total_seconds())
+            if expires_at is not None
+            else None
+        )
+        cached = bool(
+            row.get("access_token")
+            and expires_at
+            and now < expires_at - _token_refresh_buffer()
+        )
+        rate_limited = bool(cooldown_until and now < cooldown_until)
+        return {
+            "kis_token_cached": cached,
+            "kis_token_status": (
+                "cached" if cached else "backoff" if rate_limited else "missing"
+            ),
+            "kis_token_expires_at": (
+                expires_at.isoformat(timespec="seconds") if expires_at else None
+            ),
+            "kis_token_seconds_to_expiry": seconds_to_expiry,
+            "kis_token_last_refresh_at": row.get("last_refresh_at")
+            or row.get("updated_at"),
+            "kis_token_last_refresh_attempt_at": row.get("last_refresh_attempt_at"),
+            "kis_token_last_refresh_error": row.get("last_refresh_error")
+            or row.get("last_error_code"),
+            "kis_token_refresh_blocked_by_rate_limit": rate_limited,
+            "kis_token_next_refresh_allowed_at": (
+                cooldown_until.isoformat(timespec="seconds")
+                if cooldown_until
+                else None
+            ),
+            "kis_token_cache_path": str(self._token_cache_path),
+            "kis_token_cache_enabled": self._shared_token_cache_enabled(),
+        }
+
     def runtime_diagnostics(self) -> dict[str, Any]:
         """Return non-secret KIS runtime settings for production troubleshooting."""
+        token_status = self.token_status()
         return {
             "base_url": self.base_url,
             "is_paper": self.is_paper,
@@ -879,12 +997,11 @@ class KisClient:
             "token_cache_enabled": self._shared_token_cache_enabled(),
             "token_cache_key_fingerprint": self._token_cache_key()[:12],
             "request_min_interval_seconds": settings.kis_request_min_interval_seconds,
-            "cached_token_available": bool(self._load_shared_access_token()),
-            "token_issue_cooldown_until": (
-                self._load_shared_issue_cooldown().isoformat(timespec="seconds")
-                if self._load_shared_issue_cooldown()
-                else None
-            ),
+            "cached_token_available": bool(token_status["kis_token_cached"]),
+            "token_issue_cooldown_until": token_status[
+                "kis_token_next_refresh_allowed_at"
+            ],
+            **token_status,
         }
 
 
@@ -924,6 +1041,84 @@ def _fingerprint(value: Any) -> str:
     if not value:
         return ""
     return sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _token_refresh_buffer() -> timedelta:
+    seconds = max(60, int(settings.kis_token_refresh_buffer_seconds or 600))
+    return timedelta(seconds=seconds)
+
+
+def _sanitize_token_error(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    for secret in (
+        settings.kis_app_secret,
+        settings.kis_app_key,
+    ):
+        if secret:
+            text = text.replace(str(secret), "[REDACTED]")
+    return text[:500]
+
+
+class _token_file_lock:
+    def __init__(self, cache_path: Path) -> None:
+        self.lock_path = Path(f"{cache_path}.lock")
+        self.acquired = False
+
+    def __enter__(self) -> "_token_file_lock":
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + _TOKEN_FILE_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fd = os.open(
+                    self.lock_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "created_at": datetime.now().isoformat(
+                                    timespec="seconds"
+                                ),
+                                "pid": os.getpid(),
+                            }
+                        )
+                    )
+                self.acquired = True
+                return self
+            except FileExistsError:
+                self._remove_if_stale()
+                if time.monotonic() >= deadline:
+                    return self
+                time.sleep(0.2)
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if not self.acquired:
+            return
+        try:
+            self.lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _remove_if_stale(self) -> None:
+        try:
+            age = time.time() - self.lock_path.stat().st_mtime
+            if age >= _TOKEN_FILE_LOCK_STALE_SECONDS:
+                self.lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+class _noop_token_file_lock:
+    acquired = True
+
+    def __enter__(self) -> "_noop_token_file_lock":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
 
 
 def _safe_response_json(response: httpx.Response) -> dict[str, Any] | list[Any] | None:

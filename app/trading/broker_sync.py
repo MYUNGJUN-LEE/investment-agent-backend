@@ -33,6 +33,19 @@ def _is_kis_token_expired_error(exc: Exception) -> bool:
     )
 
 
+def _is_kis_token_rate_limited_error(exc: Exception) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(exc, "error_code", None),
+            getattr(exc, "error_description", None),
+            getattr(exc, "response_text", None),
+            exc,
+        )
+    )
+    return "EGW00133" in text or "kis_token_rate_limited" in text
+
+
 def _invalidate_kis_client_token(client: KisClient) -> None:
     """
     Best-effort token invalidation.
@@ -195,6 +208,17 @@ def sync_kis_account(
         return _kis_config_error_result(client=client, exc=exc)
 
     except KisApiError as exc:
+        if _is_kis_token_rate_limited_error(exc):
+            return {
+                "status": "token_backoff",
+                "broker": "KIS",
+                "message": "kis_token_rate_limited",
+                "error_code": exc.error_code,
+                "recoverable": True,
+                "kis_token": client.token_status()
+                if hasattr(client, "token_status")
+                else {},
+            }
         if is_invalid_account_error(exc):
             return _kis_config_error_result(client=client, exc=exc)
         raise

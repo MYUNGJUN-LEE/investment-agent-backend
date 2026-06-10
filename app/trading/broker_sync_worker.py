@@ -41,7 +41,7 @@ def run_broker_sync_forever(
 
 
 def _next_sleep_seconds(result: dict[str, Any], poll_seconds: float) -> float:
-    if result.get("status") == "config_error":
+    if result.get("status") in {"config_error", "token_backoff"}:
         return max(
             poll_seconds,
             float(settings.broker_sync_config_error_backoff_seconds or poll_seconds),

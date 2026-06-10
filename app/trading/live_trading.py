@@ -303,6 +303,15 @@ def broker_paper_safety_check(
             return _broker_submit_block(f"KIS mock account configuration missing: {key}", diagnostics)
     if not diagnostics.get("account_product_code"):
         return _broker_submit_block("KIS mock account product code is missing", diagnostics)
+    if (
+        diagnostics.get("kis_token_refresh_blocked_by_rate_limit")
+        and not diagnostics.get("kis_token_cached")
+    ):
+        return _broker_submit_block(
+            "kis_token_unavailable_rate_limited",
+            diagnostics,
+            code="kis_token_unavailable_rate_limited",
+        )
 
     probe_symbol = symbol or getattr(req, "symbol", None) or "005930"
     try:

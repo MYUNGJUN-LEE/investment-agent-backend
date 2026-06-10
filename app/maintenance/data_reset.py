@@ -27,6 +27,7 @@ def reset_trading_data(
             "deleted_files": [],
         }
 
+    settings.clear_storage_cache()
     files = _data_files(include_all_data_files=include_all_data_files)
     deleted: list[str] = []
     errors: list[dict[str, str]] = []
@@ -59,12 +60,13 @@ def _data_files(*, include_all_data_files: bool) -> list[Path]:
     for root in _candidate_data_roots():
         if not root.exists() or not root.is_dir():
             continue
+        _cleanup_storage_check_files(root)
         patterns = ["*.sqlite3", "*.sqlite3-*", "*.db", "*.db-*", "*.json"]
         if include_all_data_files:
             patterns.extend(["*.csv", "*.log", "*.tmp"])
         for pattern in patterns:
             for path in root.glob(pattern):
-                if path.is_file():
+                if path.is_file() and not _is_storage_check_file(path):
                     candidates.add(path)
 
     return sorted(
@@ -75,6 +77,23 @@ def _data_files(*, include_all_data_files: bool) -> list[Path]:
 
 def _with_sqlite_sidecars(path: Path) -> set[Path]:
     return {path, Path(f"{path}-wal"), Path(f"{path}-shm"), Path(f"{path}-journal")}
+
+
+def _cleanup_storage_check_files(root: Path) -> None:
+    for pattern in (".storage-write-check-*", ".storage-sqlite-check-*"):
+        for path in root.glob(pattern):
+            try:
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _is_storage_check_file(path: Path) -> bool:
+    name = path.name
+    return name.startswith(".storage-write-check-") or name.startswith(
+        ".storage-sqlite-check-"
+    )
 
 
 def _known_generated_paths() -> list[Path]:
