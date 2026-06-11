@@ -18,10 +18,12 @@ from app.config import settings
 KIS_PROD_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 _TOKEN_CACHE_LOCK = threading.RLock()
+_ACCOUNT_CACHE_LOCK = threading.RLock()
 _REQUEST_THROTTLE_LOCK = threading.RLock()
 _LAST_REQUEST_AT = 0.0
 _INVALID_ACCOUNT_ERROR_CODES = {"OPSQ2000"}
 _TOKEN_EXPIRED_ERROR_CODES = {"EGW00123"}
+_ACCOUNT_RATE_LIMIT_ERROR_CODES = {"EGW00201"}
 _TOKEN_FILE_LOCK_STALE_SECONDS = 120.0
 _TOKEN_FILE_LOCK_WAIT_SECONDS = 10.0
 
@@ -67,6 +69,7 @@ class KisClient:
         timeout: float = 10.0,
         transport: httpx.BaseTransport | None = None,
         token_cache_path: Path | str | None = None,
+        account_cache_path: Path | str | None = None,
     ) -> None:
         self.app_key = app_key or settings.kis_app_key
         self.app_secret = app_secret or settings.kis_app_secret
@@ -83,6 +86,12 @@ class KisClient:
             else settings.storage_path(settings.kis_token_cache_path)
         )
         self._token_cache_path_explicit = token_cache_path is not None
+        self._account_cache_path = (
+            Path(account_cache_path)
+            if account_cache_path is not None
+            else settings.storage_path(settings.kis_account_cache_path)
+        )
+        self._account_cache_path_explicit = account_cache_path is not None
 
         self._access_token: str | None = None
         self._access_token_expires_at: datetime | None = None
@@ -403,7 +412,6 @@ class KisClient:
         cano, product_code = _normalize_account_credentials(cano, product_code)
         self._ensure_account_credentials(cano, product_code, purpose="balance lookup")
 
-        token = self.issue_access_token()
         tr_id = "VTTC8434R" if self.is_paper else "TTTC8434R"
         params = {
             "CANO": cano,
@@ -418,39 +426,68 @@ class KisClient:
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
+        cache_params = dict(params)
+        cached = self._load_shared_account_payload(
+            operation="balance",
+            params=cache_params,
+        )
+        if cached is not None:
+            return cached
+
+        self._reserve_shared_account_probe(operation="balance")
         pages: list[dict[str, Any]] = []
         complete_snapshot = True
 
-        for page_index in range(20):
-            token = self.issue_access_token()
-            headers = self._auth_headers(
-                token=token,
-                tr_id=tr_id,
-                tr_cont="N" if page_index else "",
-            )
-            data, response_headers = self._get_with_headers(
-                "/uapi/domestic-stock/v1/trading/inquire-balance",
-                params=params,
-                headers=headers,
-            )
-            pages.append(data)
-
-            if not _has_more_pages(data, response_headers):
-                return _merge_balance_pages(
-                    pages,
-                    complete_snapshot=complete_snapshot,
+        try:
+            for page_index in range(20):
+                token = self.issue_access_token()
+                headers = self._auth_headers(
+                    token=token,
+                    tr_id=tr_id,
+                    tr_cont="N" if page_index else "",
                 )
+                data, response_headers = self._get_with_headers(
+                    "/uapi/domestic-stock/v1/trading/inquire-balance",
+                    params=params,
+                    headers=headers,
+                )
+                pages.append(data)
 
-            next_fk, next_nk = _next_context(data)
-            if not next_fk and not next_nk:
+                if not _has_more_pages(data, response_headers):
+                    merged = _merge_balance_pages(
+                        pages,
+                        complete_snapshot=complete_snapshot,
+                    )
+                    self._store_shared_account_payload(
+                        operation="balance",
+                        params=cache_params,
+                        payload=merged,
+                    )
+                    return merged
+
+                next_fk, next_nk = _next_context(data)
+                if not next_fk and not next_nk:
+                    complete_snapshot = False
+                    break
+                params["CTX_AREA_FK100"] = next_fk
+                params["CTX_AREA_NK100"] = next_nk
+            else:
                 complete_snapshot = False
-                break
-            params["CTX_AREA_FK100"] = next_fk
-            params["CTX_AREA_NK100"] = next_nk
-        else:
-            complete_snapshot = False
 
-        return _merge_balance_pages(pages, complete_snapshot=complete_snapshot)
+            merged = _merge_balance_pages(pages, complete_snapshot=complete_snapshot)
+            self._store_shared_account_payload(
+                operation="balance",
+                params=cache_params,
+                payload=merged,
+            )
+            return merged
+        except KisApiError as exc:
+            if self._is_account_rate_limited_error(exc):
+                self._store_shared_account_rate_limit(
+                    operation="balance",
+                    error=exc,
+                )
+            raise
 
     def get_daily_order_executions(
         self,
@@ -472,27 +509,49 @@ class KisClient:
             purpose="order execution lookup",
         )
 
-        token = self.issue_access_token()
         tr_id = "VTTC8001R" if self.is_paper else "TTTC8001R"
-        data = self._get(
-            "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
-            params={
-                "CANO": cano,
-                "ACNT_PRDT_CD": product_code,
-                "INQR_STRT_DT": start_date,
-                "INQR_END_DT": end_date,
-                "SLL_BUY_DVSN_CD": side_code,
-                "INQR_DVSN": "00",
-                "PDNO": symbol,
-                "CCLD_DVSN": execution_filter,
-                "ORD_GNO_BRNO": "",
-                "ODNO": "",
-                "INQR_DVSN_3": "00",
-                "INQR_DVSN_1": "",
-                "CTX_AREA_FK100": "",
-                "CTX_AREA_NK100": "",
-            },
-            headers=self._auth_headers(token=token, tr_id=tr_id),
+        params = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": product_code,
+            "INQR_STRT_DT": start_date,
+            "INQR_END_DT": end_date,
+            "SLL_BUY_DVSN_CD": side_code,
+            "INQR_DVSN": "00",
+            "PDNO": symbol,
+            "CCLD_DVSN": execution_filter,
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        cached = self._load_shared_account_payload(
+            operation="daily_order_executions",
+            params=params,
+        )
+        if cached is not None:
+            return cached
+
+        self._reserve_shared_account_probe(operation="daily_order_executions")
+        token = self.issue_access_token()
+        try:
+            data = self._get(
+                "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                params=params,
+                headers=self._auth_headers(token=token, tr_id=tr_id),
+            )
+        except KisApiError as exc:
+            if self._is_account_rate_limited_error(exc):
+                self._store_shared_account_rate_limit(
+                    operation="daily_order_executions",
+                    error=exc,
+                )
+            raise
+        self._store_shared_account_payload(
+            operation="daily_order_executions",
+            params=params,
+            payload=data,
         )
         return data
 
@@ -804,6 +863,231 @@ class KisClient:
             self.transport is None or self._token_cache_path_explicit
         )
 
+    def _shared_account_cache_enabled(self) -> bool:
+        return bool(self._account_cache_path) and (
+            self.transport is None or self._account_cache_path_explicit
+        )
+
+    def _load_shared_account_payload(
+        self,
+        *,
+        operation: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self._shared_account_cache_enabled():
+            return None
+        ttl_seconds = int(settings.kis_account_cache_ttl_seconds or 0)
+        if ttl_seconds <= 0:
+            return None
+        with _ACCOUNT_CACHE_LOCK:
+            cache = _read_token_cache(self._account_cache_path)
+            row = cache.get(self._account_cache_key())
+            if not isinstance(row, dict):
+                return None
+            operation_row = (row.get("operations") or {}).get(
+                self._account_operation_key(operation, params)
+            )
+            if not isinstance(operation_row, dict):
+                return None
+            expires_at = _parse_cached_datetime(operation_row.get("expires_at"))
+            if expires_at is None or datetime.now() >= expires_at:
+                return None
+            payload = operation_row.get("payload")
+            return dict(payload) if isinstance(payload, dict) else None
+
+    def _store_shared_account_payload(
+        self,
+        *,
+        operation: str,
+        params: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        if not self._shared_account_cache_enabled():
+            return
+        ttl_seconds = int(settings.kis_account_cache_ttl_seconds or 0)
+        if ttl_seconds <= 0:
+            return
+        with _ACCOUNT_CACHE_LOCK:
+            cache = _read_token_cache(self._account_cache_path)
+            key = self._account_cache_key()
+            row = cache.get(key)
+            if not isinstance(row, dict):
+                row = {}
+            now = datetime.now()
+            operations = row.get("operations")
+            if not isinstance(operations, dict):
+                operations = {}
+            operations[self._account_operation_key(operation, params)] = {
+                "operation": operation,
+                "params_hash": _fingerprint(
+                    json.dumps(params, ensure_ascii=False, sort_keys=True)
+                ),
+                "cached_at": now.isoformat(timespec="seconds"),
+                "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat(
+                    timespec="seconds"
+                ),
+                "payload": payload,
+            }
+            row.update(
+                {
+                    "base_url": self.base_url,
+                    "is_paper": self.is_paper,
+                    "app_key_hash": _fingerprint(self.app_key),
+                    "account_id": self._safe_account_id(),
+                    "last_success_at": now.isoformat(timespec="seconds"),
+                    "last_probe_error": None,
+                    "last_error_code": None,
+                    "operations": operations,
+                    "updated_at": now.isoformat(timespec="seconds"),
+                }
+            )
+            cache[key] = row
+            _write_token_cache(self._account_cache_path, cache)
+
+    def _reserve_shared_account_probe(self, *, operation: str) -> None:
+        if not self._shared_account_cache_enabled():
+            return
+        lock_context = _token_file_lock(self._account_cache_path)
+        with _ACCOUNT_CACHE_LOCK, lock_context as file_lock:
+            if not file_lock.acquired:
+                raise self._account_rate_limit_error(
+                    "KIS account ledger limiter lock is busy",
+                    operation=operation,
+                )
+            cache = _read_token_cache(self._account_cache_path)
+            key = self._account_cache_key()
+            row = cache.get(key)
+            if not isinstance(row, dict):
+                row = {}
+            now = datetime.now()
+            cooldown_until = _parse_cached_datetime(row.get("cooldown_until"))
+            next_allowed = _parse_cached_datetime(row.get("next_probe_allowed_at"))
+            if cooldown_until and now < cooldown_until:
+                raise self._account_rate_limit_error(
+                    (
+                        "KIS account ledger calls are cooling down after EGW00201 "
+                        f"until {cooldown_until.isoformat(timespec='seconds')}"
+                    ),
+                    operation=operation,
+                )
+            if next_allowed and now < next_allowed:
+                wait_seconds = max(0.0, (next_allowed - now).total_seconds())
+                max_serial_wait = max(
+                    0.0,
+                    float(settings.kis_account_min_probe_interval_seconds or 0.0),
+                ) + 0.5
+                if wait_seconds <= max_serial_wait:
+                    time.sleep(wait_seconds)
+                    now = datetime.now()
+                else:
+                    raise self._account_rate_limit_error(
+                        (
+                            "KIS account ledger probe is rate limited until "
+                            f"{next_allowed.isoformat(timespec='seconds')}"
+                        ),
+                        operation=operation,
+                    )
+
+            interval = max(
+                0.0,
+                float(settings.kis_account_min_probe_interval_seconds or 0.0),
+            )
+            row.update(
+                {
+                    "base_url": self.base_url,
+                    "is_paper": self.is_paper,
+                    "app_key_hash": _fingerprint(self.app_key),
+                    "account_id": self._safe_account_id(),
+                    "last_probe_attempt_at": now.isoformat(timespec="seconds"),
+                    "last_probe_operation": operation,
+                    "next_probe_allowed_at": (
+                        now + timedelta(seconds=interval)
+                    ).isoformat(timespec="seconds"),
+                    "updated_at": now.isoformat(timespec="seconds"),
+                }
+            )
+            cache[key] = row
+            _write_token_cache(self._account_cache_path, cache)
+
+    def _store_shared_account_rate_limit(
+        self,
+        *,
+        operation: str,
+        error: KisApiError,
+    ) -> None:
+        if not self._shared_account_cache_enabled():
+            return
+        with _ACCOUNT_CACHE_LOCK:
+            cache = _read_token_cache(self._account_cache_path)
+            key = self._account_cache_key()
+            row = cache.get(key)
+            if not isinstance(row, dict):
+                row = {}
+            now = datetime.now()
+            backoff_seconds = max(
+                1,
+                int(settings.kis_account_rate_limit_backoff_seconds or 70),
+            )
+            cooldown_until = now + timedelta(seconds=backoff_seconds)
+            row.update(
+                {
+                    "base_url": self.base_url,
+                    "is_paper": self.is_paper,
+                    "app_key_hash": _fingerprint(self.app_key),
+                    "account_id": self._safe_account_id(),
+                    "cooldown_until": cooldown_until.isoformat(timespec="seconds"),
+                    "next_probe_allowed_at": cooldown_until.isoformat(
+                        timespec="seconds"
+                    ),
+                    "last_probe_attempt_at": now.isoformat(timespec="seconds"),
+                    "last_probe_operation": operation,
+                    "last_probe_error": "kis_account_rate_limited",
+                    "last_error_code": str(error.error_code or "EGW00201"),
+                    "updated_at": now.isoformat(timespec="seconds"),
+                }
+            )
+            cache[key] = row
+            _write_token_cache(self._account_cache_path, cache)
+
+    def _is_account_rate_limited_error(self, exc: KisApiError) -> bool:
+        return is_account_rate_limited_error(exc)
+
+    def _account_rate_limit_error(
+        self,
+        message: str,
+        *,
+        operation: str,
+    ) -> KisApiError:
+        return KisApiError(
+            message,
+            status_code=403,
+            error_code="EGW00201",
+            error_description=(
+                "KIS account ledger rate limit cooldown"
+                f" ({operation})"
+            ),
+        )
+
+    def _account_cache_key(self) -> str:
+        return self._token_cache_key()
+
+    def _account_operation_key(
+        self,
+        operation: str,
+        params: dict[str, Any],
+    ) -> str:
+        raw = json.dumps(
+            {
+                "account_key": self._account_cache_key(),
+                "operation": operation,
+                "params": params,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return sha256(raw.encode("utf-8")).hexdigest()
+
     def _load_shared_access_token(self) -> str | None:
         if not self._shared_token_cache_enabled():
             return None
@@ -967,9 +1251,43 @@ class KisClient:
             "kis_token_cache_enabled": self._shared_token_cache_enabled(),
         }
 
+    def account_status(self) -> dict[str, Any]:
+        now = datetime.now()
+        row: dict[str, Any] = {}
+        if self._shared_account_cache_enabled():
+            cache = _read_token_cache(self._account_cache_path)
+            raw_row = cache.get(self._account_cache_key())
+            if isinstance(raw_row, dict):
+                row = raw_row
+        cooldown_until = _parse_cached_datetime(row.get("cooldown_until"))
+        next_probe_allowed = _parse_cached_datetime(row.get("next_probe_allowed_at"))
+        cooldown_active = bool(cooldown_until and now < cooldown_until)
+        probe_wait_active = bool(next_probe_allowed and now < next_probe_allowed)
+        active_until = cooldown_until if cooldown_active else next_probe_allowed
+        operations = row.get("operations") if isinstance(row, dict) else {}
+        return {
+            "kis_account_rate_limited": cooldown_active,
+            "kis_account_next_probe_allowed_at": (
+                active_until.isoformat(timespec="seconds")
+                if (cooldown_active or probe_wait_active) and active_until
+                else None
+            ),
+            "kis_account_last_probe_at": row.get("last_probe_attempt_at"),
+            "kis_account_last_probe_operation": row.get("last_probe_operation"),
+            "kis_account_last_probe_error": row.get("last_probe_error")
+            or row.get("last_error_code"),
+            "kis_account_last_success_at": row.get("last_success_at"),
+            "kis_account_cache_path": str(self._account_cache_path),
+            "kis_account_cache_enabled": self._shared_account_cache_enabled(),
+            "kis_account_cached_operation_count": (
+                len(operations) if isinstance(operations, dict) else 0
+            ),
+        }
+
     def runtime_diagnostics(self) -> dict[str, Any]:
         """Return non-secret KIS runtime settings for production troubleshooting."""
         token_status = self.token_status()
+        account_status = self.account_status()
         return {
             "base_url": self.base_url,
             "is_paper": self.is_paper,
@@ -995,6 +1313,8 @@ class KisClient:
             ),
             "token_cache_path": str(self._token_cache_path),
             "token_cache_enabled": self._shared_token_cache_enabled(),
+            "account_cache_path": str(self._account_cache_path),
+            "account_cache_enabled": self._shared_account_cache_enabled(),
             "token_cache_key_fingerprint": self._token_cache_key()[:12],
             "request_min_interval_seconds": settings.kis_request_min_interval_seconds,
             "cached_token_available": bool(token_status["kis_token_cached"]),
@@ -1002,6 +1322,7 @@ class KisClient:
                 "kis_token_next_refresh_allowed_at"
             ],
             **token_status,
+            **account_status,
         }
 
 
@@ -1013,6 +1334,18 @@ def is_invalid_account_error(exc: KisApiError) -> bool:
     return (
         str(exc.error_code or "") in _INVALID_ACCOUNT_ERROR_CODES
         and "INVALID_CHECK_ACNO" in text
+    )
+
+
+def is_account_rate_limited_error(exc: KisApiError) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (exc.error_code, exc.error_description, exc.response_text, exc)
+    )
+    return (
+        str(exc.error_code or "") in _ACCOUNT_RATE_LIMIT_ERROR_CODES
+        or "EGW00201" in text
+        or "kis_account_rate_limited" in text
     )
 
 

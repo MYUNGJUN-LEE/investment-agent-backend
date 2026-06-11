@@ -4,7 +4,12 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
-from app.brokers.kis_client import KIS_PAPER_BASE_URL, KisClient
+from app.brokers.kis_client import (
+    KIS_PAPER_BASE_URL,
+    KisApiError,
+    KisClient,
+    is_account_rate_limited_error,
+)
 from app.config import settings
 from app.models import LiveOrderRequest, PaperRunRequest
 from app.storage.market_data import get_latest_market_context
@@ -312,6 +317,12 @@ def broker_paper_safety_check(
             diagnostics,
             code="kis_token_unavailable_rate_limited",
         )
+    if diagnostics.get("kis_account_rate_limited"):
+        return _broker_submit_block(
+            "kis_account_rate_limited",
+            diagnostics,
+            code="kis_account_rate_limited",
+        )
 
     probe_symbol = symbol or getattr(req, "symbol", None) or "005930"
     try:
@@ -325,6 +336,19 @@ def broker_paper_safety_check(
     try:
         balance = client.get_balance()
         cash = _extract_cash_or_buying_power(balance)
+    except KisApiError as exc:
+        if is_account_rate_limited_error(exc):
+            diagnostics = (
+                client.runtime_diagnostics()
+                if hasattr(client, "runtime_diagnostics")
+                else diagnostics
+            )
+            return _broker_submit_block(
+                "kis_account_rate_limited",
+                diagnostics,
+                code="kis_account_rate_limited",
+            )
+        return _broker_submit_block(f"KIS mock account probe failed: {exc}", diagnostics)
     except Exception as exc:
         return _broker_submit_block(f"KIS mock account probe failed: {exc}", diagnostics)
     if cash is None:

@@ -54,6 +54,7 @@ def trading_status_snapshot(
         broker_provider=broker_provider,
     )
     kis_token = _kis_token_status(mode=mode, broker_provider=broker_provider)
+    kis_account = _kis_account_status(mode=mode, broker_provider=broker_provider)
     if broker_safety["broker_submit_blocked"]:
         mode_flags["submits_to_broker"] = False
 
@@ -159,6 +160,7 @@ def trading_status_snapshot(
         "last_broker_submit_error": order_state.get("last_broker_submit_error"),
         "last_broker_sync_at": _last_broker_sync_at(paths["broker_sync_db_path"]),
         **kis_token,
+        **kis_account,
         "broker_submit_blocked": broker_safety["broker_submit_blocked"],
         "broker_submit_block_reason": broker_safety["broker_submit_block_reason"],
         "broker_submit_block_code": broker_safety.get("broker_submit_block_code"),
@@ -610,6 +612,33 @@ def _kis_token_status(*, mode: str, broker_provider: str) -> dict[str, Any]:
         }
 
 
+def _kis_account_status(*, mode: str, broker_provider: str) -> dict[str, Any]:
+    defaults = {
+        "kis_account_rate_limited": False,
+        "kis_account_next_probe_allowed_at": None,
+        "kis_account_last_probe_at": None,
+        "kis_account_last_probe_operation": None,
+        "kis_account_last_probe_error": None,
+        "kis_account_last_success_at": None,
+        "kis_account_cache_enabled": False,
+        "kis_account_cached_operation_count": 0,
+    }
+    if str(broker_provider or "").lower() != "kis":
+        return defaults
+    if str(mode or "").lower() not in {"broker_paper", "live"}:
+        return defaults
+    try:
+        return {
+            **defaults,
+            **KisClient(is_paper=bool(settings.kis_is_paper)).account_status(),
+        }
+    except Exception as exc:
+        return {
+            **defaults,
+            "kis_account_last_probe_error": str(exc),
+        }
+
+
 def _broker_submit_static_status(
     *,
     execution_mode: str,
@@ -647,6 +676,17 @@ def _broker_submit_static_status(
             "broker_submit_block_reason": "kis_token_unavailable_rate_limited",
             "broker_submit_block_code": "kis_token_unavailable_rate_limited",
             "kis_token": token_status,
+        }
+    account_status = _kis_account_status(
+        mode=execution_mode,
+        broker_provider=broker_provider,
+    )
+    if account_status.get("kis_account_rate_limited"):
+        return {
+            "broker_submit_blocked": True,
+            "broker_submit_block_reason": "kis_account_rate_limited",
+            "broker_submit_block_code": "kis_account_rate_limited",
+            "kis_account": account_status,
         }
     storage = settings.storage_status()
     if not storage.get("data_dir_writable") or not storage.get("data_dir_is_persistent"):

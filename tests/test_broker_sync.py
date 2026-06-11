@@ -236,6 +236,35 @@ def test_sync_kis_account_returns_token_backoff_for_egw00133():
     assert result["kis_token"]["kis_token_status"] == "backoff"
 
 
+def test_sync_kis_account_returns_account_backoff_for_egw00201():
+    class FakeClient:
+        account_no = "50189471"
+        account_product_code = "01"
+        is_paper = True
+
+        def get_balance(self):
+            raise KisApiError(
+                "KIS API error EGW00201: ledger TPS exceeded",
+                status_code=403,
+                error_code="EGW00201",
+                error_description="ledger TPS exceeded",
+            )
+
+        def account_status(self):
+            return {
+                "kis_account_rate_limited": True,
+                "kis_account_next_probe_allowed_at": "2026-06-11T09:01:10",
+            }
+
+    result = sync_kis_account(client=FakeClient())
+
+    assert result["status"] == "account_backoff"
+    assert result["message"] == "kis_account_rate_limited"
+    assert result["recoverable"] is True
+    assert result["kis_account"]["kis_account_rate_limited"] is True
+    assert "config" not in result["status"]
+
+
 def test_broker_sync_once_does_not_reconcile_when_sync_has_config_error(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
@@ -265,5 +294,9 @@ def test_broker_sync_worker_backs_off_on_token_backoff(monkeypatch):
 
     assert broker_sync_worker._next_sleep_seconds(
         {"status": "token_backoff"},
+        60,
+    ) == 900
+    assert broker_sync_worker._next_sleep_seconds(
+        {"status": "account_backoff"},
         60,
     ) == 900

@@ -10,6 +10,7 @@ from app.brokers.kis_client import (
     KisApiError,
     KisClient,
     KisConfigError,
+    is_account_rate_limited_error,
     is_invalid_account_error,
 )
 from app.config import settings
@@ -44,6 +45,21 @@ def _is_kis_token_rate_limited_error(exc: Exception) -> bool:
         )
     )
     return "EGW00133" in text or "kis_token_rate_limited" in text
+
+
+def _is_kis_account_rate_limited_error(exc: Exception) -> bool:
+    if isinstance(exc, KisApiError) and is_account_rate_limited_error(exc):
+        return True
+    text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(exc, "error_code", None),
+            getattr(exc, "error_description", None),
+            getattr(exc, "response_text", None),
+            exc,
+        )
+    )
+    return "EGW00201" in text or "kis_account_rate_limited" in text
 
 
 def _invalidate_kis_client_token(client: KisClient) -> None:
@@ -217,6 +233,17 @@ def sync_kis_account(
                 "recoverable": True,
                 "kis_token": client.token_status()
                 if hasattr(client, "token_status")
+                else {},
+            }
+        if _is_kis_account_rate_limited_error(exc):
+            return {
+                "status": "account_backoff",
+                "broker": "KIS",
+                "message": "kis_account_rate_limited",
+                "error_code": exc.error_code,
+                "recoverable": True,
+                "kis_account": client.account_status()
+                if hasattr(client, "account_status")
                 else {},
             }
         if is_invalid_account_error(exc):

@@ -747,6 +747,34 @@ def test_start_reuses_active_session_for_same_account(tmp_path, monkeypatch):
     assert "no duplicate session" in second["message"]
 
 
+def test_broker_paper_start_allows_temporary_account_rate_limit(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "auto.sqlite3"
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(db_path))
+    monkeypatch.setattr(settings, "auto_trading_one_session_per_account", True)
+    monkeypatch.setattr(
+        auto_trading,
+        "broker_paper_safety_check",
+        lambda req, symbol=None: {
+            "approved": False,
+            "broker_submit_blocked": True,
+            "broker_submit_block_code": "kis_account_rate_limited",
+            "broker_submit_block_reason": "kis_account_rate_limited",
+        },
+    )
+
+    started = auto_trading.start_auto_trading(
+        AutoTradeStartRequest(execution_mode="broker_paper")
+    )
+    session = auto_trading_store.get_session(started["session_id"], db_path=db_path)
+
+    assert started["status"] == "active"
+    assert started["execution_mode"] == "broker_paper"
+    assert session["status"] == "active"
+
+
 def test_live_orchestrator_waits_for_exit_fill_before_entry(monkeypatch):
     run_calls = []
     monkeypatch.setattr(settings, "live_exit_confirm_before_entry", True)

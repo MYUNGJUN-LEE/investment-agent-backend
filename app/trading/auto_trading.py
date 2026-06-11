@@ -2170,6 +2170,15 @@ def _resolve_account_balance(req: AutoTradeStartRequest) -> dict[str, Any]:
                 "mode": req.execution_mode,
                 "message": f"Broker account balance check failed; no orders will be attempted: {exc}",
             }
+        if sync_result.get("status") == "account_backoff":
+            return {
+                "status": "blocked",
+                "mode": req.execution_mode,
+                "message": "Broker account ledger is rate limited; broker submit is temporarily blocked.",
+                "broker_submit_blocked": True,
+                "broker_submit_block_reason": "kis_account_rate_limited",
+                "broker_sync": sync_result,
+            }
         cash_available = _to_float(sync_result.get("total_cash"))
         account_equity = _to_float(sync_result.get("total_value")) or req.account_equity
         if cash_available is None:
@@ -3181,7 +3190,10 @@ def _validate_start_request(req: AutoTradeStartRequest) -> None:
         if not safety.get("approved"):
             if (
                 safety.get("broker_submit_block_code")
-                == "kis_token_unavailable_rate_limited"
+                in {
+                    "kis_token_unavailable_rate_limited",
+                    "kis_account_rate_limited",
+                }
             ):
                 return
             raise AutoTradingError(

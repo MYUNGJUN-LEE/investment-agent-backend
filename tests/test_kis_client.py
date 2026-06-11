@@ -13,6 +13,7 @@ from app.brokers.kis_client import (
     KisApiError,
     KisClient,
     KisConfigError,
+    is_account_rate_limited_error,
     is_invalid_account_error,
 )
 
@@ -292,6 +293,108 @@ def test_token_rate_limit_sets_shared_cooldown(tmp_path):
     assert status["kis_token_refresh_blocked_by_rate_limit"] is True
     assert status["kis_token_next_refresh_allowed_at"]
     assert status["kis_token_last_refresh_error"] == "kis_token_rate_limited"
+
+
+def test_get_balance_reuses_shared_account_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(kis_client.settings, "kis_account_cache_ttl_seconds", 60)
+    token_cache_path = tmp_path / "kis_token_cache.json"
+    account_cache_path = tmp_path / "kis_account_cache.json"
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/oauth2/tokenP":
+            return httpx.Response(200, json={"access_token": "account-token", "expires_in": 86400})
+        return httpx.Response(
+            200,
+            json={
+                "rt_cd": "0",
+                "output1": [],
+                "output2": [{"dnca_tot_amt": "10000000"}],
+            },
+        )
+
+    first = KisClient(
+        app_key="account-cache-key",
+        app_secret="account-cache-secret",
+        account_no="12345678",
+        account_product_code="01",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=token_cache_path,
+        account_cache_path=account_cache_path,
+    )
+    second = KisClient(
+        app_key="account-cache-key",
+        app_secret="account-cache-secret",
+        account_no="12345678",
+        account_product_code="01",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=token_cache_path,
+        account_cache_path=account_cache_path,
+    )
+
+    assert first.get_balance()["output2"][0]["dnca_tot_amt"] == "10000000"
+    assert second.get_balance()["output2"][0]["dnca_tot_amt"] == "10000000"
+    assert calls == ["/oauth2/tokenP", "/uapi/domestic-stock/v1/trading/inquire-balance"]
+    assert second.account_status()["kis_account_cached_operation_count"] == 1
+
+
+def test_account_ledger_rate_limit_sets_shared_backoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(kis_client.settings, "kis_account_rate_limit_backoff_seconds", 65)
+    token_cache_path = tmp_path / "kis_token_cache.json"
+    account_cache_path = tmp_path / "kis_account_cache.json"
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/oauth2/tokenP":
+            return httpx.Response(200, json={"access_token": "account-token", "expires_in": 86400})
+        return httpx.Response(
+            200,
+            json={
+                "rt_cd": "1",
+                "msg_cd": "EGW00201",
+                "msg1": "ledger TPS exceeded",
+            },
+        )
+
+    first = KisClient(
+        app_key="account-backoff-key",
+        app_secret="account-backoff-secret",
+        account_no="12345678",
+        account_product_code="01",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=token_cache_path,
+        account_cache_path=account_cache_path,
+    )
+    second = KisClient(
+        app_key="account-backoff-key",
+        app_secret="account-backoff-secret",
+        account_no="12345678",
+        account_product_code="01",
+        is_paper=True,
+        transport=httpx.MockTransport(handler),
+        token_cache_path=token_cache_path,
+        account_cache_path=account_cache_path,
+    )
+
+    with pytest.raises(KisApiError) as exc_info:
+        first.get_balance()
+    assert exc_info.value.error_code == "EGW00201"
+    assert is_account_rate_limited_error(exc_info.value) is True
+    assert is_invalid_account_error(exc_info.value) is False
+
+    with pytest.raises(KisApiError) as second_exc:
+        second.get_balance()
+    assert second_exc.value.error_code == "EGW00201"
+    assert calls == ["/oauth2/tokenP", "/uapi/domestic-stock/v1/trading/inquire-balance"]
+    status = second.account_status()
+    assert status["kis_account_rate_limited"] is True
+    assert status["kis_account_next_probe_allowed_at"]
+    assert status["kis_account_last_probe_error"] == "kis_account_rate_limited"
 
 
 def test_get_current_price_requests_domestic_stock_quote():

@@ -409,6 +409,50 @@ def test_broker_paper_status_blocks_submit_during_kis_token_backoff(
     assert status["submits_to_broker"] is False
 
 
+def test_broker_paper_status_blocks_submit_during_kis_account_backoff(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "kis_is_paper", True)
+    monkeypatch.setattr(settings, "kis_app_key", "account-app-key")
+    monkeypatch.setattr(settings, "kis_app_secret", "account-app-secret")
+    monkeypatch.setattr(settings, "kis_account_no", "12345678")
+    monkeypatch.setattr(settings, "kis_account_product_code", "01")
+    account_client = KisClient(is_paper=True)
+    cache_path = settings.storage_path(settings.kis_account_cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    next_allowed = (datetime.now() + timedelta(seconds=65)).isoformat(
+        timespec="seconds"
+    )
+    cache_path.write_text(
+        json.dumps(
+            {
+                account_client._account_cache_key(): {
+                    "cooldown_until": next_allowed,
+                    "next_probe_allowed_at": next_allowed,
+                    "last_probe_attempt_at": datetime.now().isoformat(
+                        timespec="seconds"
+                    ),
+                    "last_probe_error": "kis_account_rate_limited",
+                    "last_error_code": "EGW00201",
+                    "is_paper": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = execution_status.trading_status_snapshot(execution_mode="broker_paper")
+
+    assert status["kis_account_rate_limited"] is True
+    assert status["kis_account_next_probe_allowed_at"] == next_allowed
+    assert status["broker_submit_blocked"] is True
+    assert status["broker_submit_block_reason"] == "kis_account_rate_limited"
+    assert status["broker_submit_block_code"] == "kis_account_rate_limited"
+    assert status["submits_to_broker"] is False
+
+
 def test_claimed_candidate_without_submission_is_not_submitted(
     tmp_path,
     monkeypatch,

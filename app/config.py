@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     kis_token_cache_path: str = "data/kis_token_cache.json"
     kis_token_issue_cooldown_seconds: int = 70
     kis_token_refresh_buffer_seconds: int = 600
+    kis_account_cache_path: str = "data/kis_account_cache.json"
+    kis_account_cache_ttl_seconds: int = 20
+    kis_account_rate_limit_backoff_seconds: int = 70
+    kis_account_min_probe_interval_seconds: float = 2.0
     kis_request_min_interval_seconds: float = 1.5
 
     # Optional JSON feed used by app.data_sources.market_context.
