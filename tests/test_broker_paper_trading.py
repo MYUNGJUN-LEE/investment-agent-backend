@@ -459,6 +459,161 @@ def test_broker_paper_prevents_duplicate_symbol_order(tmp_path, monkeypatch):
     assert status["last_order_by_symbol"]["005930"]["scan_id"] == "scan-dup"
 
 
+def test_zero_broker_paper_limits_are_unlimited_but_open_order_still_blocks(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_kis_paper_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "broker_paper_max_order_krw", 0.0)
+    monkeypatch.setattr(settings, "broker_paper_max_daily_orders", 0)
+    monkeypatch.setattr(settings, "broker_paper_max_daily_orders_per_symbol", 0)
+    monkeypatch.setattr(settings, "broker_paper_symbol_cooldown_days", 0)
+    monkeypatch.setattr(settings, "broker_paper_max_daily_notional_krw", 0.0)
+
+    for index, symbol in enumerate(("111111", "222222", "333333"), start=1):
+        order_state.record_broker_order_event(
+            {
+                "session_id": f"session-{index}",
+                "scan_id": f"scan-{index}",
+                "symbol": symbol,
+                "side": "buy",
+                "qty": 1,
+                "order_type": "limit",
+                "limit_price": 100_000,
+                "submitted_price": 100_000,
+                "broker_provider": "kis",
+                "kis_is_paper": True,
+                "execution_mode": "broker_paper",
+                "broker_order_id": f"FILLED{index}",
+                "order_status": "filled",
+                "raw_response": {"rt_cd": "0"},
+            }
+        )
+
+    req = LiveOrderRequest(
+        symbol="444444",
+        market="KR",
+        broker_provider="kis",
+        side="buy",
+        order_type="limit",
+        price=1_000_000,
+        quantity=10,
+        confirm_token="broker_paper",
+        decision_price=1_000_000,
+        scan_id="scan-new",
+    )
+    guard = order_state.validate_broker_paper_order(req)
+
+    assert guard["approved"] is True
+    assert guard["broker_order_risk_limits"]["max_order_krw"] == 0.0
+    assert guard["broker_order_risk_limits"]["max_daily_orders"] == 0
+    assert guard["broker_order_risk_limits"]["max_daily_orders_per_symbol"] == 0
+    assert guard["broker_order_risk_limits"]["symbol_cooldown_days"] == 0
+    assert guard["broker_order_risk_limits"]["max_daily_notional_krw"] == 0.0
+
+    order_state.record_broker_order_event(
+        {
+            "session_id": "session-open",
+            "scan_id": "scan-open",
+            "symbol": "444444",
+            "side": "buy",
+            "qty": 1,
+            "order_type": "limit",
+            "limit_price": 1_000_000,
+            "submitted_price": 1_000_000,
+            "broker_provider": "kis",
+            "kis_is_paper": True,
+            "execution_mode": "broker_paper",
+            "broker_order_id": "OPEN1",
+            "order_status": "submitted",
+            "raw_response": {"rt_cd": "0"},
+        }
+    )
+    blocked = order_state.validate_broker_paper_order(req)
+
+    assert blocked["approved"] is False
+    assert blocked["broker_submit_block_code"] == "open_broker_order_exists"
+
+
+def test_claimed_broker_paper_candidate_records_no_order_reason(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_kis_paper_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        auto_trading,
+        "broker_paper_safety_check",
+        lambda **kwargs: {"approved": True, "broker_submit_blocked": False},
+    )
+    monkeypatch.setattr(
+        auto_trading.broker_sync,
+        "sync_kis_account",
+        lambda **kwargs: {
+            "status": "success",
+            "account_no": "12345678",
+            "total_cash": 10_000_000,
+            "total_value": 10_000_000,
+            "execution_count": 0,
+            "synced_at": "2026-06-06T09:00:00",
+        },
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "create_order_preview",
+        lambda req: {
+            "status": "blocked",
+            "preview_id": 1,
+            "preview_token": None,
+            "symbol": req.symbol,
+            "signal_type": "entry",
+            "side": "BUY",
+            "price": req.price,
+            "quantity": req.quantity,
+            "amount": req.price * req.quantity,
+            "recommended_quantity": None,
+            "message": "Risk blocked this order preview",
+            "strategy_decision": {"approved": True},
+            "risk_decision": {
+                "approved": False,
+                "code": "risk_cap",
+                "message": "risk cap",
+            },
+            "cost_edge_decision": None,
+        },
+    )
+
+    response = client.post(
+        "/auto-trading/run-once",
+        headers=_auth_headers(),
+        json={
+            "execution_mode": "broker_paper",
+            "broker_provider": "kis",
+            "auto_discover_symbols": False,
+            "symbols": [
+                {
+                    "symbol": "005930",
+                    "price": 75000,
+                    "quantity": 1,
+                    "claimed": True,
+                    "claim_time": "2026-06-06T09:00:00",
+                    "candidate_status": "CLAIMED",
+                    "candidate_decision": "buy_candidate",
+                    "expected_gross_edge_bps": 100,
+                    "expected_win_bps": 100,
+                    "expected_loss_bps": 40,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["claimed"] is True
+    assert result["broker_submit_attempted"] is False
+    assert result["claimed_no_order_reason"] == "risk_manager_rejected"
+    assert result["post_claim_diagnostics"]["risk_approved"] is False
+
+
 def test_broker_paper_scan_symbol_side_dedupe_blocks_filled_prior_event(
     tmp_path,
     monkeypatch,

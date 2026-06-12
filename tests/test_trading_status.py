@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
-from app.models import PaperRunRequest
+from app.models import AutoTradeStartRequest, PaperRunRequest
 from app.brokers.kis_client import KisClient
 from app.trading import auto_trading, execution_status, paper_trading, risk_manager
 from app.trading import auto_trading_store
@@ -498,3 +498,53 @@ def test_claimed_candidate_without_submission_is_not_submitted(
     assert status["claimed_candidate_count"] == 1
     assert status["submitted_order_count"] == 0
     assert status["order_status"] == "not_submitted"
+
+
+def test_trading_status_exposes_post_claim_no_order_diagnostics(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    session = auto_trading_store.create_session(
+        AutoTradeStartRequest(
+            execution_mode="broker_paper",
+            auto_discover_symbols=False,
+        )
+    )
+    auto_trading_store.complete_cycle(
+        session["session_id"],
+        [
+            {
+                "symbol": "005930",
+                "status": "blocked",
+                "claimed": True,
+                "claimed_no_order_reason": "risk_manager_rejected",
+                "post_claim_diagnostics": {
+                    "symbol": "005930",
+                    "claimed": True,
+                    "claim_time": "2026-06-06T09:00:00",
+                    "execution_mode": "broker_paper",
+                    "submits_to_broker": True,
+                    "uses_internal_paper_orders": False,
+                    "planned_entry": True,
+                    "entry_signal": True,
+                    "candidate_decision": "buy_candidate",
+                    "candidate_status": "CLAIMED",
+                    "broker_submit_attempted": False,
+                    "broker_submit_blocked": False,
+                    "kis_submit_attempted": False,
+                    "claimed_no_order_reason": "risk_manager_rejected",
+                },
+            }
+        ],
+    )
+
+    status = execution_status.trading_status_snapshot(execution_mode="broker_paper")
+
+    assert status["claimed_no_order_count"] == 1
+    assert status["claimed_no_order_reasons"] == {"risk_manager_rejected": 1}
+    assert status["latest_post_claim_diagnostics"]["symbol"] == "005930"
+    assert (
+        status["latest_post_claim_diagnostics"]["claimed_no_order_reason"]
+        == "risk_manager_rejected"
+    )

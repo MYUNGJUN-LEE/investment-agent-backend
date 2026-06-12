@@ -373,6 +373,16 @@ class AutoTradeSymbolConfig(BaseModel):
     signal_decay: dict[str, Any] | None = None
     final_entry_edge: float | None = None
     scan_id: str | None = None
+    claimed: bool = False
+    claim_time: str | None = None
+    claimed_by_worker: str | None = None
+    candidate_status: str | None = None
+    candidate_decision: str | None = None
+    candidate_reason: str | None = None
+    fresh_quote_used: bool | None = None
+    fresh_quote_age_seconds: float | None = None
+    cached_snapshot_age_seconds: float | None = None
+    order_trace: dict[str, Any] | None = None
 
 
 class AutoTradeStartRequest(BaseModel):
@@ -559,3 +569,4 @@ class GptAutoTradeControlResponse(BaseModel):
     active_sessions: list[AutoTradeStatusResponse] = Field(default_factory=list)
     recent_sessions: list[AutoTradeStatusResponse] = Field(default_factory=list)
     worker_status: dict[str, Any] | None = None
+    requested_execution: dict[str, Any] | None = None

@@ -58,6 +58,12 @@ def execute_live_order(
         raise LiveTradingError(
             f"Risk rejected: {decision.message} ({decision.code})",
             status_code=403,
+            code="risk_manager_rejected",
+            details={
+                "risk_approved": False,
+                "risk_code": decision.code,
+                "risk_message": decision.message,
+            },
         )
 
     client = KisClient(is_paper=False)
@@ -140,11 +146,17 @@ def execute_broker_paper_order(
             guard.get("broker_submit_block_reason")
             or "Broker paper order blocked"
         )
+        details = {
+            **guard,
+            "order_state_approved": False,
+            "order_state_code": guard.get("broker_submit_block_code"),
+            "order_state_message": reason,
+        }
         raise LiveTradingError(
             reason,
             status_code=403,
             code=guard.get("broker_submit_block_code"),
-            details=guard,
+            details=details,
         )
 
     try:

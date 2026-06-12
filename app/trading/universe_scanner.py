@@ -181,6 +181,12 @@ CREATE TABLE IF NOT EXISTS scanner_candidates (
     news_count INTEGER DEFAULT 0,
     disclosure_count INTEGER DEFAULT 0,
     claimed_by_worker TEXT,
+    claimed_at TEXT,
+    prefilter_score REAL,
+    fresh_quote_used INTEGER DEFAULT 1,
+    fresh_quote_age_seconds REAL,
+    cached_snapshot_age_seconds REAL,
+    exclusion_reason TEXT,
     expires_at TEXT NOT NULL,
     raw_json TEXT NOT NULL,
     UNIQUE(symbol)
@@ -217,8 +223,20 @@ CREATE TABLE IF NOT EXISTS scanner_candidate_history (
     news_count INTEGER DEFAULT 0,
     disclosure_count INTEGER DEFAULT 0,
     claimed_by_worker TEXT,
+    claimed_at TEXT,
+    prefilter_score REAL,
+    fresh_quote_used INTEGER DEFAULT 1,
+    fresh_quote_age_seconds REAL,
+    cached_snapshot_age_seconds REAL,
+    exclusion_reason TEXT,
     expires_at TEXT,
     raw_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS scanner_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_scanner_candidate_history_scan
@@ -259,17 +277,35 @@ def scan_universe_for_auto_trade(
     if reuse is not None:
         return reuse
 
+    prefilter_plan = _cached_prefilter_plan(path, source_symbols)
+    collect_source_symbols = prefilter_plan["fresh_quote_symbols"]
     snapshots, collection = _collect_price_snapshots_for_mode(
-        source_symbols,
-        full_scan=bool(universe_sources.get("full_kospi_scan")),
+        collect_source_symbols,
+        full_scan=False
+        if prefilter_plan["enabled"]
+        else bool(universe_sources.get("full_kospi_scan")),
     )
+    snapshots = _annotate_fresh_quote_snapshots(
+        snapshots,
+        prefilter_plan=prefilter_plan,
+    )
+    if prefilter_plan["enabled"]:
+        cached_snapshots = _cached_only_prefilter_snapshots(prefilter_plan)
+        snapshots = snapshots + cached_snapshots
+        collection.update(_prefilter_collection_diagnostics(prefilter_plan, snapshots))
     universe_sources["batch_count"] = collection.get("batch_count", 1)
     universe_sources["batch_error_count"] = collection.get(
         "batch_error_count",
         collection.get("error_count", 0),
     )
+    universe_sources["cached_prefilter"] = prefilter_plan["public"]
     snapshots, cleaning = _clean_universe_snapshots(snapshots)
-    _record_snapshots(path, scan_id, created_at, snapshots)
+    _record_snapshots(
+        path,
+        scan_id,
+        created_at,
+        [item for item in snapshots if item.get("fresh_quote_used") is not False],
+    )
 
     ranked = sorted(
         (_score_snapshot(item) for item in snapshots if item.get("universe_cleaning_passed")),
@@ -340,6 +376,17 @@ def scan_universe_for_auto_trade(
         "snapshot_collection_timed_out": collection["timed_out"],
         "snapshot_collection_message": collection.get("message"),
         "snapshot_batch_diagnostics": collection.get("batch_diagnostics", []),
+        "fresh_quote_cap": collection.get("fresh_quote_cap"),
+        "fresh_quote_requested_count": collection.get("fresh_quote_requested_count"),
+        "fresh_quote_used_count": collection.get("fresh_quote_used_count"),
+        "cached_only_evaluated_count": collection.get("cached_only_evaluated_count"),
+        "prefilter_evaluated_count": collection.get("prefilter_evaluated_count"),
+        "korea_api_call_count_estimate": collection.get(
+            "korea_api_call_count_estimate"
+        ),
+        "rotation_offset": collection.get("rotation_offset"),
+        "rotation_epoch": collection.get("rotation_epoch"),
+        "rotation_window_seconds": collection.get("rotation_window_seconds"),
         "candidate_limit": candidate_limit,
         "final_limit": final_limit,
         "candidate_count": len(candidates),
@@ -369,6 +416,11 @@ def scan_universe_for_auto_trade(
         "candidates": _compact_candidates(active_candidates),
         "final_candidates": _compact_candidates(active_candidates),
         "ready_candidates": _compact_candidates(ready_candidates),
+        "claimed_order_diagnostics": _claimed_candidates_without_symbol_diagnostics(
+            req=req,
+            candidates=ready_candidates,
+            symbols=symbols,
+        ),
         "symbols": symbols,
     }
     _record_scan_run(path, result)
@@ -395,11 +447,13 @@ def get_latest_universe_scan(
             """
             SELECT symbol, name, rank, composite_score AS score, raw_score,
                    expected_return, expected_risk, trading_cost, slippage_cost,
-                   net_edge, composite_score, status, claimed_by_worker,
+                   net_edge, composite_score, status, claimed_by_worker, claimed_at,
                    expires_at, decision, reason, current_price, change_rate,
                    volume, volume_ratio, turnover_value, news_count,
                    market_cap, market_segment, universe_profile,
-                   disclosure_count
+                   disclosure_count, prefilter_score, fresh_quote_used,
+                   fresh_quote_age_seconds, cached_snapshot_age_seconds,
+                   exclusion_reason
             FROM scanner_candidates
             WHERE scan_id = ?
             ORDER BY rank ASC
@@ -615,16 +669,24 @@ def get_ready_execution_candidates(
             """,
             (hurdle_rate, now, limit),
         ).fetchall()
+        claimed_at = _now() if worker_id and rows else None
         if worker_id and rows:
             conn.executemany(
                 """
                 UPDATE scanner_candidates
-                SET status = 'CLAIMED', claimed_by_worker = ?
+                SET status = 'CLAIMED', claimed_by_worker = ?, claimed_at = ?
                 WHERE id = ? AND status = 'READY'
                 """,
-                [(worker_id, row["id"]) for row in rows],
+                [(worker_id, claimed_at, row["id"]) for row in rows],
             )
-    return [dict(row) for row in rows]
+    output = [dict(row) for row in rows]
+    if worker_id and claimed_at:
+        for item in output:
+            item["status"] = "CLAIMED"
+            item["claimed"] = True
+            item["claimed_by_worker"] = worker_id
+            item["claimed_at"] = claimed_at
+    return output
 
 
 def get_active_scanner_candidates(
@@ -663,6 +725,78 @@ def scanner_candidate_to_symbol_config(
     return _to_symbol_config(req, candidate)
 
 
+def _claimed_candidates_without_symbol_diagnostics(
+    *,
+    req: AutoTradeStartRequest,
+    candidates: list[dict[str, Any]],
+    symbols: list[AutoTradeSymbolConfig],
+) -> list[dict[str, Any]]:
+    planned_symbols = {item.symbol for item in symbols}
+    diagnostics: list[dict[str, Any]] = []
+    for candidate in candidates:
+        symbol = str(candidate.get("symbol") or "")
+        if not symbol:
+            continue
+        claimed = bool(
+            candidate.get("claimed")
+            or candidate.get("claimed_at")
+            or str(candidate.get("status") or "").upper() == "CLAIMED"
+        )
+        if not claimed or symbol in planned_symbols:
+            continue
+        price = _to_float(candidate.get("current_price"))
+        if price is None or price <= 0:
+            reason = "price_zero_or_missing"
+        elif req.execution_mode == "paper":
+            reason = "execution_mode_paper_not_broker_paper"
+        else:
+            reason = "not_planned_entry"
+        diagnostics.append(
+            {
+                "symbol": symbol,
+                "claimed": True,
+                "claim_time": candidate.get("claimed_at"),
+                "execution_mode": req.execution_mode,
+                "submits_to_broker": req.execution_mode in ("broker_paper", "live"),
+                "uses_internal_paper_orders": req.execution_mode == "paper",
+                "planned_entry": False,
+                "entry_signal": None,
+                "entry_signal_source": "scanner_candidate",
+                "candidate_decision": candidate.get("decision"),
+                "candidate_status": candidate.get("status"),
+                "final_entry_edge": (
+                    _to_float(candidate.get("final_entry_edge"))
+                    or _to_float(candidate.get("net_edge"))
+                ),
+                "quantity": None,
+                "order_price": price,
+                "notional_krw": None,
+                "broker_submit_attempted": False,
+                "broker_submit_blocked": False,
+                "broker_submit_block_code": None,
+                "broker_submit_block_reason": None,
+                "risk_approved": None,
+                "risk_code": None,
+                "risk_message": None,
+                "order_state_approved": None,
+                "order_state_code": None,
+                "order_state_message": None,
+                "kis_submit_attempted": False,
+                "kis_response_code": None,
+                "kis_response_message": None,
+                "broker_order_status": None,
+                "claimed_no_order_reason": reason,
+                "candidate_reason": candidate.get("reason"),
+                "fresh_quote_used": candidate.get("fresh_quote_used"),
+                "fresh_quote_age_seconds": candidate.get("fresh_quote_age_seconds"),
+                "cached_snapshot_age_seconds": candidate.get(
+                    "cached_snapshot_age_seconds"
+                ),
+            }
+        )
+    return diagnostics
+
+
 def initialize_universe_db(db_path: Path | str | None = None) -> None:
     path = _db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -685,6 +819,13 @@ def _ensure_universe_schema_migrations(conn: sqlite3.Connection) -> None:
         _ensure_column(conn, table, "market_cap", "REAL")
         _ensure_column(conn, table, "market_segment", "TEXT")
         _ensure_column(conn, table, "universe_profile", "TEXT")
+        if table in {"scanner_candidates", "scanner_candidate_history"}:
+            _ensure_column(conn, table, "claimed_at", "TEXT")
+            _ensure_column(conn, table, "prefilter_score", "REAL")
+            _ensure_column(conn, table, "fresh_quote_used", "INTEGER DEFAULT 1")
+            _ensure_column(conn, table, "fresh_quote_age_seconds", "REAL")
+            _ensure_column(conn, table, "cached_snapshot_age_seconds", "REAL")
+            _ensure_column(conn, table, "exclusion_reason", "TEXT")
 
 
 def _ensure_column(
@@ -759,9 +900,11 @@ def _backfill_scanner_candidate_history_from_legacy(conn: sqlite3.Connection) ->
                 composite_score, rank, reason, status, decision, current_price,
                 change_rate, volume, volume_ratio, turnover_value, market_cap,
                 market_segment, universe_profile, news_count, disclosure_count,
-                claimed_by_worker, expires_at, raw_json
+                claimed_by_worker, claimed_at, prefilter_score, fresh_quote_used,
+                fresh_quote_age_seconds, cached_snapshot_age_seconds,
+                exclusion_reason, expires_at, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -1302,6 +1445,368 @@ def _market_non_final_reasons(
         if len(rows) >= limit:
             break
     return rows
+
+
+def _cached_prefilter_plan(
+    path: Path,
+    source_symbols: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    enabled = bool(settings.universe_scanner_cached_prefilter_enabled)
+    if not enabled:
+        return {
+            "enabled": False,
+            "rows": [],
+            "fresh_quote_symbols": source_symbols,
+            "fresh_symbols": set(source_symbols.keys()),
+            "latest_snapshots": {},
+            "public": {
+                "enabled": False,
+                "fresh_quote_cap": len(source_symbols),
+                "prefilter_evaluated_count": len(source_symbols),
+            },
+        }
+
+    max_prefilter = max(
+        1,
+        int(settings.universe_scanner_prefilter_max_symbols or 500),
+    )
+    fresh_cap = max(
+        0,
+        int(settings.universe_scanner_max_fresh_quote_symbols or 42),
+    )
+    latest = _latest_cached_snapshots(path, list(source_symbols.keys()))
+    rows: list[dict[str, Any]] = []
+    for order, (symbol, meta) in enumerate(source_symbols.items()):
+        cached = latest.get(symbol)
+        score, reasons, age_seconds = _prefilter_score(
+            symbol=symbol,
+            metadata=meta,
+            cached=cached,
+            order=order,
+        )
+        rows.append(
+            {
+                "symbol": symbol,
+                "metadata": meta,
+                "prefilter_score": round(score, 4),
+                "prefilter_reasons": reasons,
+                "cached_snapshot_age_seconds": age_seconds,
+                "fresh_quote_required": True,
+                "latest_snapshot": cached,
+            }
+        )
+
+    rows.sort(
+        key=lambda item: (
+            float(item.get("prefilter_score") or 0.0),
+            -_source_priority(item.get("metadata") or {}),
+        ),
+        reverse=True,
+    )
+    rows = rows[: min(max_prefilter, len(rows))]
+    rotation = _fresh_quote_rotation(path, total=len(rows), cap=fresh_cap)
+    fresh_rows = _rotated_rows(rows, offset=rotation["rotation_offset"], limit=fresh_cap)
+    fresh_symbols = {row["symbol"] for row in fresh_rows}
+    fresh_quote_symbols = {
+        row["symbol"]: row["metadata"]
+        for row in fresh_rows
+    }
+    public = {
+        "enabled": True,
+        "fresh_quote_cap": fresh_cap,
+        "fresh_quote_requested_count": len(fresh_quote_symbols),
+        "prefilter_evaluated_count": len(rows),
+        "source_symbol_count": len(source_symbols),
+        "cached_snapshot_available_count": sum(
+            1 for row in rows if row.get("latest_snapshot")
+        ),
+        "rotation_offset": rotation["rotation_offset"],
+        "rotation_epoch": rotation["rotation_epoch"],
+        "rotation_window_seconds": rotation["rotation_window_seconds"],
+    }
+    return {
+        "enabled": True,
+        "rows": rows,
+        "fresh_quote_symbols": fresh_quote_symbols,
+        "fresh_symbols": fresh_symbols,
+        "latest_snapshots": latest,
+        "public": public,
+        **rotation,
+    }
+
+
+def _prefilter_score(
+    *,
+    symbol: str,
+    metadata: dict[str, Any],
+    cached: dict[str, Any] | None,
+    order: int,
+) -> tuple[float, list[str], float | None]:
+    reasons: list[str] = []
+    priority = _source_priority(metadata)
+    score = max(0.0, 80.0 - priority * 8.0 - min(order, 500) * 0.01)
+    source = str(metadata.get("source") or "").lower()
+    if source in {"explicit", "seed", "watchlist"}:
+        score += 20.0
+        reasons.append(f"{source}_priority")
+    age_seconds = None
+    if cached:
+        age_seconds = _snapshot_age_seconds(cached)
+        score += 20.0
+        reasons.append("cached_snapshot_available")
+        if age_seconds is not None:
+            max_age = max(
+                1,
+                int(settings.universe_scanner_cached_snapshot_max_age_seconds or 86400),
+            )
+            freshness = max(0.0, 1.0 - min(age_seconds, max_age) / max_age)
+            score += freshness * 20.0
+            reasons.append("cached_snapshot_fresh" if freshness > 0 else "cached_snapshot_stale")
+        if _to_float(cached.get("turnover_value")):
+            score += min(12.0, float(_to_float(cached.get("turnover_value")) or 0.0) / 50_000_000_000 * 12.0)
+            reasons.append("cached_turnover")
+        if _to_float(cached.get("volume_ratio")):
+            score += min(8.0, float(_to_float(cached.get("volume_ratio")) or 0.0) * 2.0)
+            reasons.append("cached_volume_ratio")
+    if not reasons:
+        reasons.append("source_priority")
+    return score, reasons, age_seconds
+
+
+def _fresh_quote_rotation(path: Path, *, total: int, cap: int) -> dict[str, Any]:
+    window = max(
+        1,
+        int(settings.universe_scanner_rotation_window_seconds or 1800),
+    )
+    now = _now()
+    if (
+        not bool(settings.universe_scanner_rotation_enabled)
+        or cap <= 0
+        or total <= cap
+    ):
+        return {
+            "rotation_offset": 0,
+            "rotation_epoch": now,
+            "rotation_window_seconds": window,
+        }
+    state = _read_scanner_metadata(path, "fresh_quote_rotation")
+    offset = 0
+    epoch = now
+    if isinstance(state, dict):
+        offset = max(0, int(state.get("rotation_offset") or 0)) % max(1, total)
+        epoch = str(state.get("rotation_epoch") or now)
+        try:
+            epoch_dt = datetime.fromisoformat(epoch)
+            elapsed = (datetime.fromisoformat(now) - epoch_dt).total_seconds()
+        except ValueError:
+            elapsed = window
+        if elapsed >= window:
+            offset = (offset + cap) % max(1, total)
+            epoch = now
+    _write_scanner_metadata(
+        path,
+        "fresh_quote_rotation",
+        {
+            "rotation_offset": offset,
+            "rotation_epoch": epoch,
+            "rotation_window_seconds": window,
+            "total": total,
+            "cap": cap,
+        },
+    )
+    return {
+        "rotation_offset": offset,
+        "rotation_epoch": epoch,
+        "rotation_window_seconds": window,
+    }
+
+
+def _rotated_rows(
+    rows: list[dict[str, Any]],
+    *,
+    offset: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not rows or limit <= 0:
+        return []
+    limit = min(limit, len(rows))
+    offset = max(0, offset) % len(rows)
+    rotated = rows[offset:] + rows[:offset]
+    return rotated[:limit]
+
+
+def _read_scanner_metadata(path: Path, key: str) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        with _connect(path, row_factory=True) as conn:
+            row = conn.execute(
+                "SELECT value FROM scanner_metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    parsed = _parse_json(row["value"], {})
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _write_scanner_metadata(path: Path, key: str, value: dict[str, Any]) -> None:
+    try:
+        with _connect(path) as conn:
+            conn.execute(
+                """
+                INSERT INTO scanner_metadata(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, _json(value), _now()),
+            )
+    except sqlite3.Error:
+        logger.debug("failed to write scanner metadata key=%s", key, exc_info=True)
+
+
+def _latest_cached_snapshots(
+    path: Path,
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not path.exists() or not symbols:
+        return {}
+    latest: dict[str, dict[str, Any]] = {}
+    try:
+        with _connect(path, row_factory=True) as conn:
+            for chunk in _chunks(symbols, 500):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM universe_price_snapshots
+                    WHERE symbol IN ({placeholders})
+                      AND current_price IS NOT NULL
+                      AND current_price > 0
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+                for row in rows:
+                    symbol = str(row["symbol"])
+                    if symbol in latest:
+                        continue
+                    raw = _parse_json(row["raw_json"], {})
+                    payload = raw if isinstance(raw, dict) else {}
+                    latest[symbol] = {
+                        **payload,
+                        **dict(row),
+                        "source": payload.get("source") or row["source"],
+                    }
+    except sqlite3.Error:
+        return {}
+    return latest
+
+
+def _chunks(items: list[str], size: int):
+    for index in range(0, len(items), size):
+        yield items[index:index + size]
+
+
+def _annotate_fresh_quote_snapshots(
+    snapshots: list[dict[str, Any]],
+    *,
+    prefilter_plan: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not prefilter_plan.get("enabled"):
+        return snapshots
+    row_by_symbol = {
+        row["symbol"]: row
+        for row in prefilter_plan.get("rows") or []
+    }
+    annotated: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        symbol = str(snapshot.get("symbol") or "")
+        row = row_by_symbol.get(symbol) or {}
+        annotated.append(
+            {
+                **snapshot,
+                "prefilter_score": row.get("prefilter_score"),
+                "prefilter_reasons": row.get("prefilter_reasons"),
+                "cached_snapshot_age_seconds": row.get("cached_snapshot_age_seconds"),
+                "fresh_quote_required": True,
+                "fresh_quote_used": True,
+                "fresh_quote_age_seconds": 0.0,
+            }
+        )
+    return annotated
+
+
+def _cached_only_prefilter_snapshots(
+    prefilter_plan: dict[str, Any],
+) -> list[dict[str, Any]]:
+    fresh_symbols = set(prefilter_plan.get("fresh_symbols") or set())
+    max_age = max(
+        1,
+        int(settings.universe_scanner_cached_snapshot_max_age_seconds or 86400),
+    )
+    limit = max(
+        0,
+        int(settings.universe_scanner_cached_only_candidate_limit or 300),
+    )
+    snapshots: list[dict[str, Any]] = []
+    for row in prefilter_plan.get("rows") or []:
+        symbol = row.get("symbol")
+        if symbol in fresh_symbols:
+            continue
+        cached = row.get("latest_snapshot")
+        if not cached:
+            continue
+        age = row.get("cached_snapshot_age_seconds")
+        if age is not None and float(age) > max_age:
+            exclusion = "stale_cached_snapshot"
+        else:
+            exclusion = "cached_only_no_fresh_quote"
+        snapshots.append(
+            {
+                **cached,
+                "symbol": symbol,
+                "name": cached.get("name") or (row.get("metadata") or {}).get("name"),
+                "prefilter_score": row.get("prefilter_score"),
+                "prefilter_reasons": row.get("prefilter_reasons"),
+                "cached_snapshot_age_seconds": age,
+                "fresh_quote_required": True,
+                "fresh_quote_used": False,
+                "fresh_quote_age_seconds": None,
+                "exclusion_reason": exclusion,
+                "reason": _join_reasons(
+                    [
+                        str(cached.get("reason") or cached.get("message") or ""),
+                        exclusion,
+                        "deferred_due_to_fresh_quote_cap",
+                    ]
+                ),
+                "price_source": "cached_snapshot",
+            }
+        )
+        if limit and len(snapshots) >= limit:
+            break
+    return snapshots
+
+
+def _prefilter_collection_diagnostics(
+    prefilter_plan: dict[str, Any],
+    snapshots: list[dict[str, Any]],
+) -> dict[str, Any]:
+    public = dict(prefilter_plan.get("public") or {})
+    fresh_used = sum(1 for item in snapshots if item.get("fresh_quote_used") is True)
+    cached_only = sum(1 for item in snapshots if item.get("fresh_quote_used") is False)
+    return {
+        **public,
+        "fresh_quote_used_count": fresh_used,
+        "cached_only_evaluated_count": cached_only,
+        "korea_api_call_count_estimate": public.get("fresh_quote_requested_count", 0),
+        "batch_count": 1 if public.get("fresh_quote_requested_count") else 0,
+    }
 
 
 def _collect_price_snapshots(
@@ -2732,6 +3237,13 @@ def _execution_status_for_candidate(
         reasons.append("not executable")
         return "EXCLUDED", _join_reasons(reasons)
 
+    if candidate.get("fresh_quote_used") is False:
+        exclusion = str(candidate.get("exclusion_reason") or "cached_only_no_fresh_quote")
+        reasons.append(exclusion)
+        reasons.append("deferred_due_to_fresh_quote_cap")
+        reasons.append("fresh_quote_cap_reached")
+        return "SKIPPED", _join_reasons(reasons)
+
     decision = str(candidate.get("decision") or "").lower()
 
     if paper_bootstrap:
@@ -3322,6 +3834,27 @@ def _to_symbol_config(
         ),
         expected_holding_days=5.0,
         scan_id=str(candidate.get("scan_id") or ""),
+        claimed=bool(
+            candidate.get("claimed")
+            or candidate.get("claimed_at")
+            or str(candidate.get("status") or "").upper() == "CLAIMED"
+        ),
+        claim_time=candidate.get("claimed_at"),
+        claimed_by_worker=candidate.get("claimed_by_worker"),
+        candidate_status=str(candidate.get("status") or "") or None,
+        candidate_decision=str(candidate.get("decision") or "") or None,
+        candidate_reason=str(candidate.get("reason") or "") or None,
+        final_entry_edge=_to_float(candidate.get("final_entry_edge"))
+        or _to_float(candidate.get("net_edge")),
+        fresh_quote_used=(
+            None
+            if candidate.get("fresh_quote_used") is None
+            else bool(candidate.get("fresh_quote_used"))
+        ),
+        fresh_quote_age_seconds=_to_float(candidate.get("fresh_quote_age_seconds")),
+        cached_snapshot_age_seconds=_to_float(
+            candidate.get("cached_snapshot_age_seconds")
+        ),
     )
 
 
@@ -3408,6 +3941,21 @@ def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
                 "broker_paper_executable": item.get("broker_paper_executable"),
                 "calibration_gate_mode": item.get("calibration_gate_mode"),
                 "claimed_by_worker": item.get("claimed_by_worker"),
+                "claimed_at": item.get("claimed_at"),
+                "claimed": bool(
+                    item.get("claimed")
+                    or item.get("claimed_at")
+                    or str(item.get("status") or "").upper() == "CLAIMED"
+                ),
+                "prefilter_score": item.get("prefilter_score"),
+                "prefilter_reasons": item.get("prefilter_reasons"),
+                "fresh_quote_required": item.get("fresh_quote_required"),
+                "fresh_quote_used": item.get("fresh_quote_used"),
+                "fresh_quote_age_seconds": item.get("fresh_quote_age_seconds"),
+                "cached_snapshot_age_seconds": item.get(
+                    "cached_snapshot_age_seconds"
+                ),
+                "exclusion_reason": item.get("exclusion_reason"),
                 "expires_at": item.get("expires_at"),
             }
         )
@@ -3528,9 +4076,11 @@ def _record_scanner_candidates(
                     composite_score, rank, reason, status, decision, current_price,
                     change_rate, volume, volume_ratio, turnover_value, market_cap,
                     market_segment, universe_profile, news_count, disclosure_count,
-                    claimed_by_worker, expires_at, raw_json
+                    claimed_by_worker, claimed_at, prefilter_score, fresh_quote_used,
+                    fresh_quote_age_seconds, cached_snapshot_age_seconds,
+                    exclusion_reason, expires_at, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     _candidate_row_values(
@@ -3552,9 +4102,11 @@ def _record_scanner_candidates(
                     composite_score, rank, reason, status, decision, current_price,
                     change_rate, volume, volume_ratio, turnover_value, market_cap,
                     market_segment, universe_profile, news_count, disclosure_count,
-                    claimed_by_worker, expires_at, raw_json
+                    claimed_by_worker, claimed_at, prefilter_score, fresh_quote_used,
+                    fresh_quote_age_seconds, cached_snapshot_age_seconds,
+                    exclusion_reason, expires_at, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     _candidate_row_values(
@@ -3602,6 +4154,12 @@ def _candidate_row_values(
         _to_int(item.get("news_count")) or 0,
         _to_int(item.get("disclosure_count")) or 0,
         item.get("claimed_by_worker"),
+        item.get("claimed_at"),
+        _to_float(item.get("prefilter_score")),
+        1 if item.get("fresh_quote_used", True) else 0,
+        _to_float(item.get("fresh_quote_age_seconds")),
+        _to_float(item.get("cached_snapshot_age_seconds")),
+        item.get("exclusion_reason"),
         item.get("expires_at"),
         _json(item),
     )

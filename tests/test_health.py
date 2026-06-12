@@ -154,6 +154,7 @@ def test_admin_runtime_status_endpoint_returns_compact_summary():
     assert "summary" in body
     assert "auto_trading" in body
     assert "latest_universe" in body
+    assert body["latest_universe"] is None
     assert "samples" in body
     assert "workers" in body
     assert "scanner_state" in body["summary"]
@@ -162,6 +163,13 @@ def test_admin_runtime_status_endpoint_returns_compact_summary():
     assert "latest_scan_age_seconds" in body["summary"]
     assert "scanner_stale_after_seconds" in body["summary"]
     assert "locked_session_count" in body["summary"]
+
+    expanded = client.get(
+        "/admin/runtime-status?include_latest_universe=true&limit=5",
+        headers=_auth_headers(),
+    )
+    assert expanded.status_code == 200
+    assert expanded.json()["latest_universe"] is not None
 
 
 def test_edge_training_samples_refresh_endpoint_returns_diagnostics(monkeypatch):

@@ -151,13 +151,13 @@ class Settings(BaseSettings):
     outcome_attribution_enabled: bool = True
     outcome_attribution_db_path: str = "data/outcome_attribution.sqlite3"
     outcome_attribution_risk_weight: float = 0.10
-    outcome_attribution_max_records: int = 5000
+    outcome_attribution_max_records: int = 1500
     outcome_attribution_min_hold_seconds: int = 60
-    outcome_attribution_recent_limit: int = 200
+    outcome_attribution_recent_limit: int = 100
     auto_tuning_enabled: bool = True
     auto_tuning_mode: str = "recommend"
     auto_tuning_db_path: str = "data/auto_tuning.sqlite3"
-    auto_tuning_recent_limit: int = 200
+    auto_tuning_recent_limit: int = 100
     auto_tuning_min_samples: int = 30
     auto_tuning_min_loss_samples: int = 10
     auto_tuning_max_recommendations: int = 20
@@ -172,7 +172,7 @@ class Settings(BaseSettings):
     auto_tuning_signal_decay_scale_step: float = 0.20
     tuning_review_enabled: bool = True
     tuning_review_db_path: str = "data/tuning_review.sqlite3"
-    tuning_review_max_records: int = 1000
+    tuning_review_max_records: int = 300
     tuning_review_allowed_keys: str = (
         "UNIVERSE_SCANNER_DEFAULT_SLIPPAGE_BPS,"
         "SIGNAL_DECAY_HALF_LIFE_SECONDS,"
@@ -204,10 +204,10 @@ class Settings(BaseSettings):
     edge_calibration_horizon_seconds: int = 86400
     edge_calibration_max_samples: int = 2000
     edge_calibration_min_samples: int = 30
-    edge_calibration_future_price_limit: int = 1200
+    edge_calibration_future_price_limit: int = 300
     edge_calibration_label_snapshots_enabled: bool = True
-    edge_calibration_label_snapshot_max_symbols: int = 200
-    edge_calibration_refresh_batch_size: int = 500
+    edge_calibration_label_snapshot_max_symbols: int = 50
+    edge_calibration_refresh_batch_size: int = 100
     edge_calibration_refresh_after_scan: bool = False
     edge_calibration_min_label_age_seconds: int = 300
     edge_calibration_min_future_snapshots: int = 2
@@ -216,8 +216,8 @@ class Settings(BaseSettings):
     edge_calibration_candidate_lookback_seconds: int | None = None
     edge_calibration_ridge_lambda: float = 10.0
     edge_calibration_blend: float = 0.35
-    edge_calibration_target_samples: int = 3000
-    edge_calibration_sample_retention_limit: int = 10_000
+    edge_calibration_target_samples: int = 1500
+    edge_calibration_sample_retention_limit: int = 3000
     edge_calibration_gate_min_samples: int = 600
     edge_calibration_gate_min_oos_samples: int = 200
     edge_calibration_gate_max_mae_return_bps: float = 180.0
@@ -261,11 +261,11 @@ class Settings(BaseSettings):
     order_state_db_path: str = "data/order_state.sqlite3"
     order_dedupe_window_seconds: int = 120
     allow_position_additions: bool = False
-    broker_paper_max_order_krw: float = 100_000.0
-    broker_paper_max_daily_orders: int = 3
-    broker_paper_max_daily_orders_per_symbol: int = 1
-    broker_paper_symbol_cooldown_days: int = 1
-    broker_paper_max_daily_notional_krw: float = 300_000.0
+    broker_paper_max_order_krw: float = 0.0
+    broker_paper_max_daily_orders: int = 0
+    broker_paper_max_daily_orders_per_symbol: int = 0
+    broker_paper_symbol_cooldown_days: int = 0
+    broker_paper_max_daily_notional_krw: float = 0.0
     broker_paper_bootstrap_enabled: bool = True
     broker_paper_calibration_source: str = "broker_fills"
     broker_paper_candidate_label_gate_mode: str = "observe_only"
@@ -312,6 +312,13 @@ class Settings(BaseSettings):
     universe_scanner_max_scan_seconds: int = 300
     universe_scanner_candidate_ttl_seconds: int = 7200
     universe_scanner_min_interval_seconds: int = 900
+    universe_scanner_cached_prefilter_enabled: bool = True
+    universe_scanner_prefilter_max_symbols: int = 500
+    universe_scanner_max_fresh_quote_symbols: int = 42
+    universe_scanner_cached_snapshot_max_age_seconds: int = 86400
+    universe_scanner_rotation_enabled: bool = True
+    universe_scanner_rotation_window_seconds: int = 1800
+    universe_scanner_cached_only_candidate_limit: int = 300
     universe_scanner_worker_hurdle_rate_bps: float = 40.0
     universe_scanner_paper_bootstrap_soft_pass_enabled: bool = True
     universe_scanner_paper_bootstrap_min_net_edge_bps: float = -20.0

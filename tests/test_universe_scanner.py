@@ -1453,6 +1453,119 @@ def test_universe_scanner_keeps_only_top_ten_execution_candidates(
     assert archived_count == 2
 
 
+def test_universe_scanner_caps_fresh_quotes_and_rotates_cached_prefilter(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "universe.sqlite3"
+    seed_symbols = [f"10{index:04d}" for index in range(1, 7)]
+    calls: list[str] = []
+
+    monkeypatch.setattr(universe_scanner.settings, "universe_include_kospi", False)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_seed_symbols", "")
+    monkeypatch.setattr(universe_scanner.settings, "monitor_watchlist_symbols", "")
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_source_symbols", 20)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_cached_prefilter_enabled", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_prefilter_max_symbols", 6)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_max_fresh_quote_symbols", 2)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_cached_only_candidate_limit", 10)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_rotation_enabled", True)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_rotation_window_seconds", 1)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_min_scanned_symbols_for_trading", 0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_worker_hurdle_rate_bps", 0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_scanner_symbol_interval_seconds", 0)
+    monkeypatch.setattr(universe_scanner.settings, "universe_cleaning_max_snapshot_age_seconds", 0)
+    monkeypatch.setattr(universe_scanner, "_paper_average_realized_return_bps", lambda: None)
+    monkeypatch.setattr(
+        universe_scanner,
+        "search_naver_news",
+        lambda query, display=5, sort="date": {"items": []},
+    )
+    monkeypatch.setattr(
+        universe_scanner,
+        "fetch_opendart_disclosures",
+        lambda symbol, lookback_hours: [],
+    )
+
+    universe_scanner.initialize_universe_db(db_path)
+    universe_scanner._record_snapshots(
+        db_path,
+        "cached-scan",
+        "2026-06-01T09:00:00",
+        [
+            {
+                "symbol": symbol,
+                "name": f"Cached {symbol}",
+                "current_price": 10_000 + index,
+                "change_rate": 2.0,
+                "volume": 2_000_000,
+                "volume_ratio": 2.0,
+                "turnover_value": 80_000_000_000,
+                "market_cap": 500_000_000_000,
+                "market_segment": "KOSDAQ",
+                "source": "cached_fixture",
+            }
+            for index, symbol in enumerate(seed_symbols, start=1)
+        ],
+    )
+
+    def fake_fetch_price_data(symbol: str, *, include_intraday=True) -> dict:
+        calls.append(symbol)
+        return {
+            "symbol": symbol,
+            "name": f"Fresh {symbol}",
+            "current_price": 11_000 + int(symbol[-2:]),
+            "change_rate": 3.0,
+            "volume": 3_000_000,
+            "volume_ratio": 2.5,
+            "turnover_value": 90_000_000_000,
+            "market_cap": 600_000_000_000,
+            "market_segment": "KOSDAQ",
+            "intraday": {"minute_volume_ratio": 2.0},
+            "source": "fresh_fixture",
+        }
+
+    monkeypatch.setattr(universe_scanner, "fetch_price_data", fake_fetch_price_data)
+    req = AutoTradeStartRequest(
+        universe_seed_symbols=seed_symbols,
+        universe_candidate_limit=6,
+        universe_final_limit=6,
+    )
+
+    first = universe_scanner.scan_universe_for_auto_trade(req, db_path=db_path)
+    first_calls = calls[:]
+    universe_scanner._write_scanner_metadata(
+        db_path,
+        "fresh_quote_rotation",
+        {
+            "rotation_offset": 0,
+            "rotation_epoch": "2000-01-01T00:00:00",
+            "rotation_window_seconds": 1,
+            "total": 6,
+            "cap": 2,
+        },
+    )
+    second = universe_scanner.scan_universe_for_auto_trade(req, db_path=db_path)
+    second_calls = calls[len(first_calls):]
+
+    assert first["prefilter_evaluated_count"] == 6
+    assert first["fresh_quote_cap"] == 2
+    assert first["fresh_quote_requested_count"] == 2
+    assert first["fresh_quote_used_count"] == 2
+    assert first["cached_only_evaluated_count"] >= 1
+    assert first["korea_api_call_count_estimate"] == 2
+    assert len(first_calls) == 2
+    assert len(second_calls) == 2
+    assert set(second_calls) != set(first_calls)
+    assert second["rotation_offset"] == 2
+    assert any(
+        item.get("fresh_quote_used") is False
+        and item.get("status") == "SKIPPED"
+        and "deferred_due_to_fresh_quote_cap" in str(item.get("reason"))
+        for item in first["final_candidates"]
+    )
+
+
 def test_initialize_universe_db_backfills_legacy_candidate_history(tmp_path, monkeypatch):
     db_path = tmp_path / "universe.sqlite3"
     monkeypatch.setattr(

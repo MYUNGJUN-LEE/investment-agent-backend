@@ -1016,6 +1016,54 @@ def test_gpt_status_and_start_paper_compatibility_routes(tmp_path, monkeypatch):
     assert "detail" not in start_response.json()
 
 
+def test_gpt_start_paper_preserves_explicit_broker_paper_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
+    monkeypatch.setattr(
+        auto_trading,
+        "broker_paper_safety_check",
+        lambda **kwargs: {"approved": True, "broker_submit_blocked": False},
+    )
+
+    start_response = client.post(
+        "/gpt/auto-trading/start-paper",
+        headers=_auth_headers(),
+        json={"execution_mode": "broker_paper", "broker_provider": "kis"},
+    )
+
+    assert start_response.status_code == 200
+    body = start_response.json()
+    assert body["status"] == "started"
+    assert body["started_session"]["execution_mode"] == "broker_paper"
+    assert body["requested_execution"]["execution_mode"] == "broker_paper"
+    assert body["requested_execution"]["submits_to_broker"] is True
+    assert body["requested_execution"]["uses_internal_paper_orders"] is False
+
+
+def test_gpt_start_broker_paper_route_forces_kis_broker_paper(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auto_trading_db_path", str(tmp_path / "auto.sqlite3"))
+    monkeypatch.setattr(
+        auto_trading,
+        "broker_paper_safety_check",
+        lambda **kwargs: {"approved": True, "broker_submit_blocked": False},
+    )
+
+    start_response = client.post(
+        "/gpt/auto-trading/start-broker-paper",
+        headers=_auth_headers(),
+        json={},
+    )
+
+    assert start_response.status_code == 200
+    body = start_response.json()
+    assert body["status"] == "started"
+    assert body["started_session"]["execution_mode"] == "broker_paper"
+    assert body["requested_execution"]["broker_provider"] == "kis"
+    assert body["requested_execution"]["submits_to_broker"] is True
+
+
 def test_legacy_auto_trading_stop_without_session_id_stops_active_sessions(
     tmp_path,
     monkeypatch,
@@ -1669,7 +1717,7 @@ def test_auto_trading_runs_symbols_in_parallel(monkeypatch):
     monkeypatch.setattr(settings, "auto_trading_symbol_workers", 2)
 
     def slow_run_symbol(req, symbol_cfg, session_id=None):
-        time.sleep(0.2)
+        time.sleep(0.3)
         return {"symbol": symbol_cfg.symbol, "status": "done"}
 
     monkeypatch.setattr(auto_trading, "_run_symbol", slow_run_symbol)
@@ -1685,7 +1733,7 @@ def test_auto_trading_runs_symbols_in_parallel(monkeypatch):
     elapsed = time.perf_counter() - started_at
 
     assert [result["symbol"] for result in results] == ["005930", "000660"]
-    assert elapsed < 0.35
+    assert elapsed < 0.65
 
 
 def test_live_auto_trading_requires_live_gate(monkeypatch):

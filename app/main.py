@@ -71,6 +71,7 @@ from app.trading.edge_calibration import (
     refresh_top10_performance_if_due,
 )
 from app.trading.execution_status import trading_status_snapshot
+from app.trading.execution_status import execution_mode_flags
 from app.trading.kis_paper_e2e import KisPaperE2EError, preflight_kis_paper_e2e
 from app.trading.live_trading import LiveTradingError, execute_live_order
 from app.trading.market_monitor import (
@@ -644,9 +645,51 @@ def gpt_start_paper_auto_trading_endpoint(
 ):
     try:
         data = dict(payload or {})
-        data.update({"command": "start", "execution_mode": "paper"})
+        data.setdefault("command", "start")
+        data.setdefault("execution_mode", "paper")
         req = GptAutoTradeControlRequest(**data)
-        return _gpt_json(control_auto_trading_from_gpt(req))
+        response = control_auto_trading_from_gpt(req)
+        response["requested_execution"] = execution_mode_flags(
+            req.execution_mode,
+            broker_provider=req.broker_provider,
+        )
+        return _gpt_json(response)
+    except Exception as exc:
+        return _gpt_exception_response(exc, command="start")
+
+
+@app.post(
+    "/gpt/auto-trading/start-broker-paper",
+    response_model=GptAutoTradeControlResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(verify_api_key)],
+    operation_id="startGptBrokerPaperAutoTrading",
+    summary="Start KIS broker-paper auto-trading from Custom GPT",
+)
+@app.post(
+    "/gpt/auto-trading/start-broker-paper/",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+def gpt_start_broker_paper_auto_trading_endpoint(
+    payload: dict[str, Any] | None = Body(default=None),
+):
+    try:
+        data = dict(payload or {})
+        data.update(
+            {
+                "command": "start",
+                "execution_mode": "broker_paper",
+                "broker_provider": "kis",
+            }
+        )
+        req = GptAutoTradeControlRequest(**data)
+        response = control_auto_trading_from_gpt(req)
+        response["requested_execution"] = execution_mode_flags(
+            req.execution_mode,
+            broker_provider=req.broker_provider,
+        )
+        return _gpt_json(response)
     except Exception as exc:
         return _gpt_exception_response(exc, command="start")
 
@@ -841,7 +884,13 @@ def refresh_edge_training_sample_summary(limit: int = 20):
     operation_id="getAdminRuntimeStatus",
     summary="Get read-only admin dashboard runtime status",
 )
-def admin_runtime_status(limit: int = 20):
+def admin_runtime_status(
+    include_latest_universe: bool = False,
+    include_samples: bool = True,
+    include_auto_tuning: bool = False,
+    include_raw_candidates: bool = False,
+    limit: int = 20,
+):
     from app.workers.manager import embedded_worker_status
     from app.trading import auto_trading_store
 
@@ -849,19 +898,39 @@ def admin_runtime_status(limit: int = 20):
     auto_status = control_auto_trading_from_gpt(
         GptAutoTradeControlRequest(command="status")
     )
-    samples = get_edge_training_sample_summary(limit=limit)
+    samples = (
+        get_edge_training_sample_summary(limit=limit)
+        if include_samples
+        else {
+            "status": "skipped",
+            "sample_count": None,
+            "summary": {},
+            "diagnostics": {},
+            "label_policy": {},
+            "top10_performance": {},
+        }
+    )
     workers = embedded_worker_status()
     raw_active_sessions = auto_trading_store.list_sessions(status="active", limit=50)
-    auto_tuning = latest_auto_tuning_recommendation()
+    auto_tuning = latest_auto_tuning_recommendation() if include_auto_tuning else None
     trading_status = trading_status_snapshot(sample_limit=limit)
-    latest_universe = get_latest_universe_scan(
+    latest_universe_summary = get_latest_universe_scan(
         execution_mode=trading_status.get("execution_mode")
+    )
+    latest_universe = (
+        _compact_latest_universe_payload(
+            latest_universe_summary,
+            include_raw_candidates=include_raw_candidates,
+            limit=limit,
+        )
+        if include_latest_universe
+        else None
     )
     summary = _admin_runtime_summary(
         generated_at=generated_at,
         auto_status=auto_status,
         samples=samples,
-        latest_universe=latest_universe,
+        latest_universe=latest_universe_summary,
         workers=workers,
         raw_active_sessions=raw_active_sessions,
     )
@@ -877,6 +946,26 @@ def admin_runtime_status(limit: int = 20):
         "workers": workers,
         "auto_tuning": auto_tuning,
     }
+
+
+def _compact_latest_universe_payload(
+    latest_universe: dict[str, Any],
+    *,
+    include_raw_candidates: bool,
+    limit: int,
+) -> dict[str, Any]:
+    limit = max(1, min(int(limit or 20), 100))
+    payload = dict(latest_universe or {})
+    for key in ("candidates", "final_candidates", "ready_candidates"):
+        rows = payload.get(key)
+        if not isinstance(rows, list):
+            continue
+        payload[key] = rows if include_raw_candidates else rows[:limit]
+    payload.pop("symbols", None)
+    if not include_raw_candidates:
+        payload.pop("cleaning_excluded", None)
+        payload.pop("snapshot_batch_diagnostics", None)
+    return payload
 
 
 def _runtime_execution_summary_fields(status: dict[str, Any]) -> dict[str, Any]:
@@ -944,6 +1033,10 @@ def _runtime_execution_summary_fields(status: dict[str, Any]) -> dict[str, Any]:
         "today_broker_order_count",
         "today_broker_notional_krw",
         "candidate_status",
+        "latest_post_claim_diagnostics",
+        "claimed_no_order_count",
+        "claimed_no_order_reasons",
+        "claimed_order_diagnostics",
         "planner_status",
         "auto_trading_db_missing",
         "order_state_db_missing",
@@ -2047,6 +2140,7 @@ def gpt_unknown_action_fallback(gpt_path: str):
                     "/gpt/auto-trading/control",
                     "/gpt/auto-trading/status",
                     "/gpt/auto-trading/start-paper",
+                    "/gpt/auto-trading/start-broker-paper",
                     "/gpt/workers/status",
                     "/gpt/broker/kis/config-status",
                     "/gpt/broker/kis/paper-preflight",

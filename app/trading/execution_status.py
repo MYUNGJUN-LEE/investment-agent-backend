@@ -116,6 +116,7 @@ def trading_status_snapshot(
         and not session_mismatch["session_mode_mismatch"]
     )
     guard_counts = _broker_guard_counts(latest_session)
+    post_claim = _post_claim_diagnostics(latest_session)
 
     return {
         "status": "success",
@@ -177,6 +178,10 @@ def trading_status_snapshot(
         "claimed_candidate_count": scanner["claimed_candidate_count"],
         "ready_candidate_count": scanner["ready_candidate_count"],
         "latest_execution_candidate": scanner.get("latest_execution_candidate"),
+        "latest_post_claim_diagnostics": post_claim["latest_post_claim_diagnostics"],
+        "claimed_no_order_count": post_claim["claimed_no_order_count"],
+        "claimed_no_order_reasons": post_claim["claimed_no_order_reasons"],
+        "claimed_order_diagnostics": post_claim["claimed_order_diagnostics"],
         "order_status": order_status,
         "paper_orders_zero_reason": paper_zero_reason,
         "entry_planner_running": planned_entry_count > 0,
@@ -769,7 +774,10 @@ def _scanner_execution_state(path: Path) -> dict[str, Any]:
             )
             row = conn.execute(
                 """
-                SELECT scan_id, scan_time, symbol, rank, status, reason, raw_json
+                SELECT scan_id, scan_time, symbol, rank, status, reason,
+                       claimed_by_worker, claimed_at, fresh_quote_used,
+                       fresh_quote_age_seconds, cached_snapshot_age_seconds,
+                       exclusion_reason, raw_json
                 FROM scanner_candidates
                 WHERE status IN ('READY', 'CLAIMED')
                 ORDER BY scan_time DESC, rank ASC
@@ -783,6 +791,39 @@ def _scanner_execution_state(path: Path) -> dict[str, Any]:
     except sqlite3.Error:
         return result
     return result
+
+
+def _post_claim_diagnostics(latest_session: dict[str, Any] | None) -> dict[str, Any]:
+    diagnostics: list[dict[str, Any]] = []
+    if latest_session:
+        stack = list(latest_session.get("last_results") or [])
+        while stack:
+            item = stack.pop()
+            if not isinstance(item, dict):
+                continue
+            trace = item.get("post_claim_diagnostics")
+            if isinstance(trace, dict):
+                diagnostics.append(trace)
+            nested_scan = item.get("claimed_order_diagnostics")
+            if isinstance(nested_scan, list):
+                diagnostics.extend(
+                    row for row in nested_scan if isinstance(row, dict)
+                )
+            if isinstance(item.get("results"), list):
+                stack.extend(item["results"])
+    diagnostics.sort(key=lambda row: str(row.get("claim_time") or ""), reverse=True)
+    reason_counts: dict[str, int] = {}
+    for row in diagnostics:
+        reason = row.get("claimed_no_order_reason")
+        if reason:
+            key = str(reason)
+            reason_counts[key] = reason_counts.get(key, 0) + 1
+    return {
+        "latest_post_claim_diagnostics": diagnostics[0] if diagnostics else None,
+        "claimed_order_diagnostics": diagnostics[:20],
+        "claimed_no_order_count": sum(reason_counts.values()),
+        "claimed_no_order_reasons": reason_counts,
+    }
 
 
 def _edge_metric_status(

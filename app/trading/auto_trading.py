@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+import logging
 import math
 import sqlite3
 import time
@@ -54,6 +55,9 @@ from app.storage.sqlite import (
     connect_sqlite,
     is_recoverable_sqlite_error,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class AutoTradingError(ValueError):
@@ -2111,12 +2115,13 @@ def _prepare_symbols_for_account_balance(
         price_result = _resolve_loop_price(symbol_cfg)
         if not price_result.get("price"):
             blocked_results.append(
-                {
-                    "symbol": symbol_cfg.symbol,
-                    "status": "blocked",
-                    "message": price_result["message"],
-                    "price_source": price_result["source"],
-                }
+                _claimed_no_order_result(
+                    req=req,
+                    symbol_cfg=symbol_cfg,
+                    message=price_result["message"],
+                    reason="price_zero_or_missing",
+                )
+                | {"price_source": price_result["source"]}
             )
             continue
         price = float(price_result["price"])
@@ -2140,6 +2145,23 @@ def _prepare_symbols_for_account_balance(
 
     account = _resolve_account_balance(req)
     if account["status"] != "ready":
+        reason = str(account.get("broker_submit_block_reason") or "")
+        claimed_reason = (
+            "kis_account_rate_limited"
+            if reason == "kis_account_rate_limited"
+            else "kis_cash_or_buying_power_zero"
+            if req.execution_mode in ("live", "broker_paper")
+            else "unknown_post_claim_block"
+        )
+        account_blocks = [
+            _claimed_no_order_result(
+                req=req,
+                symbol_cfg=symbol_cfg,
+                message=account["message"],
+                reason=claimed_reason,
+            )
+            for symbol_cfg in priced_symbols
+        ]
         return {
             "symbols": [],
             "results": [
@@ -2150,6 +2172,7 @@ def _prepare_symbols_for_account_balance(
                     "message": account["message"],
                     "account": account,
                 },
+                *account_blocks,
             ],
         }
 
@@ -2262,6 +2285,14 @@ def _allocate_cash_to_symbols(
                 "open_position_count": projected_open_count,
                 "open_symbols": sorted(open_symbols),
             }
+            blocked_by_index[index] = _attach_order_trace(
+                blocked_by_index[index],
+                _post_claim_diagnostics_base(
+                    req=AutoTradeStartRequest(execution_mode=str(account.get("mode") or "paper")),
+                    symbol_cfg=symbol_cfg,
+                ),
+                claimed_no_order_reason="unknown_post_claim_block",
+            )
             continue
 
         circuit_breaker = _strategy_circuit_breaker_for_symbol(symbol_cfg, account)
@@ -2275,6 +2306,14 @@ def _allocate_cash_to_symbols(
                 ),
                 "strategy_circuit_breaker": circuit_breaker,
             }
+            blocked_by_index[index] = _attach_order_trace(
+                blocked_by_index[index],
+                _post_claim_diagnostics_base(
+                    req=AutoTradeStartRequest(execution_mode=str(account.get("mode") or "paper")),
+                    symbol_cfg=symbol_cfg,
+                ),
+                claimed_no_order_reason="unknown_post_claim_block",
+            )
             continue
         target_weight = _target_position_weight(symbol_cfg) * float(
             circuit_breaker.get("position_scale") or 1.0
@@ -2389,7 +2428,7 @@ def _insufficient_cash_result(
     reason: str,
     recommendation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "symbol": symbol_cfg.symbol,
         "status": "blocked",
         "message": (
@@ -2403,6 +2442,25 @@ def _insufficient_cash_result(
         },
         "recommendation": recommendation,
     }
+    trace_req = AutoTradeStartRequest(execution_mode=str(account.get("mode") or "paper"))
+    trace = _post_claim_diagnostics_base(req=trace_req, symbol_cfg=symbol_cfg)
+    trace["broker_submit_blocked"] = str(account.get("mode") or "") in {
+        "broker_paper",
+        "live",
+    }
+    trace["broker_submit_block_reason"] = "insufficient_cash"
+    trace["broker_submit_block_code"] = "insufficient_cash"
+    if reason == "missing price":
+        claimed_reason = "price_zero_or_missing"
+    elif "minimum executable quantity" in reason:
+        claimed_reason = "quantity_zero_or_missing"
+    else:
+        claimed_reason = "kis_cash_or_buying_power_zero" if trace["broker_submit_blocked"] else "quantity_zero_or_missing"
+    return _attach_order_trace(
+        result,
+        trace,
+        claimed_no_order_reason=claimed_reason,
+    )
 
 
 def _target_position_weight(symbol_cfg: AutoTradeSymbolConfig) -> float:
@@ -2658,22 +2716,184 @@ def _record_outcome_attribution_for_result(
         return None
 
 
+def _post_claim_diagnostics_base(
+    *,
+    req: AutoTradeStartRequest,
+    symbol_cfg: AutoTradeSymbolConfig,
+) -> dict[str, Any]:
+    mode = str(req.execution_mode or "paper")
+    price = (
+        _safe_float(symbol_cfg.order_price, 0.0)
+        or _safe_float(symbol_cfg.price, 0.0)
+        or _safe_float(symbol_cfg.decision_price, 0.0)
+    )
+    quantity = _safe_int(symbol_cfg.quantity, 0)
+    notional = price * quantity if price > 0 and quantity > 0 else None
+    claimed = bool(
+        symbol_cfg.claimed
+        or symbol_cfg.claim_time
+        or str(symbol_cfg.candidate_status or "").upper() == "CLAIMED"
+    )
+    return {
+        "symbol": symbol_cfg.symbol,
+        "claimed": claimed,
+        "claim_time": symbol_cfg.claim_time,
+        "execution_mode": mode,
+        "submits_to_broker": mode in {"broker_paper", "live"},
+        "uses_internal_paper_orders": mode == "paper",
+        "planned_entry": symbol_cfg.requested_action != "exit",
+        "entry_signal": None,
+        "entry_signal_source": "scanner_candidate" if claimed else "manual_request",
+        "candidate_decision": symbol_cfg.candidate_decision,
+        "candidate_status": symbol_cfg.candidate_status,
+        "final_entry_edge": symbol_cfg.final_entry_edge,
+        "quantity": quantity or None,
+        "order_price": price or None,
+        "notional_krw": round(notional, 2) if notional else None,
+        "broker_submit_attempted": False,
+        "broker_submit_blocked": False,
+        "broker_submit_block_code": None,
+        "broker_submit_block_reason": None,
+        "risk_approved": None,
+        "risk_code": None,
+        "risk_message": None,
+        "order_state_approved": None,
+        "order_state_code": None,
+        "order_state_message": None,
+        "kis_submit_attempted": False,
+        "kis_response_code": None,
+        "kis_response_message": None,
+        "broker_order_status": None,
+        "claimed_no_order_reason": None,
+        "fresh_quote_used": symbol_cfg.fresh_quote_used,
+        "fresh_quote_age_seconds": symbol_cfg.fresh_quote_age_seconds,
+        "cached_snapshot_age_seconds": symbol_cfg.cached_snapshot_age_seconds,
+        "candidate_reason": symbol_cfg.candidate_reason,
+        "claimed_by_worker": symbol_cfg.claimed_by_worker,
+    }
+
+
+def _claimed_no_order_reason_from_block_code(code: Any, message: Any = None) -> str:
+    text = str(code or "").strip()
+    message_text = str(message or "").lower()
+    if text == "risk_manager_rejected":
+        return "risk_manager_rejected"
+    if text in {
+        "kis_account_rate_limited",
+        "kis_token_unavailable_rate_limited",
+        "kis_cash_or_buying_power_zero",
+    }:
+        return text
+    if text in {"duplicate_scan_symbol_side", "duplicate_client_order_id"}:
+        return "duplicate_order_blocked"
+    if text in {"open_broker_order_exists", "open_order_intent_exists"}:
+        return "open_order_exists"
+    if text == "already_position_exists":
+        return "already_position_exists"
+    if text == "daily_order_limit_exceeded":
+        return "daily_order_limit_exceeded"
+    if text == "daily_notional_limit_exceeded":
+        return "daily_notional_limit_exceeded"
+    if text == "daily_symbol_order_limit_exceeded":
+        return "daily_order_limit_exceeded"
+    if text == "symbol_cooldown_active":
+        return "symbol_cooldown_active"
+    if text in {
+        "kis_config_missing",
+        "kis_is_paper_false",
+        "broker_provider_not_kis",
+        "persistent_order_storage_unavailable",
+    }:
+        return "broker_paper_safety_blocked"
+    if "rate_limited" in message_text and "token" in message_text:
+        return "kis_token_unavailable_rate_limited"
+    if "rate_limited" in message_text and "account" in message_text:
+        return "kis_account_rate_limited"
+    return "unknown_post_claim_block"
+
+
+def _claimed_no_order_reason_from_preview(
+    preview: dict[str, Any],
+    *,
+    symbol_cfg: AutoTradeSymbolConfig,
+) -> str:
+    if _safe_int(preview.get("quantity"), 0) <= 0 or _safe_int(symbol_cfg.quantity, 0) <= 0:
+        return "quantity_zero_or_missing"
+    if _safe_float(preview.get("price"), 0.0) <= 0:
+        return "price_zero_or_missing"
+    risk = preview.get("risk_decision") or {}
+    if isinstance(risk, dict) and risk.get("approved") is False:
+        return "risk_manager_rejected"
+    strategy = preview.get("strategy_decision") or {}
+    if isinstance(strategy, dict) and strategy.get("approved") is False:
+        return "entry_signal_false"
+    return "unknown_post_claim_block"
+
+
+def _attach_order_trace(
+    result: dict[str, Any],
+    trace: dict[str, Any],
+    *,
+    claimed_no_order_reason: str | None = None,
+) -> dict[str, Any]:
+    if claimed_no_order_reason and not trace.get("claimed_no_order_reason"):
+        trace["claimed_no_order_reason"] = claimed_no_order_reason
+    for key, value in trace.items():
+        result.setdefault(key, value)
+    result["post_claim_diagnostics"] = dict(trace)
+    if trace.get("claimed"):
+        level = logger.warning if trace.get("claimed_no_order_reason") else logger.info
+        level(
+            "post-claim order diagnostic symbol=%s execution_mode=%s "
+            "planned_entry=%s broker_submit_attempted=%s blocked=%s "
+            "claimed_no_order_reason=%s",
+            trace.get("symbol"),
+            trace.get("execution_mode"),
+            trace.get("planned_entry"),
+            trace.get("broker_submit_attempted"),
+            trace.get("broker_submit_blocked"),
+            trace.get("claimed_no_order_reason"),
+        )
+    return result
+
+
+def _claimed_no_order_result(
+    *,
+    req: AutoTradeStartRequest,
+    symbol_cfg: AutoTradeSymbolConfig,
+    message: str,
+    reason: str,
+    status: str = "blocked",
+) -> dict[str, Any]:
+    trace = _post_claim_diagnostics_base(req=req, symbol_cfg=symbol_cfg)
+    trace["entry_signal"] = False
+    result = {
+        "symbol": symbol_cfg.symbol,
+        "status": status,
+        "message": message,
+    }
+    return _attach_order_trace(result, trace, claimed_no_order_reason=reason)
+
+
 def _run_symbol(
     req: AutoTradeStartRequest,
     symbol_cfg: AutoTradeSymbolConfig,
     session_id: str | None = None,
 ) -> dict[str, Any]:
+    trace = _post_claim_diagnostics_base(req=req, symbol_cfg=symbol_cfg)
     try:
         price_result = _resolve_loop_price(symbol_cfg)
         if not price_result.get("price"):
-            return {
+            trace["entry_signal"] = False
+            return _attach_order_trace({
                 "symbol": symbol_cfg.symbol,
                 "status": "blocked",
                 "message": price_result["message"],
                 "price_source": price_result["source"],
-            }
+            }, trace, claimed_no_order_reason="price_zero_or_missing")
 
         price = float(price_result["price"])
+        trace["order_price"] = price
         position_before_exit = _exit_position_snapshot(req=req, symbol_cfg=symbol_cfg)
         symbol_cfg = _apply_order_sizing_defaults(
             req,
@@ -2681,11 +2901,28 @@ def _run_symbol(
             price,
             price_result.get("price_data") or {},
         )
+        trace["quantity"] = _safe_int(symbol_cfg.quantity, 0) or None
+        if trace["quantity"]:
+            trace["notional_krw"] = round(price * int(trace["quantity"]), 2)
         if req.execution_mode == "broker_paper" and symbol_cfg.requested_action != "exit":
             cap = _cap_broker_paper_symbol_quantity(symbol_cfg, price)
             if cap.get("status") == "blocked":
-                return cap
+                trace["broker_submit_blocked"] = True
+                trace["broker_submit_block_reason"] = cap.get(
+                    "broker_submit_block_reason"
+                )
+                trace["broker_submit_block_code"] = cap.get(
+                    "broker_submit_block_code"
+                )
+                return _attach_order_trace(
+                    cap,
+                    trace,
+                    claimed_no_order_reason="quantity_zero_or_missing",
+                )
             symbol_cfg = cap["symbol_cfg"]
+            trace["quantity"] = _safe_int(symbol_cfg.quantity, 0) or None
+            if trace["quantity"]:
+                trace["notional_krw"] = round(price * int(trace["quantity"]), 2)
         orderbook_check: dict[str, Any] | None = None
         if (
             settings.pretrade_orderbook_check_enabled
@@ -2707,17 +2944,34 @@ def _run_symbol(
                 req.execution_mode != "paper"
                 and orderbook_check.get("approved") is False
             ):
-                return {
+                trace["entry_signal"] = False
+                return _attach_order_trace({
                     "symbol": symbol_cfg.symbol,
                     "status": "blocked",
                     "message": str(
                         orderbook_check.get("message") or "Orderbook check failed"
                     ),
                     "orderbook_check": orderbook_check,
-                }
+                }, trace, claimed_no_order_reason="unknown_post_claim_block")
 
         preview_req = _to_preview_request(symbol_cfg, price)
         preview = create_order_preview(preview_req)
+        trace["quantity"] = _safe_int(preview.get("quantity"), 0) or trace.get("quantity")
+        trace["order_price"] = _safe_float(preview.get("price"), price)
+        if trace.get("quantity") and trace.get("order_price"):
+            trace["notional_krw"] = round(
+                float(trace["order_price"]) * int(trace["quantity"]),
+                2,
+            )
+        risk_decision = preview.get("risk_decision")
+        if isinstance(risk_decision, dict):
+            trace["risk_approved"] = risk_decision.get("approved")
+            trace["risk_code"] = risk_decision.get("code")
+            trace["risk_message"] = risk_decision.get("message")
+        strategy_decision = preview.get("strategy_decision")
+        if isinstance(strategy_decision, dict):
+            trace["entry_signal"] = bool(strategy_decision.get("approved"))
+            trace["entry_signal_source"] = "order_preview_strategy"
         result: dict[str, Any] = {
             "symbol": symbol_cfg.symbol,
             "status": preview["status"],
@@ -2742,7 +2996,14 @@ def _run_symbol(
                 req=req,
                 symbol_cfg=symbol_cfg,
             )
-            return result
+            return _attach_order_trace(
+                result,
+                trace,
+                claimed_no_order_reason=_claimed_no_order_reason_from_preview(
+                    preview,
+                    symbol_cfg=symbol_cfg,
+                ),
+            )
 
         if req.execution_mode == "paper":
             if not req.auto_confirm_paper:
@@ -2752,7 +3013,11 @@ def _run_symbol(
                     req=req,
                     symbol_cfg=symbol_cfg,
                 )
-                return result
+                return _attach_order_trace(
+                    result,
+                    trace,
+                    claimed_no_order_reason="unknown_post_claim_block",
+                )
             result["execution"] = confirm_order_preview(
                 OrderConfirmRequest(
                     preview_id=preview["preview_id"],
@@ -2772,9 +3037,10 @@ def _run_symbol(
                 symbol_cfg=symbol_cfg,
                 position_before_exit=position_before_exit,
             )
-            return result
+            return _attach_order_trace(result, trace)
 
         if req.execution_mode == "broker_paper":
+            trace["broker_submit_attempted"] = True
             result["execution"] = execute_broker_paper_order(
                 _to_live_order_request(
                     req=req,
@@ -2785,6 +3051,30 @@ def _run_symbol(
                 )
             )
             result["status"] = result["execution"]["status"]
+            execution = result.get("execution") or {}
+            trace["broker_submit_blocked"] = bool(
+                execution.get("broker_submit_blocked")
+            )
+            trace["broker_order_status"] = execution.get("status")
+            kis_result = execution.get("kis_result")
+            if isinstance(kis_result, dict):
+                trace["kis_submit_attempted"] = True
+                trace["kis_response_code"] = (
+                    kis_result.get("rt_cd")
+                    or kis_result.get("msg_cd")
+                    or kis_result.get("code")
+                )
+                trace["kis_response_message"] = (
+                    kis_result.get("msg1")
+                    or kis_result.get("message")
+                    or kis_result.get("msg")
+                )
+            elif execution.get("order_event") is not None:
+                trace["kis_submit_attempted"] = True
+            order_state_result = execution.get("order_state")
+            if isinstance(order_state_result, dict):
+                trace["order_state_approved"] = True
+                trace["order_state_message"] = order_state_result.get("status")
             _record_fill_quality_for_result(
                 result=result,
                 req=req,
@@ -2796,7 +3086,16 @@ def _run_symbol(
                 symbol_cfg=symbol_cfg,
                 position_before_exit=position_before_exit,
             )
-            return result
+            no_order_reason = (
+                "kis_submit_rejected"
+                if str(result.get("status") or "").lower() == "rejected"
+                else None
+            )
+            return _attach_order_trace(
+                result,
+                trace,
+                claimed_no_order_reason=no_order_reason,
+            )
 
         result["execution"] = execute_live_order(
             _to_live_order_request(
@@ -2819,7 +3118,10 @@ def _run_symbol(
             symbol_cfg=symbol_cfg,
             position_before_exit=position_before_exit,
         )
-        return result
+        trace["broker_submit_attempted"] = True
+        trace["kis_submit_attempted"] = True
+        trace["broker_order_status"] = result.get("status")
+        return _attach_order_trace(result, trace)
     except (OrderApprovalError, LiveTradingError, AutoTradingError) as exc:
         result = {
             "symbol": symbol_cfg.symbol,
@@ -2830,25 +3132,51 @@ def _run_symbol(
         if code:
             result["broker_submit_block_code"] = code
             result["broker_order_guard_code"] = code
+            trace["broker_submit_block_code"] = code
         details = getattr(exc, "details", None)
         if isinstance(details, dict):
             if details.get("broker_submit_blocked") is not None:
                 result["broker_submit_blocked"] = details.get("broker_submit_blocked")
+                trace["broker_submit_blocked"] = bool(
+                    details.get("broker_submit_blocked")
+                )
             if details.get("broker_submit_block_reason") is not None:
                 result["broker_submit_block_reason"] = details.get(
+                    "broker_submit_block_reason"
+                )
+                trace["broker_submit_block_reason"] = details.get(
                     "broker_submit_block_reason"
                 )
             if details.get("broker_order_risk_limits") is not None:
                 result["broker_order_risk_limits"] = details.get(
                     "broker_order_risk_limits"
                 )
-        return result
+            for key in (
+                "risk_approved",
+                "risk_code",
+                "risk_message",
+                "order_state_approved",
+                "order_state_code",
+                "order_state_message",
+            ):
+                if key in details:
+                    trace[key] = details.get(key)
+        if req.execution_mode in {"broker_paper", "live"}:
+            trace["broker_submit_attempted"] = True
+        return _attach_order_trace(
+            result,
+            trace,
+            claimed_no_order_reason=_claimed_no_order_reason_from_block_code(
+                trace.get("broker_submit_block_code") or code,
+                trace.get("broker_submit_block_reason") or str(exc),
+            ),
+        )
     except Exception as exc:
-        return {
+        return _attach_order_trace({
             "symbol": symbol_cfg.symbol,
             "status": "error",
             "message": f"Unexpected auto-trading error: {exc}",
-        }
+        }, trace, claimed_no_order_reason="unknown_post_claim_block")
 
 
 def _to_preview_request(

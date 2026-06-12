@@ -858,9 +858,8 @@
       }
       return {
         method: "POST",
-        path: "/gpt/auto-trading/control",
+        path: "/gpt/auto-trading/start-broker-paper",
         body: {
-          command: "start",
           execution_mode: "broker_paper",
           broker_provider: "kis",
           auto_discover_symbols: true,
