@@ -491,20 +491,11 @@ class Settings(BaseSettings):
 
     def broker_paper_risk_limits(self) -> dict[str, Any]:
         return {
-            "max_order_krw": max(0.0, float(self.broker_paper_max_order_krw or 0.0)),
-            "max_daily_orders": max(0, int(self.broker_paper_max_daily_orders or 0)),
-            "max_daily_orders_per_symbol": max(
-                0,
-                int(self.broker_paper_max_daily_orders_per_symbol or 0),
-            ),
-            "symbol_cooldown_days": max(
-                0,
-                int(self.broker_paper_symbol_cooldown_days or 0),
-            ),
-            "max_daily_notional_krw": max(
-                0.0,
-                float(self.broker_paper_max_daily_notional_krw or 0.0),
-            ),
+            "max_order_krw": 0.0,
+            "max_daily_orders": 0,
+            "max_daily_orders_per_symbol": 0,
+            "symbol_cooldown_days": 0,
+            "max_daily_notional_krw": 0.0,
             "allow_position_additions": bool(self.allow_position_additions),
         }
 

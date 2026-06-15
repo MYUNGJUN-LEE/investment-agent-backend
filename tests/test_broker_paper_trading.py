@@ -185,6 +185,7 @@ def test_paper_mode_does_not_call_kis_submit(tmp_path, monkeypatch):
 
 def test_broker_paper_submits_kis_order_and_records_event(tmp_path, monkeypatch):
     _use_tmp_kis_paper_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "broker_paper_max_order_krw", 100_000.0)
     _approve_all_orders(monkeypatch)
     FakeKisPaperClient.calls = []
     monkeypatch.setattr(live_trading, "KisClient", FakeKisPaperClient)
@@ -237,7 +238,7 @@ def test_broker_paper_submits_kis_order_and_records_event(tmp_path, monkeypatch)
                 {
                     "symbol": "005930",
                     "price": 75000,
-                    "quantity": 1,
+                    "quantity": 3,
                     "expected_gross_edge_bps": 100,
                     "expected_win_bps": 100,
                     "expected_loss_bps": 40,
@@ -253,7 +254,7 @@ def test_broker_paper_submits_kis_order_and_records_event(tmp_path, monkeypatch)
             "symbol": "005930",
             "side": "buy",
             "price": 75000.0,
-            "quantity": 1,
+            "quantity": 3,
             "is_paper": True,
         }
     ]
@@ -267,7 +268,7 @@ def test_broker_paper_submits_kis_order_and_records_event(tmp_path, monkeypatch)
             """
         ).fetchone()
 
-    assert row == ("005930", "buy", 1, "broker_paper", "PAPER123", "submitted")
+    assert row == ("005930", "buy", 3, "broker_paper", "PAPER123", "submitted")
     with sqlite3.connect(state_path) as conn:
         columns = {
             row[1]
@@ -281,7 +282,7 @@ def test_broker_paper_submits_kis_order_and_records_event(tmp_path, monkeypatch)
         ).fetchone()
 
     assert {"session_id", "scan_id", "name", "notional_krw"}.issubset(columns)
-    assert event_row[3] == 75000.0
+    assert event_row[3] == 225000.0
 
     status_response = client.get(
         "/trading/status?execution_mode=broker_paper",
@@ -368,7 +369,7 @@ def test_broker_paper_blocks_when_account_probe_cash_is_zero(tmp_path, monkeypat
     assert ZeroCashKisPaperClient.calls == []
 
 
-def test_broker_paper_prevents_duplicate_symbol_order(tmp_path, monkeypatch):
+def test_broker_paper_prevents_duplicate_scan_symbol_order(tmp_path, monkeypatch):
     _use_tmp_kis_paper_config(tmp_path, monkeypatch)
     _approve_all_orders(monkeypatch)
     FakeKisPaperClient.calls = []
@@ -444,11 +445,7 @@ def test_broker_paper_prevents_duplicate_symbol_order(tmp_path, monkeypatch):
     blocked = second.json()["results"][0]
     assert blocked["status"] == "error"
     assert blocked["broker_submit_blocked"] is True
-    assert blocked["broker_submit_block_code"] in {
-        "open_broker_order_exists",
-        "open_order_intent_exists",
-        "duplicate_scan_symbol_side",
-    }
+    assert blocked["broker_submit_block_code"] == "duplicate_scan_symbol_side"
     assert len(FakeKisPaperClient.calls) == 1
 
     status = client.get(
@@ -459,16 +456,16 @@ def test_broker_paper_prevents_duplicate_symbol_order(tmp_path, monkeypatch):
     assert status["last_order_by_symbol"]["005930"]["scan_id"] == "scan-dup"
 
 
-def test_zero_broker_paper_limits_are_unlimited_but_open_order_still_blocks(
+def test_broker_paper_artificial_limits_and_open_orders_do_not_block(
     tmp_path,
     monkeypatch,
 ):
     _use_tmp_kis_paper_config(tmp_path, monkeypatch)
-    monkeypatch.setattr(settings, "broker_paper_max_order_krw", 0.0)
-    monkeypatch.setattr(settings, "broker_paper_max_daily_orders", 0)
-    monkeypatch.setattr(settings, "broker_paper_max_daily_orders_per_symbol", 0)
-    monkeypatch.setattr(settings, "broker_paper_symbol_cooldown_days", 0)
-    monkeypatch.setattr(settings, "broker_paper_max_daily_notional_krw", 0.0)
+    monkeypatch.setattr(settings, "broker_paper_max_order_krw", 100_000.0)
+    monkeypatch.setattr(settings, "broker_paper_max_daily_orders", 3)
+    monkeypatch.setattr(settings, "broker_paper_max_daily_orders_per_symbol", 1)
+    monkeypatch.setattr(settings, "broker_paper_symbol_cooldown_days", 5)
+    monkeypatch.setattr(settings, "broker_paper_max_daily_notional_krw", 300_000.0)
 
     for index, symbol in enumerate(("111111", "222222", "333333"), start=1):
         order_state.record_broker_order_event(
@@ -531,8 +528,9 @@ def test_zero_broker_paper_limits_are_unlimited_but_open_order_still_blocks(
     )
     blocked = order_state.validate_broker_paper_order(req)
 
-    assert blocked["approved"] is False
-    assert blocked["broker_submit_block_code"] == "open_broker_order_exists"
+    assert blocked["approved"] is True
+    assert blocked["broker_submit_blocked"] is False
+    assert blocked["broker_submit_block_code"] is None
 
 
 def test_claimed_broker_paper_candidate_records_no_order_reason(

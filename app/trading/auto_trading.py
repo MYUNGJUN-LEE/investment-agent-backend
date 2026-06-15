@@ -2904,25 +2904,6 @@ def _run_symbol(
         trace["quantity"] = _safe_int(symbol_cfg.quantity, 0) or None
         if trace["quantity"]:
             trace["notional_krw"] = round(price * int(trace["quantity"]), 2)
-        if req.execution_mode == "broker_paper" and symbol_cfg.requested_action != "exit":
-            cap = _cap_broker_paper_symbol_quantity(symbol_cfg, price)
-            if cap.get("status") == "blocked":
-                trace["broker_submit_blocked"] = True
-                trace["broker_submit_block_reason"] = cap.get(
-                    "broker_submit_block_reason"
-                )
-                trace["broker_submit_block_code"] = cap.get(
-                    "broker_submit_block_code"
-                )
-                return _attach_order_trace(
-                    cap,
-                    trace,
-                    claimed_no_order_reason="quantity_zero_or_missing",
-                )
-            symbol_cfg = cap["symbol_cfg"]
-            trace["quantity"] = _safe_int(symbol_cfg.quantity, 0) or None
-            if trace["quantity"]:
-                trace["notional_krw"] = round(price * int(trace["quantity"]), 2)
         orderbook_check: dict[str, Any] | None = None
         if (
             settings.pretrade_orderbook_check_enabled
@@ -3333,35 +3314,6 @@ def _auto_client_order_id(
     if not session_id:
         return None
     return f"auto:{session_id}:{symbol}:{side}:{int(price)}:{quantity}"
-
-
-def _cap_broker_paper_symbol_quantity(
-    symbol_cfg: AutoTradeSymbolConfig,
-    price: float,
-) -> dict[str, Any]:
-    max_order_krw = float(settings.broker_paper_risk_limits()["max_order_krw"])
-    if max_order_krw <= 0 or price <= 0:
-        return {"status": "ready", "symbol_cfg": symbol_cfg}
-    capped_qty = int(max_order_krw // float(price))
-    if capped_qty <= 0:
-        return {
-            "symbol": symbol_cfg.symbol,
-            "status": "blocked",
-            "message": "Broker paper max order KRW is below one share",
-            "broker_submit_blocked": True,
-            "broker_submit_block_reason": "broker_paper_max_order_below_minimum",
-            "broker_order_risk_limits": settings.broker_paper_risk_limits(),
-        }
-    if symbol_cfg.quantity is None or int(symbol_cfg.quantity) <= capped_qty:
-        return {"status": "ready", "symbol_cfg": symbol_cfg}
-    return {
-        "status": "ready",
-        "symbol_cfg": symbol_cfg.model_copy(update={"quantity": capped_qty}),
-        "broker_paper_quantity_capped": True,
-        "original_quantity": symbol_cfg.quantity,
-        "capped_quantity": capped_qty,
-        "max_order_krw": max_order_krw,
-    }
 
 
 def _resolve_loop_price(symbol_cfg: AutoTradeSymbolConfig) -> dict[str, Any]:

@@ -621,8 +621,6 @@ def validate_broker_paper_order(
     """Return whether a broker_paper order passes DB-backed duplicate/risk limits."""
     path = _db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    now = _now_dt()
-    today_start = datetime(now.year, now.month, now.day)
     limits = broker_paper_order_risk_limits()
     notional = float(req.price) * int(req.quantity)
 
@@ -635,9 +633,6 @@ def validate_broker_paper_order(
             conn=conn,
             req=req,
             notional=notional,
-            now=now,
-            today_start=today_start,
-            limits=limits,
         )
         conn.commit()
 
@@ -873,63 +868,11 @@ def _broker_paper_order_block(
     conn: sqlite3.Connection,
     req: LiveOrderRequest,
     notional: float,
-    now: datetime,
-    today_start: datetime,
-    limits: dict[str, Any],
 ) -> dict[str, Any] | None:
     if notional <= 0:
         return _broker_block("notional_zero", "Order notional is zero")
 
-    max_order = float(limits.get("max_order_krw") or 0.0)
-    if max_order and notional > max_order:
-        return _broker_block(
-            "max_order_notional_exceeded",
-            "Broker paper max order notional exceeded",
-            {"notional_krw": notional, "max_order_krw": max_order},
-        )
-
     if req.side == "buy":
-        active_statuses = ",".join("?" for _ in ACTIVE_BROKER_ORDER_STATUSES)
-        open_event = conn.execute(
-            f"""
-            SELECT *
-            FROM broker_order_events
-            WHERE execution_mode = 'broker_paper'
-              AND symbol = ?
-              AND side = 'buy'
-              AND order_status IN ({active_statuses})
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (req.symbol, *ACTIVE_BROKER_ORDER_STATUSES),
-        ).fetchone()
-        if open_event:
-            return _broker_block(
-                "open_broker_order_exists",
-                "Open broker order already exists for this symbol",
-                {"existing_broker_order_id": open_event["broker_order_id"]},
-            )
-
-        intent_statuses = ",".join("?" for _ in PENDING_INTENT_STATUSES)
-        open_intent = conn.execute(
-            f"""
-            SELECT *
-            FROM order_intents
-            WHERE symbol = ?
-              AND side = 'buy'
-              AND status IN ({intent_statuses})
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (req.symbol, *PENDING_INTENT_STATUSES),
-        ).fetchone()
-        if open_intent:
-            return _broker_block(
-                "open_order_intent_exists",
-                "Open order intent already exists for this symbol",
-                {"existing_intent_id": open_intent["id"]},
-            )
-
         position_state = _get_position_state_row(conn, req.symbol)
         if (
             position_state
@@ -965,93 +908,6 @@ def _broker_paper_order_block(
                 "Broker order already exists for this scan, symbol, and side",
                 {"scan_id": req.scan_id},
             )
-
-    cooldown_days = int(limits.get("symbol_cooldown_days") or 0)
-    if cooldown_days > 0 and req.side == "buy":
-        since = _format_dt(now - timedelta(days=cooldown_days))
-        recent_symbol = conn.execute(
-            """
-            SELECT *
-            FROM broker_order_events
-            WHERE execution_mode = 'broker_paper'
-              AND symbol = ?
-              AND side = 'buy'
-              AND order_status IN (
-                'submitted', 'accepted', 'unknown_pending',
-                'partially_filled', 'filled'
-              )
-              AND created_at >= ?
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (req.symbol, since),
-        ).fetchone()
-        if recent_symbol:
-            return _broker_block(
-                "symbol_cooldown_active",
-                "Broker paper symbol cooldown is active",
-                {
-                    "cooldown_days": cooldown_days,
-                    "last_order_at": recent_symbol["created_at"],
-                },
-            )
-
-    today_text = _format_dt(today_start)
-    counted_statuses = ",".join("?" for _ in COUNTED_BROKER_ORDER_STATUSES)
-    daily = conn.execute(
-        f"""
-        SELECT COUNT(*), COALESCE(SUM(notional_krw), 0)
-        FROM broker_order_events
-        WHERE execution_mode = 'broker_paper'
-          AND order_status IN ({counted_statuses})
-          AND created_at >= ?
-        """,
-        (*COUNTED_BROKER_ORDER_STATUSES, today_text),
-    ).fetchone()
-    daily_count = int(daily[0] or 0) if daily else 0
-    daily_notional = float(daily[1] or 0.0) if daily else 0.0
-    max_daily_orders = int(limits.get("max_daily_orders") or 0)
-    if max_daily_orders and daily_count >= max_daily_orders:
-        return _broker_block(
-            "daily_order_limit_exceeded",
-            "Broker paper daily order limit reached",
-            {"today_broker_order_count": daily_count, "max_daily_orders": max_daily_orders},
-        )
-
-    max_daily_notional = float(limits.get("max_daily_notional_krw") or 0.0)
-    if max_daily_notional and daily_notional + notional > max_daily_notional:
-        return _broker_block(
-            "daily_notional_limit_exceeded",
-            "Broker paper daily notional limit exceeded",
-            {
-                "today_broker_notional_krw": daily_notional,
-                "order_notional_krw": notional,
-                "max_daily_notional_krw": max_daily_notional,
-            },
-        )
-
-    per_symbol = conn.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM broker_order_events
-        WHERE execution_mode = 'broker_paper'
-          AND symbol = ?
-          AND order_status IN ({counted_statuses})
-          AND created_at >= ?
-        """,
-        (req.symbol, *COUNTED_BROKER_ORDER_STATUSES, today_text),
-    ).fetchone()
-    per_symbol_count = int(per_symbol[0] or 0) if per_symbol else 0
-    max_per_symbol = int(limits.get("max_daily_orders_per_symbol") or 0)
-    if max_per_symbol and per_symbol_count >= max_per_symbol:
-        return _broker_block(
-            "daily_symbol_order_limit_exceeded",
-            "Broker paper daily per-symbol order limit reached",
-            {
-                "today_symbol_order_count": per_symbol_count,
-                "max_daily_orders_per_symbol": max_per_symbol,
-            },
-        )
 
     return None
 
