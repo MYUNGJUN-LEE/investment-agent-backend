@@ -2784,11 +2784,19 @@ def _claimed_no_order_reason_from_block_code(code: Any, message: Any = None) -> 
         "kis_cash_or_buying_power_zero",
     }:
         return text
-    if text in {"duplicate_scan_symbol_side", "duplicate_client_order_id"}:
+    if text in {
+        "duplicate_scan_symbol_side",
+        "duplicate_client_order_id",
+        "duplicate_idempotency_key",
+    }:
         return "duplicate_order_blocked"
     if text in {"open_broker_order_exists", "open_order_intent_exists"}:
         return "open_order_exists"
-    if text == "already_position_exists":
+    if text in {
+        "already_position_exists",
+        "position_already_long",
+        "position_already_flat",
+    }:
         return "already_position_exists"
     if text == "daily_order_limit_exceeded":
         return "daily_order_limit_exceeded"
@@ -3141,6 +3149,7 @@ def _run_symbol(
                 "order_state_message",
             ):
                 if key in details:
+                    result[key] = details.get(key)
                     trace[key] = details.get(key)
         if req.execution_mode in {"broker_paper", "live"}:
             trace["broker_submit_attempted"] = True

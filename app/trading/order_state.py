@@ -873,6 +873,47 @@ def _broker_paper_order_block(
         return _broker_block("notional_zero", "Order notional is zero")
 
     if req.side == "buy":
+        active_statuses = ",".join("?" for _ in ACTIVE_BROKER_ORDER_STATUSES)
+        open_event = conn.execute(
+            f"""
+            SELECT *
+            FROM broker_order_events
+            WHERE execution_mode = 'broker_paper'
+              AND symbol = ?
+              AND side = 'buy'
+              AND order_status IN ({active_statuses})
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (req.symbol, *ACTIVE_BROKER_ORDER_STATUSES),
+        ).fetchone()
+        if open_event:
+            return _broker_block(
+                "open_broker_order_exists",
+                "Open broker order already exists for this symbol",
+                {"existing_broker_order_id": open_event["broker_order_id"]},
+            )
+
+        intent_statuses = ",".join("?" for _ in PENDING_INTENT_STATUSES)
+        open_intent = conn.execute(
+            f"""
+            SELECT *
+            FROM order_intents
+            WHERE symbol = ?
+              AND side = 'buy'
+              AND status IN ({intent_statuses})
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (req.symbol, *PENDING_INTENT_STATUSES),
+        ).fetchone()
+        if open_intent:
+            return _broker_block(
+                "open_order_intent_exists",
+                "Open order intent already exists for this symbol",
+                {"existing_intent_id": open_intent["id"]},
+            )
+
         position_state = _get_position_state_row(conn, req.symbol)
         if (
             position_state

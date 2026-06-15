@@ -138,6 +138,15 @@ def execute_broker_paper_order(
         raise LiveTradingError(
             f"Risk rejected: {decision.message} ({decision.code})",
             status_code=403,
+            code="risk_manager_rejected",
+            details={
+                "broker_submit_blocked": True,
+                "broker_submit_block_code": "risk_manager_rejected",
+                "broker_submit_block_reason": decision.message,
+                "risk_approved": False,
+                "risk_code": decision.code,
+                "risk_message": decision.message,
+            },
         )
 
     guard = order_state.validate_broker_paper_order(req)
@@ -162,10 +171,19 @@ def execute_broker_paper_order(
     try:
         intent = order_state.begin_order_intent(req)
     except order_state.OrderStateError as exc:
+        details = {
+            "broker_submit_blocked": True,
+            "broker_submit_block_code": exc.code,
+            "broker_submit_block_reason": str(exc),
+            "order_state_approved": False,
+            "order_state_code": exc.code,
+            "order_state_message": str(exc),
+        }
         raise LiveTradingError(
             str(exc),
             status_code=exc.status_code,
             code=exc.code,
+            details=details,
         ) from exc
 
     try:

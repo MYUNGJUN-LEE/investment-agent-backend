@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
 from app.models import LiveOrderRequest
-from app.trading import auto_trading, live_trading, order_state, risk_manager
+from app.trading import auto_trading, broker_sync, live_trading, order_state, risk_manager
 from app.trading import paper_trading
 
 
@@ -369,7 +370,7 @@ def test_broker_paper_blocks_when_account_probe_cash_is_zero(tmp_path, monkeypat
     assert ZeroCashKisPaperClient.calls == []
 
 
-def test_broker_paper_prevents_duplicate_scan_symbol_order(tmp_path, monkeypatch):
+def test_broker_paper_prevents_second_buy_while_active_order_is_open(tmp_path, monkeypatch):
     _use_tmp_kis_paper_config(tmp_path, monkeypatch)
     _approve_all_orders(monkeypatch)
     FakeKisPaperClient.calls = []
@@ -445,7 +446,7 @@ def test_broker_paper_prevents_duplicate_scan_symbol_order(tmp_path, monkeypatch
     blocked = second.json()["results"][0]
     assert blocked["status"] == "error"
     assert blocked["broker_submit_blocked"] is True
-    assert blocked["broker_submit_block_code"] == "duplicate_scan_symbol_side"
+    assert blocked["broker_submit_block_code"] == "open_broker_order_exists"
     assert len(FakeKisPaperClient.calls) == 1
 
     status = client.get(
@@ -456,18 +457,27 @@ def test_broker_paper_prevents_duplicate_scan_symbol_order(tmp_path, monkeypatch
     assert status["last_order_by_symbol"]["005930"]["scan_id"] == "scan-dup"
 
 
-def test_broker_paper_artificial_limits_and_open_orders_do_not_block(
+def test_broker_paper_artificial_limits_do_not_block_final_prior_orders(
     tmp_path,
     monkeypatch,
 ):
     _use_tmp_kis_paper_config(tmp_path, monkeypatch)
-    monkeypatch.setattr(settings, "broker_paper_max_order_krw", 100_000.0)
-    monkeypatch.setattr(settings, "broker_paper_max_daily_orders", 3)
-    monkeypatch.setattr(settings, "broker_paper_max_daily_orders_per_symbol", 1)
-    monkeypatch.setattr(settings, "broker_paper_symbol_cooldown_days", 5)
-    monkeypatch.setattr(settings, "broker_paper_max_daily_notional_krw", 300_000.0)
+    monkeypatch.setattr(settings, "broker_paper_max_order_krw", 0.0)
+    monkeypatch.setattr(settings, "broker_paper_max_daily_orders", 0)
+    monkeypatch.setattr(settings, "broker_paper_max_daily_orders_per_symbol", 0)
+    monkeypatch.setattr(settings, "broker_paper_symbol_cooldown_days", 0)
+    monkeypatch.setattr(settings, "broker_paper_max_daily_notional_krw", 0.0)
 
-    for index, symbol in enumerate(("111111", "222222", "333333"), start=1):
+    for index, (symbol, status) in enumerate(
+        (
+            ("111111", "filled"),
+            ("222222", "filled"),
+            ("333333", "filled"),
+            ("444444", "filled"),
+            ("444444", "rejected"),
+        ),
+        start=1,
+    ):
         order_state.record_broker_order_event(
             {
                 "session_id": f"session-{index}",
@@ -482,7 +492,7 @@ def test_broker_paper_artificial_limits_and_open_orders_do_not_block(
                 "kis_is_paper": True,
                 "execution_mode": "broker_paper",
                 "broker_order_id": f"FILLED{index}",
-                "order_status": "filled",
+                "order_status": status,
                 "raw_response": {"rt_cd": "0"},
             }
         )
@@ -508,6 +518,15 @@ def test_broker_paper_artificial_limits_and_open_orders_do_not_block(
     assert guard["broker_order_risk_limits"]["symbol_cooldown_days"] == 0
     assert guard["broker_order_risk_limits"]["max_daily_notional_krw"] == 0.0
 
+    assert guard["broker_submit_blocked"] is False
+    assert guard["broker_submit_block_code"] is None
+
+
+def test_broker_paper_blocks_active_broker_order_for_same_symbol(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_kis_paper_config(tmp_path, monkeypatch)
     order_state.record_broker_order_event(
         {
             "session_id": "session-open",
@@ -526,11 +545,144 @@ def test_broker_paper_artificial_limits_and_open_orders_do_not_block(
             "raw_response": {"rt_cd": "0"},
         }
     )
+    req = LiveOrderRequest(
+        symbol="444444",
+        market="KR",
+        broker_provider="kis",
+        side="buy",
+        order_type="limit",
+        price=1_000_000,
+        quantity=1,
+        confirm_token="broker_paper",
+        decision_price=1_000_000,
+        scan_id="scan-new",
+    )
+
     blocked = order_state.validate_broker_paper_order(req)
 
-    assert blocked["approved"] is True
-    assert blocked["broker_submit_blocked"] is False
-    assert blocked["broker_submit_block_code"] is None
+    assert blocked["approved"] is False
+    assert blocked["broker_submit_block_code"] == "open_broker_order_exists"
+    assert blocked["broker_submit_block_reason"] == (
+        "Open broker order already exists for this symbol"
+    )
+
+
+def test_broker_paper_blocks_pending_order_intent_for_same_symbol(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_kis_paper_config(tmp_path, monkeypatch)
+    pending_req = LiveOrderRequest(
+        symbol="555555",
+        market="KR",
+        broker_provider="kis",
+        side="buy",
+        order_type="limit",
+        price=50_000,
+        quantity=1,
+        confirm_token="broker_paper",
+        decision_price=50_000,
+        client_order_id="pending-intent",
+    )
+    order_state.begin_order_intent(pending_req)
+    next_req = pending_req.model_copy(
+        update={"client_order_id": "next-intent", "scan_id": "scan-next"}
+    )
+
+    blocked = order_state.validate_broker_paper_order(next_req)
+
+    assert blocked["approved"] is False
+    assert blocked["broker_submit_block_code"] == "open_order_intent_exists"
+    assert blocked["broker_submit_block_reason"] == (
+        "Open order intent already exists for this symbol"
+    )
+
+
+def test_order_state_blocks_duplicate_idempotency_key(tmp_path, monkeypatch):
+    _use_tmp_kis_paper_config(tmp_path, monkeypatch)
+    req = LiveOrderRequest(
+        symbol="555555",
+        market="KR",
+        broker_provider="kis",
+        side="buy",
+        order_type="limit",
+        price=50_000,
+        quantity=1,
+        confirm_token="broker_paper",
+        decision_price=50_000,
+        client_order_id="same-key",
+    )
+    order_state.begin_order_intent(req)
+
+    with pytest.raises(order_state.OrderStateError) as exc:
+        order_state.begin_order_intent(req.model_copy(update={"symbol": "666666"}))
+
+    assert exc.value.code == "duplicate_idempotency_key"
+
+
+def test_broker_paper_blocks_existing_long_position_and_flat_sell(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_kis_paper_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "allow_position_additions", False)
+    broker_db = settings.storage_path(settings.broker_sync_db_path)
+    broker_sync.record_kis_sync(
+        balance={
+            "output1": [
+                {
+                    "pdno": "777777",
+                    "prdt_name": "Held",
+                    "hldg_qty": "2",
+                    "pchs_avg_pric": "50000",
+                }
+            ],
+            "output2": [{"tot_evlu_amt": "100000"}],
+        },
+        executions={"output1": []},
+        account_no="12345678",
+        db_path=broker_db,
+    )
+    order_state.reconcile_after_broker_sync(
+        symbol="777777",
+        market="KR",
+        account_no="12345678",
+        broker_db_path=broker_db,
+    )
+    buy_req = LiveOrderRequest(
+        symbol="777777",
+        market="KR",
+        broker_provider="kis",
+        side="buy",
+        order_type="limit",
+        price=50_000,
+        quantity=1,
+        confirm_token="broker_paper",
+        decision_price=50_000,
+        scan_id="scan-long",
+    )
+
+    blocked = order_state.validate_broker_paper_order(buy_req)
+
+    assert blocked["approved"] is False
+    assert blocked["broker_submit_block_code"] == "already_position_exists"
+
+    sell_req = LiveOrderRequest(
+        symbol="888888",
+        market="KR",
+        broker_provider="kis",
+        side="sell",
+        order_type="limit",
+        price=50_000,
+        quantity=1,
+        confirm_token="broker_paper",
+        decision_price=50_000,
+        client_order_id="flat-sell",
+    )
+    with pytest.raises(order_state.OrderStateError) as exc:
+        order_state.begin_order_intent(sell_req)
+
+    assert exc.value.code == "position_already_flat"
 
 
 def test_claimed_broker_paper_candidate_records_no_order_reason(
@@ -610,6 +762,115 @@ def test_claimed_broker_paper_candidate_records_no_order_reason(
     assert result["broker_submit_attempted"] is False
     assert result["claimed_no_order_reason"] == "risk_manager_rejected"
     assert result["post_claim_diagnostics"]["risk_approved"] is False
+
+
+def test_claimed_broker_paper_candidate_blocked_by_open_order_has_diagnostics(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_kis_paper_config(tmp_path, monkeypatch)
+    _approve_all_orders(monkeypatch)
+    FakeKisPaperClient.calls = []
+    monkeypatch.setattr(live_trading, "KisClient", FakeKisPaperClient)
+    monkeypatch.setattr(
+        auto_trading,
+        "broker_paper_safety_check",
+        lambda **kwargs: {"approved": True, "broker_submit_blocked": False},
+    )
+    monkeypatch.setattr(
+        auto_trading.broker_sync,
+        "sync_kis_account",
+        lambda **kwargs: {
+            "status": "success",
+            "account_no": "12345678",
+            "total_cash": 10_000_000,
+            "total_value": 10_000_000,
+            "execution_count": 0,
+            "synced_at": "2026-06-06T09:00:00",
+        },
+    )
+    monkeypatch.setattr(
+        auto_trading,
+        "create_order_preview",
+        lambda req: {
+            "status": "pending",
+            "preview_id": 1,
+            "preview_token": "token",
+            "symbol": req.symbol,
+            "signal_type": "entry",
+            "side": "BUY",
+            "price": req.price,
+            "quantity": req.quantity,
+            "amount": req.price * req.quantity,
+            "recommended_quantity": None,
+            "message": "ok",
+            "strategy_decision": {"approved": True},
+            "risk_decision": {"approved": True},
+            "cost_edge_decision": None,
+        },
+    )
+    order_state.record_broker_order_event(
+        {
+            "session_id": "session-open",
+            "scan_id": "scan-open",
+            "symbol": "005930",
+            "side": "buy",
+            "qty": 1,
+            "order_type": "limit",
+            "limit_price": 75000,
+            "submitted_price": 75000,
+            "broker_provider": "kis",
+            "kis_is_paper": True,
+            "execution_mode": "broker_paper",
+            "broker_order_id": "OPEN1",
+            "order_status": "submitted",
+            "raw_response": {"rt_cd": "0"},
+        }
+    )
+
+    response = client.post(
+        "/auto-trading/run-once",
+        headers=_auth_headers(),
+        json={
+            "execution_mode": "broker_paper",
+            "broker_provider": "kis",
+            "auto_discover_symbols": False,
+            "symbols": [
+                {
+                    "symbol": "005930",
+                    "price": 75000,
+                    "quantity": 1,
+                    "claimed": True,
+                    "claim_time": "2026-06-06T09:00:00",
+                    "candidate_status": "CLAIMED",
+                    "candidate_decision": "buy_candidate",
+                    "expected_gross_edge_bps": 100,
+                    "expected_win_bps": 100,
+                    "expected_loss_bps": 40,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["claimed"] is True
+    assert result["broker_submit_blocked"] is True
+    assert result["broker_submit_block_code"] == "open_broker_order_exists"
+    assert result["claimed_no_order_reason"] == "open_order_exists"
+    assert result["order_state_code"] == "open_broker_order_exists"
+    assert result["order_state_message"] == (
+        "Open broker order already exists for this symbol"
+    )
+    diagnostics = result["post_claim_diagnostics"]
+    assert diagnostics["broker_submit_blocked"] is True
+    assert diagnostics["broker_submit_block_code"] == "open_broker_order_exists"
+    assert diagnostics["broker_submit_block_reason"] == (
+        "Open broker order already exists for this symbol"
+    )
+    assert diagnostics["order_state_code"] == "open_broker_order_exists"
+    assert diagnostics["claimed_no_order_reason"] == "open_order_exists"
+    assert FakeKisPaperClient.calls == []
 
 
 def test_broker_paper_scan_symbol_side_dedupe_blocks_filled_prior_event(
