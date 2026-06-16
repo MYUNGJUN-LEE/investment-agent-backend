@@ -32,6 +32,10 @@ from app.trading.atr_exits import atr_exit_levels_from_price_data
 from app.trading import paper_trading
 
 EDGE_RISK_WEIGHT = 0.10
+READY_EXECUTABLE_STATUS = "READY_EXECUTABLE"
+READY_OBSERVE_ONLY_STATUS = "READY_OBSERVE_ONLY"
+RISK_REJECTED_STATUS = "RISK_REJECTED"
+CALIBRATION_ONLY_STATUS = "CALIBRATION_ONLY"
 logger = logging.getLogger(__name__)
 
 DEFAULT_UNIVERSE = {
@@ -527,6 +531,7 @@ def _apply_runtime_execution_overlay(
                 **candidate,
                 "rank": rank,
                 "status": status,
+                "candidate_state": _candidate_state_for_status(status, reason),
                 "reason": reason,
                 "broker_paper_bootstrap_allowed": bool(
                     entry_gate.get("broker_paper_bootstrap_allowed")
@@ -550,6 +555,7 @@ def _apply_runtime_execution_overlay(
                     "broker_paper_min_fill_samples"
                 ),
                 "broker_paper_executable": bool(status == "READY"),
+                "high_loss_risk": status == RISK_REJECTED_STATUS,
                 "calibration_gate_mode": entry_gate.get("calibration_gate_mode"),
             }
         )
@@ -2736,6 +2742,7 @@ def _rank_execution_candidates(
                 "rank": rank,
                 "score": item["composite_score"],
                 "status": status,
+                "candidate_state": _candidate_state_for_status(status, reason),
                 "reason": reason,
                 "worker_hurdle_rate": round(hurdle_rate, 4),
                 "entry_gate": entry_gate,
@@ -2766,6 +2773,7 @@ def _rank_execution_candidates(
                 "broker_paper_executable": bool(
                     execution_mode == "broker_paper" and status == "READY"
                 ),
+                "high_loss_risk": status == RISK_REJECTED_STATUS,
                 "calibration_gate_mode": entry_gate.get("calibration_gate_mode"),
             }
         )
@@ -3090,6 +3098,150 @@ def _execution_status_bonus(
     return max(-30.0, min(30.0, bonus))
 
 
+def _candidate_state_for_status(status: str, reason: str = "") -> str:
+    normalized = str(status or "").upper()
+    if normalized == "READY":
+        if BROKER_PAPER_OBSERVE_ONLY_REASON in str(reason or ""):
+            return READY_EXECUTABLE_STATUS
+        return READY_EXECUTABLE_STATUS
+    if normalized in {
+        READY_EXECUTABLE_STATUS,
+        READY_OBSERVE_ONLY_STATUS,
+        RISK_REJECTED_STATUS,
+        CALIBRATION_ONLY_STATUS,
+    }:
+        return normalized
+    return normalized or "UNKNOWN"
+
+
+def _strict_order_execution_mode(execution_mode: str | None) -> bool:
+    return str(execution_mode or "").strip().lower() in {"broker_paper", "live"}
+
+
+def _candidate_risk_bps(candidate: dict[str, Any]) -> float | None:
+    reward_risk = candidate.get("edge_reward_risk") or {}
+    for key in ("risk_bps", "net_risk_bps", "loss_risk_floor_bps"):
+        value = _to_float(reward_risk.get(key))
+        if value is not None:
+            return value
+    for key in ("risk_bps", "expected_risk_bps", "expected_risk"):
+        value = _to_float(candidate.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _return_fraction(value: Any) -> float | None:
+    parsed = _to_float(value)
+    if parsed is None:
+        return None
+    return parsed / 100.0 if abs(parsed) > 1.0 else parsed
+
+
+def _upper_wick_ratio(candidate: dict[str, Any]) -> float | None:
+    technical = candidate.get("latest_technical_features") or {}
+    for key in ("upper_wick_ratio", "upper_wick_pct", "upper_shadow_ratio", "upper_shadow_pct"):
+        value = _to_float(candidate.get(key))
+        if value is None:
+            value = _to_float(technical.get(key))
+        if value is not None:
+            return value / 100.0 if value > 1.0 else value
+    high = _to_float(technical.get("high") or candidate.get("high"))
+    close = _to_float(technical.get("close") or candidate.get("current_price"))
+    open_price = _to_float(technical.get("open") or candidate.get("open"))
+    low = _to_float(technical.get("low") or candidate.get("low"))
+    if high and close and open_price and low and high > low:
+        candle_top = max(close, open_price)
+        return max(0.0, (high - candle_top) / (high - low))
+    return None
+
+
+def _high_loss_risk_check(
+    candidate: dict[str, Any],
+    *,
+    execution_mode: str | None,
+) -> dict[str, Any]:
+    technical = candidate.get("latest_technical_features") or {}
+    risk_bps = _candidate_risk_bps(candidate)
+    expected_return = _to_float(
+        candidate.get("expected_return_bps") or candidate.get("expected_return")
+    )
+    predicted_edge = _to_float(
+        candidate.get("predicted_edge_bps")
+        or candidate.get("expected_net_edge")
+        or candidate.get("net_edge_bps")
+        or candidate.get("net_edge")
+    )
+    atr_pct = _to_float(
+        technical.get("atr_14_pct") or candidate.get("atr_pct") or candidate.get("atr_14_pct")
+    )
+    rsi = _to_float(technical.get("rsi_14") or candidate.get("rsi_14"))
+    change_rate = _to_float(candidate.get("change_rate")) or 0.0
+    gap_up_pct = _to_float(candidate.get("gap_up_pct")) or 0.0
+    return_3d = _return_fraction(
+        technical.get("return_3d")
+        or technical.get("return_3day")
+        or candidate.get("return_3d")
+    )
+    return_5d = _return_fraction(
+        technical.get("return_5d")
+        or technical.get("return_5day")
+        or candidate.get("return_5d")
+    )
+    volume_ratio = _to_float(candidate.get("volume_ratio"))
+    upper_wick = _upper_wick_ratio(candidate)
+    reasons: list[str] = []
+
+    if risk_bps is not None and risk_bps >= 1000.0:
+        reasons.append(f"blocked: high_loss_risk: risk_bps {risk_bps:.0f} >= 1000")
+
+    if atr_pct is not None and atr_pct >= 0.095:
+        reasons.append("blocked: ATR volatility too high")
+
+    overheated = bool(candidate.get("overheated"))
+    overheated = overheated or (
+        change_rate >= 8.0 and (rsi is None or rsi >= 70.0 or gap_up_pct >= 3.0)
+    )
+    if overheated:
+        reasons.append("blocked: overheated momentum reversal risk")
+
+    if (
+        expected_return is not None
+        and risk_bps is not None
+        and expected_return < risk_bps * 0.5
+    ):
+        reasons.append("blocked: expected_return/risk ratio too low")
+
+    if return_3d is not None and return_3d >= 0.12:
+        reasons.append("blocked: recent 3-day surge too high")
+    elif return_5d is not None and return_5d >= 0.18:
+        reasons.append("blocked: recent 5-day surge too high")
+
+    if change_rate >= 8.0 and return_5d is not None and return_5d >= 0.10:
+        reasons.append("blocked: post-long-bull-candle chase risk")
+
+    if (
+        volume_ratio is not None
+        and volume_ratio >= 5.0
+        and upper_wick is not None
+        and upper_wick >= 0.35
+    ):
+        reasons.append("blocked: turnover surge + long upper wick")
+
+    if gap_up_pct >= 5.0:
+        reasons.append("blocked: gap-up short-term reversal risk")
+
+    return {
+        "blocked": bool(reasons),
+        "reasons": reasons,
+        "risk_bps": risk_bps,
+        "expected_return_bps": expected_return,
+        "predicted_edge_bps": predicted_edge,
+        "atr_pct": atr_pct,
+        "overheated_risk": overheated,
+    }
+
+
 def _with_expected_value_scores(
     candidate: dict[str, Any],
     *,
@@ -3256,6 +3408,31 @@ def _execution_status_for_candidate(
     else:
         if decision != "buy_candidate":
             reasons.append("not a buy candidate")
+            return "SKIPPED", _join_reasons(reasons)
+
+    high_loss_risk = _high_loss_risk_check(
+        candidate,
+        execution_mode=execution_mode,
+    )
+    if high_loss_risk.get("blocked"):
+        reasons.extend(str(item) for item in high_loss_risk.get("reasons") or [])
+        return RISK_REJECTED_STATUS, _join_reasons(reasons)
+
+    if _strict_order_execution_mode(execution_mode):
+        predicted_edge = _to_float(
+            candidate.get("predicted_edge_bps")
+            or candidate.get("expected_net_edge")
+            or candidate.get("net_edge_bps")
+            or candidate.get("net_edge")
+        )
+        expected_return = _to_float(
+            candidate.get("expected_return_bps") or candidate.get("expected_return")
+        )
+        if predicted_edge is not None and predicted_edge < 100.0:
+            reasons.append("blocked: predicted_edge_bps below 100")
+            return "SKIPPED", _join_reasons(reasons)
+        if expected_return is not None and expected_return < 150.0:
+            reasons.append("blocked: expected_return_bps below 150")
             return "SKIPPED", _join_reasons(reasons)
 
     reward_risk = candidate.get("edge_reward_risk") or {}
@@ -3893,6 +4070,8 @@ def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
                 "composite_score": item.get("composite_score"),
                 "decision": item.get("decision"),
                 "status": item.get("status"),
+                "candidate_state": item.get("candidate_state"),
+                "high_loss_risk": item.get("high_loss_risk"),
                 "reason": item.get("reason"),
                 "current_price": item.get("current_price"),
                 "change_rate": item.get("change_rate"),

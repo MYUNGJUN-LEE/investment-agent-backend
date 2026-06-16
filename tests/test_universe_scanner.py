@@ -910,6 +910,97 @@ def test_broker_paper_bootstrap_observe_only_candidate_label_gate(monkeypatch):
     assert blocked_status == "SKIPPED"
 
 
+def test_high_loss_risk_candidate_is_risk_rejected():
+    candidate = {
+        "symbol": "123456",
+        "decision": "buy_candidate",
+        "current_price": 10_000,
+        "score": 80.0,
+        "composite_score": 80.0,
+        "net_edge": 180.0,
+        "expected_return": 700.0,
+        "edge_reward_risk": {
+            "expected_value_after_cost_bps": 60.0,
+            "reward_risk_ratio": 1.8,
+            "risk_bps": 1295.0,
+        },
+        "large_cap_top10_gate": {"passed": True},
+    }
+
+    status, reason = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate={"approved": True},
+        execution_mode="broker_paper",
+    )
+
+    assert status == universe_scanner.RISK_REJECTED_STATUS
+    assert "blocked: high_loss_risk: risk_bps 1295 >= 1000" in reason
+
+
+def test_expected_return_risk_ratio_candidate_is_risk_rejected():
+    candidate = {
+        "symbol": "123456",
+        "decision": "buy_candidate",
+        "current_price": 10_000,
+        "score": 80.0,
+        "composite_score": 80.0,
+        "net_edge": 180.0,
+        "expected_return": 300.0,
+        "edge_reward_risk": {
+            "expected_value_after_cost_bps": 60.0,
+            "reward_risk_ratio": 1.8,
+            "risk_bps": 800.0,
+        },
+        "large_cap_top10_gate": {"passed": True},
+    }
+
+    status, reason = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate={"approved": True},
+        execution_mode="broker_paper",
+    )
+
+    assert status == universe_scanner.RISK_REJECTED_STATUS
+    assert "blocked: expected_return/risk ratio too low" in reason
+
+
+def test_overheated_candidate_is_risk_rejected():
+    candidate = {
+        "symbol": "123456",
+        "decision": "buy_candidate",
+        "current_price": 10_000,
+        "score": 80.0,
+        "composite_score": 80.0,
+        "net_edge": 180.0,
+        "expected_return": 300.0,
+        "overheated": True,
+        "edge_reward_risk": {
+            "expected_value_after_cost_bps": 60.0,
+            "reward_risk_ratio": 1.8,
+            "risk_bps": 200.0,
+        },
+        "large_cap_top10_gate": {"passed": True},
+    }
+
+    status, reason = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate={"approved": True},
+        execution_mode="broker_paper",
+    )
+
+    assert status == universe_scanner.RISK_REJECTED_STATUS
+    assert "blocked: overheated momentum reversal risk" in reason
+
+
 def test_broker_paper_observe_only_final_candidate_path_counts_executable(monkeypatch):
     monkeypatch.setattr(
         universe_scanner,

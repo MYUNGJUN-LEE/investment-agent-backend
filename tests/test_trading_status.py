@@ -10,7 +10,7 @@ from app.config import settings
 from app.main import app
 from app.models import AutoTradeStartRequest, PaperRunRequest
 from app.brokers.kis_client import KisClient
-from app.trading import auto_trading, execution_status, paper_trading, risk_manager
+from app.trading import auto_trading, edge_calibration, execution_status, paper_trading, risk_manager
 from app.trading import auto_trading_store
 from app.trading import universe_scanner
 from app.workers import trading_worker
@@ -498,6 +498,47 @@ def test_claimed_candidate_without_submission_is_not_submitted(
     assert status["claimed_candidate_count"] == 1
     assert status["submitted_order_count"] == 0
     assert status["order_status"] == "not_submitted"
+
+
+def test_trading_status_exposes_net_edge_aggregate_splits(tmp_path, monkeypatch):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    calibration_path = settings.storage_path(settings.edge_calibration_db_path)
+    edge_calibration.initialize_edge_calibration_db(calibration_path)
+    with sqlite3.connect(calibration_path) as conn:
+        for source_id, symbol, realized_net, sample_status in (
+            (1, "005930", 120.0, "READY"),
+            (2, "000660", -500.0, "RISK_REJECTED"),
+        ):
+            conn.execute(
+                """
+                INSERT INTO edge_training_samples (
+                    source_candidate_id, scan_id, label_horizon_key, symbol,
+                    scan_time, observed_at, entry_price, observed_price,
+                    features_json, realized_return_bps, realized_risk_bps,
+                    realized_net_edge_bps, net_edge_bps, rank, status,
+                    created_at, raw_json
+                )
+                VALUES (?, 'scan-a', ?, ?, '2026-06-06T09:00:00',
+                        '2026-06-07T09:00:00', 100, 101, '[]',
+                        ?, 0, ?, 180, 1, ?, '2026-06-07T09:00:00', '{}')
+                """,
+                (
+                    source_id,
+                    f"{symbol}:2026-06-06T09:00:00:86400",
+                    symbol,
+                    realized_net,
+                    realized_net,
+                    sample_status,
+                ),
+            )
+
+    status = execution_status.trading_status_snapshot(execution_mode="paper")
+
+    assert status["all_observed_net_edge_bps"] == -380.0
+    assert status["executable_only_net_edge_bps"] == 120.0
+    assert status["risk_rejected_net_edge_bps"] == -500.0
+    assert status["top_rank_executable_net_edge_bps"] == 120.0
+    assert "net_edge_aggregate_splits" in status
 
 
 def test_trading_status_exposes_post_claim_no_order_diagnostics(

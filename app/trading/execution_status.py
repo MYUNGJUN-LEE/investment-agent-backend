@@ -864,6 +864,15 @@ def _edge_metric_status(
         "broker_paper_fill_gate_hard_blocking": False,
         "broker_paper_fill_gate_blocked": False,
         "calibration_gate_mode": None,
+        "net_edge_aggregate_splits": {},
+        "all_observed_net_edge_bps": None,
+        "executable_only_net_edge_bps": None,
+        "risk_rejected_net_edge_bps": None,
+        "top_rank_executable_net_edge_bps": None,
+        "false_positive_net_edge_impact_bps": None,
+        "false_positive_count": 0,
+        "false_positive_rate": 0.0,
+        "severe_false_positive_count": 0,
     }
     summary: dict[str, Any] = {}
     try:
@@ -920,6 +929,39 @@ def _edge_metric_status(
             public["dashboard_edge_sample_count"] = (
                 (summary.get("summary") or {}).get("sample_count")
                 or summary.get("sample_count")
+            )
+            splits = summary.get("net_edge_aggregate_splits") or {}
+            executable_split = splits.get("executable_candidates_only") or {}
+            public["net_edge_aggregate_splits"] = splits
+            public["all_observed_net_edge_bps"] = (
+                (splits.get("all_observed_candidates") or {}).get(
+                    "total_realized_net_edge_bps"
+                )
+            )
+            public["executable_only_net_edge_bps"] = executable_split.get(
+                "total_realized_net_edge_bps"
+            )
+            public["risk_rejected_net_edge_bps"] = (
+                (splits.get("risk_rejected_candidates") or {}).get(
+                    "total_realized_net_edge_bps"
+                )
+            )
+            public["top_rank_executable_net_edge_bps"] = (
+                (splits.get("top_rank_executable_only") or {}).get(
+                    "total_realized_net_edge_bps"
+                )
+            )
+            public["false_positive_net_edge_impact_bps"] = executable_split.get(
+                "false_positive_net_edge_impact_bps"
+            )
+            public["false_positive_count"] = (
+                executable_split.get("false_positive_count") or 0
+            )
+            public["false_positive_rate"] = (
+                executable_split.get("false_positive_rate") or 0.0
+            )
+            public["severe_false_positive_count"] = (
+                executable_split.get("severe_false_positive_count") or 0
             )
         except Exception as exc:
             public["dashboard_edge_error"] = str(exc)

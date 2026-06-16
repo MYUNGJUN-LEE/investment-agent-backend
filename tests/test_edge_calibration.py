@@ -744,6 +744,138 @@ def test_top10_performance_uses_only_current_eligible_ranked_samples(tmp_path):
     assert performance["avg_return_bps"] == 20.0
 
 
+def test_store_training_sample_calculates_realized_net_edge_label_and_penalty(tmp_path):
+    calibration_db = tmp_path / "edge.sqlite3"
+    edge_calibration.initialize_edge_calibration_db(calibration_db)
+    with sqlite3.connect(calibration_db) as conn:
+        inserted = edge_calibration._store_training_sample(
+            conn,
+            {
+                "source_candidate_id": 1,
+                "scan_id": "scan-a",
+                "label_horizon_key": "005930:2026-05-24T09:00:00:86400",
+                "symbol": "005930",
+                "scan_time": "2026-05-24T09:00:00",
+                "observed_at": "2026-05-25T09:00:00",
+                "entry_price": 100.0,
+                "observed_price": 96.0,
+                "features": [0.0] * len(edge_calibration.FEATURE_NAMES),
+                "realized_return_bps": -400.0,
+                "realized_risk_bps": 500.0,
+                "trading_cost_bps": 50.0,
+                "slippage_cost_bps": 20.0,
+                "tax_bps": 10.0,
+                "net_edge_bps": 260.0,
+                "rank": 1,
+                "status": "READY",
+                "raw_json": {},
+            },
+        )
+        row = conn.execute(
+            """
+            SELECT realized_net_edge_bps, net_edge_label, false_positive_flag,
+                   severe_false_positive_flag, sample_weight
+            FROM edge_training_samples
+            WHERE source_candidate_id = 1
+            """
+        ).fetchone()
+
+    assert inserted == 1
+    assert row[0] == -530.0
+    assert row[1] == 0
+    assert row[2] == 1
+    assert row[3] == 1
+    assert row[4] == 5.0
+
+
+def test_false_positive_metrics_block_calibration_gate(monkeypatch):
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_samples", 20)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_return_bps", 10_000)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_risk_bps", 10_000)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_win_rate", 0.0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_expectancy_bps", -1)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 0)
+
+    gate = edge_calibration._gate_from_metrics(
+        sample_count=20,
+        oos_sample_count=1,
+        mae_return_bps=50,
+        mae_risk_bps=50,
+        top10_performance={
+            "status": "ready",
+            "sample_count": 20,
+            "metric_sample_count": 20,
+            "top_count": 10,
+            "avg_return_bps": 25,
+            "win_rate": 0.60,
+            "loss_rate": 0.40,
+            "avg_win_bps": 90,
+            "avg_loss_bps": 20,
+            "expectancy_bps": 24,
+            "mae_net_edge_error_bps": 50,
+            "false_positive_rate": 0.25,
+            "severe_false_positive_count": 2,
+        },
+        fill_adjustment={"multiplier": 1.0},
+        ic_metrics={"ic": 0.03},
+        candidates=[
+            {
+                "symbol": "035900",
+                "status": "READY",
+                "net_edge": 200,
+                "expected_return": 500,
+                "trading_cost": 49.4,
+                "slippage_cost": 10,
+                "liquidity_drag_bps": 0,
+            }
+        ],
+    )
+
+    assert gate["approved"] is False
+    assert "false_positive_rate too high" in gate["message"]
+    assert "severe false positives detected" in gate["message"]
+
+
+def test_risk_rejected_samples_are_split_from_executable_aggregate(tmp_path):
+    calibration_db = tmp_path / "edge.sqlite3"
+    edge_calibration.initialize_edge_calibration_db(calibration_db)
+    with sqlite3.connect(calibration_db) as conn:
+        _insert_training_sample(
+            conn,
+            source_candidate_id=1,
+            symbol="005930",
+            observed_at="2026-05-24T10:00:00",
+            realized_return_bps=200.0,
+            rank=1,
+            net_edge_bps=180.0,
+            status="READY",
+        )
+        _insert_training_sample(
+            conn,
+            source_candidate_id=2,
+            symbol="000660",
+            observed_at="2026-05-24T10:01:00",
+            realized_return_bps=-800.0,
+            rank=1,
+            net_edge_bps=180.0,
+            status="RISK_REJECTED",
+        )
+
+    summary = edge_calibration.get_edge_training_sample_summary(
+        calibration_db_path=calibration_db,
+    )
+    splits = summary["net_edge_aggregate_splits"]
+
+    assert splits["all_observed_candidates"]["sample_count"] == 2
+    assert splits["executable_candidates_only"]["sample_count"] == 1
+    assert splits["risk_rejected_candidates"]["sample_count"] == 1
+    assert splits["executable_candidates_only"]["total_realized_net_edge_bps"] == 200.0
+    assert splits["risk_rejected_candidates"]["total_realized_net_edge_bps"] == -800.0
+    assert splits["top_rank_executable_only"]["sample_count"] == 1
+
+
 def test_paper_and_live_gate_use_two_bps_top10_average(monkeypatch):
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_samples", 1)
     monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 1)

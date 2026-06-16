@@ -237,15 +237,33 @@ EXPECTED_NET_EDGE_FORMULA = (
     "- trading_cost_bps - slippage_cost_bps - liquidity_drag_bps"
 )
 
-ELIGIBLE_EDGE_SAMPLE_STATUSES = {
+EXECUTABLE_EDGE_SAMPLE_STATUSES = {
     "BUY",
     "BUY_CANDIDATE",
     "WATCH",
     "CANDIDATE",
     "EXECUTABLE",
     "READY",
+    "READY_EXECUTABLE",
     "CLAIMED",
 }
+
+CALIBRATION_ONLY_EDGE_SAMPLE_STATUSES = {
+    "READY_OBSERVE_ONLY",
+    "CALIBRATION_ONLY",
+}
+
+RISK_REJECTED_EDGE_SAMPLE_STATUSES = {
+    "RISK_REJECTED",
+}
+
+OBSERVED_EDGE_SAMPLE_STATUSES = (
+    EXECUTABLE_EDGE_SAMPLE_STATUSES
+    | CALIBRATION_ONLY_EDGE_SAMPLE_STATUSES
+    | RISK_REJECTED_EDGE_SAMPLE_STATUSES
+)
+
+ELIGIBLE_EDGE_SAMPLE_STATUSES = EXECUTABLE_EDGE_SAMPLE_STATUSES
 
 INELIGIBLE_EDGE_SAMPLE_STATUSES = {
     "EXCLUDED",
@@ -257,18 +275,27 @@ INELIGIBLE_EDGE_SAMPLE_STATUSES = {
 
 ELIGIBLE_EDGE_SAMPLE_STATUS_SQL = (
     "UPPER(COALESCE(status, '')) IN "
-    "('BUY', 'BUY_CANDIDATE', 'WATCH', 'CANDIDATE', 'EXECUTABLE', 'READY', 'CLAIMED')"
+    "('BUY', 'BUY_CANDIDATE', 'WATCH', 'CANDIDATE', 'EXECUTABLE', 'READY', 'READY_EXECUTABLE', 'CLAIMED')"
+)
+
+OBSERVED_EDGE_SAMPLE_STATUS_SQL = (
+    "UPPER(COALESCE(status, '')) IN "
+    "('BUY', 'BUY_CANDIDATE', 'WATCH', 'CANDIDATE', 'EXECUTABLE', 'READY', "
+    "'READY_EXECUTABLE', 'CLAIMED', 'READY_OBSERVE_ONLY', 'CALIBRATION_ONLY', "
+    "'RISK_REJECTED')"
 )
 
 
 REALIZED_NET_EDGE_SQL = (
+    "COALESCE(realized_net_edge_bps, "
     f"realized_return_bps - (realized_risk_bps * {REALIZED_RISK_WEIGHT:.2f}) "
-    "- COALESCE(trading_cost_bps, 0) - COALESCE(slippage_cost_bps, 0)"
+    "- COALESCE(trading_cost_bps, 0) - COALESCE(slippage_cost_bps, 0) "
+    "- COALESCE(tax_bps, 0))"
 )
 
 REALIZED_NET_EDGE_FORMULA = (
     f"realized_return_bps - realized_risk_bps * {REALIZED_RISK_WEIGHT:.2f} "
-    "- trading_cost_bps - slippage_cost_bps"
+    "- trading_cost_bps - slippage_bps - tax_bps"
 )
 
 COMPOSITE_SCORE_FORMULA = (
@@ -330,12 +357,21 @@ CREATE TABLE IF NOT EXISTS edge_training_samples (
     features_json TEXT NOT NULL,
     realized_return_bps REAL NOT NULL,
     realized_risk_bps REAL NOT NULL,
+    future_return_bps REAL,
     label_observation_span_seconds INTEGER,
     raw_score REAL,
     expected_return_bps REAL,
     expected_risk_bps REAL,
     trading_cost_bps REAL,
     slippage_cost_bps REAL,
+    slippage_bps REAL,
+    tax_bps REAL,
+    downside_risk_penalty_bps REAL,
+    realized_net_edge_bps REAL,
+    net_edge_label INTEGER,
+    false_positive_flag INTEGER NOT NULL DEFAULT 0,
+    severe_false_positive_flag INTEGER NOT NULL DEFAULT 0,
+    sample_weight REAL NOT NULL DEFAULT 1.0,
     net_edge_bps REAL,
     composite_score REAL,
     rank INTEGER,
@@ -445,7 +481,12 @@ def _is_edge_training_sample_status_allowed(value: Any) -> bool:
     status = _normalize_sample_status(value)
     if status in INELIGIBLE_EDGE_SAMPLE_STATUSES:
         return False
-    return status in ELIGIBLE_EDGE_SAMPLE_STATUSES
+    return status in OBSERVED_EDGE_SAMPLE_STATUSES
+
+
+def _is_executable_edge_sample_status(value: Any) -> bool:
+    status = _normalize_sample_status(value)
+    return status in EXECUTABLE_EDGE_SAMPLE_STATUSES
 
 
 def _row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
@@ -453,6 +494,61 @@ def _row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
         return row[key]
     except (KeyError, IndexError):
         return default
+
+
+def _net_edge_label_components(payload: dict[str, Any]) -> dict[str, Any]:
+    future_return = _to_float(
+        payload.get("future_return_bps") or payload.get("realized_return_bps")
+    ) or 0.0
+    realized_risk = _to_float(payload.get("realized_risk_bps")) or 0.0
+    trading_cost = _to_float(payload.get("trading_cost_bps")) or 0.0
+    slippage = _to_float(
+        payload.get("slippage_bps") or payload.get("slippage_cost_bps")
+    ) or 0.0
+    tax = _to_float(payload.get("tax_bps")) or 0.0
+    downside_penalty = _to_float(payload.get("downside_risk_penalty_bps"))
+    if downside_penalty is None:
+        downside_penalty = realized_risk * REALIZED_RISK_WEIGHT
+    realized_net = _to_float(payload.get("realized_net_edge_bps"))
+    if realized_net is None:
+        realized_net = (
+            future_return
+            - trading_cost
+            - slippage
+            - tax
+            - downside_penalty
+        )
+    predicted_edge = _to_float(payload.get("net_edge_bps"))
+    false_positive = bool(
+        predicted_edge is not None
+        and predicted_edge >= 150.0
+        and realized_net <= -300.0
+    )
+    severe_false_positive = bool(
+        predicted_edge is not None
+        and predicted_edge >= 250.0
+        and realized_net <= -500.0
+    )
+    base_weight = _to_float(payload.get("base_weight") or payload.get("sample_weight")) or 1.0
+    if severe_false_positive:
+        sample_weight = base_weight * 5.0
+    elif false_positive:
+        sample_weight = base_weight * 3.0
+    else:
+        sample_weight = base_weight
+    return {
+        "future_return_bps": future_return,
+        "realized_risk_bps": realized_risk,
+        "trading_cost_bps": trading_cost,
+        "slippage_bps": slippage,
+        "tax_bps": tax,
+        "downside_risk_penalty_bps": downside_penalty,
+        "realized_net_edge_bps": realized_net,
+        "net_edge_label": 1 if realized_net >= 100.0 else 0,
+        "false_positive_flag": 1 if false_positive else 0,
+        "severe_false_positive_flag": 1 if severe_false_positive else 0,
+        "sample_weight": sample_weight,
+    }
 
 
 def initialize_edge_calibration_db(db_path: Path | str | None = None) -> None:
@@ -652,9 +748,21 @@ def calibrate_edge_model(
 
     train_samples, oos_samples = _performance_split(samples)
     for sample in train_samples:
-        features, realized_return_bps, realized_risk_bps = sample
-        _accumulate(return_matrix, return_vector, features, realized_return_bps)
-        _accumulate(risk_matrix, risk_vector, features, realized_risk_bps)
+        features, realized_return_bps, realized_risk_bps, sample_weight = sample
+        _accumulate(
+            return_matrix,
+            return_vector,
+            features,
+            realized_return_bps,
+            weight=sample_weight,
+        )
+        _accumulate(
+            risk_matrix,
+            risk_vector,
+            features,
+            realized_risk_bps,
+            weight=sample_weight,
+        )
 
     if sample_count < min_samples:
         gate = _default_gate(
@@ -806,6 +914,7 @@ def get_edge_training_sample_summary(
             "sample_count": 0,
             "summary": _empty_sample_summary(),
             "top10_performance": _empty_top10_performance(),
+            "net_edge_aggregate_splits": _empty_net_edge_aggregate_splits(),
             "unit_performance": _empty_unit_performance(),
             "label_policy": label_policy_summary(),
             "recent_samples": [],
@@ -839,9 +948,7 @@ def get_edge_training_sample_summary(
                 COALESCE(SUM(realized_return_bps), 0) AS total_return_bps,
                 COALESCE(SUM(realized_risk_bps), 0) AS total_risk_bps,
                 COALESCE(SUM(
-                    realized_return_bps - (realized_risk_bps * 0.10)
-                    - COALESCE(trading_cost_bps, 0)
-                    - COALESCE(slippage_cost_bps, 0)
+                    {REALIZED_NET_EDGE_SQL}
                 ), 0) AS total_realized_net_edge_bps,
                 COALESCE(SUM(expected_return_bps), 0) AS total_expected_return_bps,
                 COALESCE(SUM(expected_risk_bps), 0) AS total_expected_risk_bps,
@@ -860,15 +967,11 @@ def get_edge_training_sample_summary(
                 AVG(realized_risk_bps - expected_risk_bps) AS avg_risk_error_bps,
                 AVG(ABS(realized_risk_bps - expected_risk_bps)) AS mae_risk_error_bps,
                 AVG(
-                    realized_return_bps - (realized_risk_bps * 0.10)
-                    - COALESCE(trading_cost_bps, 0)
-                    - COALESCE(slippage_cost_bps, 0)
+                    {REALIZED_NET_EDGE_SQL}
                     - net_edge_bps
                 ) AS avg_net_edge_error_bps,
                 AVG(ABS(
-                    realized_return_bps - (realized_risk_bps * 0.10)
-                    - COALESCE(trading_cost_bps, 0)
-                    - COALESCE(slippage_cost_bps, 0)
+                    {REALIZED_NET_EDGE_SQL}
                     - net_edge_bps
                 )) AS mae_net_edge_error_bps,
                 COUNT(expected_return_bps) AS metric_sample_count,
@@ -877,24 +980,38 @@ def get_edge_training_sample_summary(
                 SUM(CASE WHEN realized_return_bps > 0 THEN 1 ELSE 0 END) AS win_count,
                 SUM(CASE WHEN realized_return_bps <= 0 THEN 1 ELSE 0 END) AS loss_count,
                 AVG(
-                    realized_return_bps - (realized_risk_bps * 0.10)
-                    - COALESCE(trading_cost_bps, 0)
-                    - COALESCE(slippage_cost_bps, 0)
+                    {REALIZED_NET_EDGE_SQL}
                 ) AS avg_realized_net_edge_bps,
                 SUM(CASE
                     WHEN (
-                        realized_return_bps - (realized_risk_bps * 0.10)
-                        - COALESCE(trading_cost_bps, 0)
-                        - COALESCE(slippage_cost_bps, 0)
+                        {REALIZED_NET_EDGE_SQL}
                     ) > 0 THEN 1 ELSE 0
                 END) AS net_edge_win_count,
                 SUM(CASE
                     WHEN (
-                        realized_return_bps - (realized_risk_bps * 0.10)
-                        - COALESCE(trading_cost_bps, 0)
-                        - COALESCE(slippage_cost_bps, 0)
+                        {REALIZED_NET_EDGE_SQL}
                     ) <= 0 THEN 1 ELSE 0
-                END) AS net_edge_loss_count
+                END) AS net_edge_loss_count,
+                SUM(CASE
+                    WHEN COALESCE(false_positive_flag, 0) = 1
+                      OR (COALESCE(net_edge_bps, 0) >= 150 AND ({REALIZED_NET_EDGE_SQL}) <= -300)
+                    THEN 1 ELSE 0
+                END) AS false_positive_count,
+                SUM(CASE
+                    WHEN COALESCE(severe_false_positive_flag, 0) = 1
+                      OR (COALESCE(net_edge_bps, 0) >= 250 AND ({REALIZED_NET_EDGE_SQL}) <= -500)
+                    THEN 1 ELSE 0
+                END) AS severe_false_positive_count,
+                AVG(CASE
+                    WHEN COALESCE(false_positive_flag, 0) = 1
+                      OR (COALESCE(net_edge_bps, 0) >= 150 AND ({REALIZED_NET_EDGE_SQL}) <= -300)
+                    THEN ABS(MIN(0, {REALIZED_NET_EDGE_SQL})) ELSE NULL
+                END) AS avg_false_positive_loss_bps,
+                SUM(CASE
+                    WHEN COALESCE(false_positive_flag, 0) = 1
+                      OR (COALESCE(net_edge_bps, 0) >= 150 AND ({REALIZED_NET_EDGE_SQL}) <= -300)
+                    THEN ({REALIZED_NET_EDGE_SQL}) ELSE 0
+                END) AS false_positive_net_edge_impact_bps
             FROM canonical
             """
         ).fetchone()
@@ -919,7 +1036,10 @@ def get_edge_training_sample_summary(
                 realized_return_bps, realized_risk_bps, label_observation_span_seconds,
                 raw_score,
                 expected_return_bps, expected_risk_bps, trading_cost_bps,
-                slippage_cost_bps, net_edge_bps, composite_score, rank, status,
+                slippage_cost_bps, slippage_bps, tax_bps,
+                downside_risk_penalty_bps, realized_net_edge_bps,
+                net_edge_label, false_positive_flag, severe_false_positive_flag,
+                sample_weight, net_edge_bps, composite_score, rank, status,
                 market_segment, sector, theme
             FROM canonical
             ORDER BY observed_at DESC, id DESC
@@ -964,6 +1084,7 @@ def get_edge_training_sample_summary(
     summary = _sample_summary_from_row(dict(aggregate or {}))
     diagnostics = get_edge_data_diagnostics(calibration_db_path=path)
     top10_performance = _top10_performance_from_store(calibration_path=path)
+    net_edge_aggregate_splits = _net_edge_aggregate_splits(calibration_path=path)
     unit_performance = _unit_performance_summary(calibration_path=path)
     return {
         "status": "ready" if summary["sample_count"] else "empty",
@@ -975,6 +1096,7 @@ def get_edge_training_sample_summary(
         "sample_count": summary["sample_count"],
         "summary": summary,
         "top10_performance": top10_performance,
+        "net_edge_aggregate_splits": net_edge_aggregate_splits,
         "unit_performance": unit_performance,
         "label_policy": label_policy_summary(),
         "recent_samples": [_sample_row(row) for row in recent],
@@ -1232,7 +1354,11 @@ def _recent_ic_from_store(
                 realized_return_bps,
                 realized_risk_bps,
                 trading_cost_bps,
-                slippage_cost_bps
+                slippage_cost_bps,
+                slippage_bps,
+                tax_bps,
+                downside_risk_penalty_bps,
+                realized_net_edge_bps
             FROM edge_training_samples
             WHERE net_edge_bps IS NOT NULL
               AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
@@ -1250,17 +1376,7 @@ def _recent_ic_from_store(
         if pred is None:
             continue
 
-        realized_return = _to_float(row["realized_return_bps"]) or 0.0
-        realized_risk = _to_float(row["realized_risk_bps"]) or 0.0
-        trading_cost = _to_float(row["trading_cost_bps"]) or 0.0
-        slippage_cost = _to_float(row["slippage_cost_bps"]) or 0.0
-
-        realized_net = (
-            realized_return
-            - realized_risk * REALIZED_RISK_WEIGHT
-            - trading_cost
-            - slippage_cost
-        )
+        realized_net = _realized_net_edge_from_row(dict(row))
 
         predicted.append(pred)
         realized.append(realized_net)
@@ -2355,18 +2471,62 @@ def _store_training_sample(
         ).fetchone()
         if existing:
             return 0
+    label_components = _net_edge_label_components(payload)
+    payload = {**payload, **label_components}
+    raw_json = payload.get("raw_json") or {}
+    if isinstance(raw_json, dict):
+        raw_metrics = raw_json.get("sample_metrics")
+        if not isinstance(raw_metrics, dict):
+            raw_metrics = {}
+        raw_json = {
+            **raw_json,
+            "target_policy": {
+                "target": "realized_net_edge_bps",
+                "net_edge_label_threshold_bps": 100.0,
+                "false_positive_threshold": {
+                    "predicted_edge_bps": 150.0,
+                    "realized_net_edge_bps": -300.0,
+                    "sample_weight_multiplier": 3.0,
+                },
+                "severe_false_positive_threshold": {
+                    "predicted_edge_bps": 250.0,
+                    "realized_net_edge_bps": -500.0,
+                    "sample_weight_multiplier": 5.0,
+                },
+            },
+            "sample_metrics": {
+                **raw_metrics,
+                "future_return_bps": payload["future_return_bps"],
+                "realized_risk_bps": payload["realized_risk_bps"],
+                "trading_cost_bps": payload["trading_cost_bps"],
+                "slippage_bps": payload["slippage_bps"],
+                "tax_bps": payload["tax_bps"],
+                "downside_risk_penalty_bps": payload["downside_risk_penalty_bps"],
+                "realized_net_edge_bps": payload["realized_net_edge_bps"],
+                "net_edge_label": payload["net_edge_label"],
+                "false_positive_flag": bool(payload["false_positive_flag"]),
+                "severe_false_positive_flag": bool(
+                    payload["severe_false_positive_flag"]
+                ),
+                "sample_weight": payload["sample_weight"],
+            },
+        }
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO edge_training_samples (
             source_candidate_id, scan_id, label_horizon_key,
             symbol, scan_time, observed_at, entry_price,
             observed_price, features_json, realized_return_bps,
-            realized_risk_bps, label_observation_span_seconds, raw_score, expected_return_bps,
+            realized_risk_bps, future_return_bps, label_observation_span_seconds,
+            raw_score, expected_return_bps,
             expected_risk_bps, trading_cost_bps, slippage_cost_bps,
-            net_edge_bps, composite_score, rank, status,
+            slippage_bps, tax_bps, downside_risk_penalty_bps,
+            realized_net_edge_bps, net_edge_label, false_positive_flag,
+            severe_false_positive_flag, sample_weight, net_edge_bps,
+            composite_score, rank, status,
             market_segment, sector, theme, created_at, raw_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload["source_candidate_id"],
@@ -2380,12 +2540,21 @@ def _store_training_sample(
             _json(payload["features"]),
             payload["realized_return_bps"],
             payload["realized_risk_bps"],
+            payload["future_return_bps"],
             payload.get("label_observation_span_seconds"),
             payload.get("raw_score"),
             payload.get("expected_return_bps"),
             payload.get("expected_risk_bps"),
             payload.get("trading_cost_bps"),
             payload.get("slippage_cost_bps"),
+            payload.get("slippage_bps"),
+            payload.get("tax_bps"),
+            payload.get("downside_risk_penalty_bps"),
+            payload.get("realized_net_edge_bps"),
+            payload.get("net_edge_label"),
+            payload.get("false_positive_flag"),
+            payload.get("severe_false_positive_flag"),
+            payload.get("sample_weight"),
             payload.get("net_edge_bps"),
             payload.get("composite_score"),
             payload.get("rank"),
@@ -2394,7 +2563,7 @@ def _store_training_sample(
             payload.get("sector"),
             payload.get("theme"),
             _now(),
-            _json(payload.get("raw_json") or {}),
+            _json(raw_json),
         ),
     )
     return int(cursor.rowcount or 0)
@@ -2420,7 +2589,7 @@ def _iter_training_samples_from_store(
     *,
     calibration_path: Path,
     limit: int,
-) -> Iterator[tuple[list[float], float, float]]:
+) -> Iterator[tuple[list[float], float, float, float]]:
     initialize_edge_calibration_db(calibration_path)
     with sqlite3.connect(calibration_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -2436,7 +2605,7 @@ def _iter_training_samples_from_store(
                 FROM edge_training_samples
                 WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
             )
-            SELECT features_json, realized_return_bps, realized_risk_bps
+            SELECT features_json, realized_return_bps, realized_risk_bps, sample_weight
             FROM (
                 SELECT *
                 FROM ranked
@@ -2460,7 +2629,7 @@ def _iter_training_samples_from_store(
 
 def _training_sample_from_row(
     row: sqlite3.Row,
-) -> tuple[list[float], float, float] | None:
+) -> tuple[list[float], float, float, float] | None:
     features = _parse_json(row["features_json"], None)
     if not isinstance(features, list) or len(features) != len(FEATURE_NAMES):
         return None
@@ -2475,10 +2644,16 @@ def _training_sample_from_row(
             0.0,
             800.0,
         )
+        sample_weight = _clip_bps(
+            _to_float(_row_value(row, "sample_weight")) or 1.0,
+            0.1,
+            10.0,
+        )
         return (
             [float(value) for value in features],
             realized_return_bps,
             realized_risk_bps,
+            sample_weight,
         )
     except (TypeError, ValueError):
         return None
@@ -2514,10 +2689,10 @@ def _evaluate_model(
 
 
 def _performance_split(
-    samples: list[tuple[list[float], float, float]],
+    samples: list[tuple[list[float], float, float, float]],
 ) -> tuple[
-    list[tuple[list[float], float, float]],
-    list[tuple[list[float], float, float]],
+    list[tuple[list[float], float, float, float]],
+    list[tuple[list[float], float, float, float]],
 ]:
     if len(samples) <= 1:
         return samples, []
@@ -2527,7 +2702,7 @@ def _performance_split(
 
 
 def _model_metrics_for_samples(
-    samples: list[tuple[list[float], float, float]],
+    samples: list[tuple[list[float], float, float, float]],
     *,
     return_coefficients: dict[str, float],
     risk_coefficients: dict[str, float],
@@ -2535,7 +2710,7 @@ def _model_metrics_for_samples(
     count = 0
     return_error = 0.0
     risk_error = 0.0
-    for features, realized_return_bps, realized_risk_bps in samples:
+    for features, realized_return_bps, realized_risk_bps, _sample_weight in samples:
         feature_map = dict(zip(FEATURE_NAMES, features, strict=True))
         return_error += abs(_predict(return_coefficients, feature_map) - realized_return_bps)
         risk_error += abs(_predict(risk_coefficients, feature_map) - realized_risk_bps)
@@ -2593,7 +2768,109 @@ def _top10_candidate_rows(
                 id, source_candidate_id, scan_id, label_horizon_key, symbol,
                 scan_time, observed_at, realized_return_bps, realized_risk_bps,
                 expected_return_bps, expected_risk_bps, trading_cost_bps,
-                slippage_cost_bps, net_edge_bps, raw_score, composite_score,
+                slippage_cost_bps, slippage_bps, tax_bps,
+                downside_risk_penalty_bps, realized_net_edge_bps,
+                net_edge_label, false_positive_flag, severe_false_positive_flag,
+                sample_weight, net_edge_bps, raw_score, composite_score,
+                rank, status, market_segment, sector, theme, raw_json
+            FROM ranked
+            WHERE symbol_horizon_rank = 1
+            ORDER BY observed_at DESC, id DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _net_edge_aggregate_splits(
+    *,
+    calibration_path: Path,
+) -> dict[str, Any]:
+    if not calibration_path.exists():
+        return _empty_net_edge_aggregate_splits()
+    initialize_edge_calibration_db(calibration_path)
+    return {
+        "all_observed_candidates": _performance_summary_for_status_scope(
+            calibration_path=calibration_path,
+            where_sql=OBSERVED_EDGE_SAMPLE_STATUS_SQL,
+            sample_source="all_observed_symbol_horizon_deduped_candidates",
+        ),
+        "executable_candidates_only": _performance_summary_for_status_scope(
+            calibration_path=calibration_path,
+            where_sql=ELIGIBLE_EDGE_SAMPLE_STATUS_SQL,
+            sample_source="executable_symbol_horizon_deduped_candidates",
+        ),
+        "risk_rejected_candidates": _performance_summary_for_status_scope(
+            calibration_path=calibration_path,
+            where_sql="UPPER(COALESCE(status, '')) IN ('RISK_REJECTED')",
+            sample_source="risk_rejected_symbol_horizon_deduped_candidates",
+        ),
+        "top_rank_executable_only": _performance_summary_for_status_scope(
+            calibration_path=calibration_path,
+            where_sql=(
+                f"rank IS NOT NULL AND rank <= 10 AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}"
+            ),
+            sample_source="top_rank_executable_symbol_horizon_deduped_candidates",
+            top_count=10,
+        ),
+        "calibration_only_candidates": _performance_summary_for_status_scope(
+            calibration_path=calibration_path,
+            where_sql=(
+                "UPPER(COALESCE(status, '')) IN "
+                "('READY_OBSERVE_ONLY', 'CALIBRATION_ONLY')"
+            ),
+            sample_source="calibration_only_symbol_horizon_deduped_candidates",
+        ),
+    }
+
+
+def _performance_summary_for_status_scope(
+    *,
+    calibration_path: Path,
+    where_sql: str,
+    sample_source: str,
+    top_count: int = 0,
+) -> dict[str, Any]:
+    rows = _candidate_rows_for_status_scope(
+        calibration_path=calibration_path,
+        where_sql=where_sql,
+    )
+    if not rows:
+        return _empty_net_edge_split(sample_source=sample_source, top_count=top_count)
+    return _performance_summary_from_rows(
+        rows,
+        top_count=top_count,
+        sample_source=sample_source,
+        concentration=_concentration_from_rows(rows),
+    )
+
+
+def _candidate_rows_for_status_scope(
+    *,
+    calibration_path: Path,
+    where_sql: str,
+) -> list[dict[str, Any]]:
+    with sqlite3.connect(calibration_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            WITH ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol, COALESCE(label_horizon_key, symbol || ':' || scan_time)
+                        ORDER BY observed_at ASC, id ASC
+                    ) AS symbol_horizon_rank
+                FROM edge_training_samples
+                WHERE {where_sql}
+            )
+            SELECT
+                id, source_candidate_id, scan_id, label_horizon_key, symbol,
+                scan_time, observed_at, realized_return_bps, realized_risk_bps,
+                expected_return_bps, expected_risk_bps, trading_cost_bps,
+                slippage_cost_bps, slippage_bps, tax_bps,
+                downside_risk_penalty_bps, realized_net_edge_bps,
+                net_edge_label, false_positive_flag, severe_false_positive_flag,
+                sample_weight, net_edge_bps, raw_score, composite_score,
                 rank, status, market_segment, sector, theme, raw_json
             FROM ranked
             WHERE symbol_horizon_rank = 1
@@ -2637,7 +2914,14 @@ def _scan_run_unit_from_rows(
     realized_return = avg("realized_return_bps") or 0.0
     realized_risk = avg("realized_risk_bps") or 0.0
     trading_cost = avg("trading_cost_bps") or 0.0
-    slippage_cost = avg("slippage_cost_bps") or 0.0
+    slippage_cost = avg("slippage_bps") or avg("slippage_cost_bps") or 0.0
+    tax = avg("tax_bps") or 0.0
+    downside_penalty = avg("downside_risk_penalty_bps")
+    if downside_penalty is None:
+        downside_penalty = realized_risk * REALIZED_RISK_WEIGHT
+    realized_net = avg("realized_net_edge_bps")
+    if realized_net is None:
+        realized_net = realized_return - trading_cost - slippage_cost - tax - downside_penalty
     net_edge = avg("net_edge_bps")
     return {
         "scan_id": scan_id,
@@ -2652,15 +2936,13 @@ def _scan_run_unit_from_rows(
         "expected_risk_bps": avg("expected_risk_bps"),
         "trading_cost_bps": trading_cost,
         "slippage_cost_bps": slippage_cost,
+        "slippage_bps": slippage_cost,
+        "tax_bps": tax,
+        "downside_risk_penalty_bps": downside_penalty,
         "net_edge_bps": net_edge,
         "raw_score": avg("raw_score"),
         "composite_score": avg("composite_score"),
-        "realized_net_edge_bps": (
-            realized_return
-            - realized_risk * REALIZED_RISK_WEIGHT
-            - trading_cost
-            - slippage_cost
-        ),
+        "realized_net_edge_bps": realized_net,
     }
 
 
@@ -2697,6 +2979,30 @@ def _performance_summary_from_rows(
         _realized_net_edge_from_row(row)
         for row in rows
     ]
+    false_positive_rows: list[tuple[dict[str, Any], float]] = []
+    severe_false_positive_rows: list[tuple[dict[str, Any], float]] = []
+    for row, realized_net in zip(rows, realized_net_values, strict=True):
+        predicted_edge = _to_float(row.get("net_edge_bps"))
+        false_positive = bool(_to_int(row.get("false_positive_flag")))
+        severe_false_positive = bool(_to_int(row.get("severe_false_positive_flag")))
+        if (
+            not false_positive
+            and predicted_edge is not None
+            and predicted_edge >= 150.0
+            and realized_net <= -300.0
+        ):
+            false_positive = True
+        if (
+            not severe_false_positive
+            and predicted_edge is not None
+            and predicted_edge >= 250.0
+            and realized_net <= -500.0
+        ):
+            severe_false_positive = True
+        if false_positive:
+            false_positive_rows.append((row, realized_net))
+        if severe_false_positive:
+            severe_false_positive_rows.append((row, realized_net))
     return_errors = [
         (_to_float(row.get("realized_return_bps")) or 0.0)
         - _to_float(row.get("expected_return_bps"))
@@ -2729,6 +3035,12 @@ def _performance_summary_from_rows(
     avg_loss = sum(losses) / len(losses) if losses else 0.0
     expectancy = win_rate * avg_win - loss_rate * avg_loss
     total_realized_net = sum(realized_net_values)
+    false_positive_count = len(false_positive_rows)
+    severe_false_positive_count = len(severe_false_positive_rows)
+    false_positive_losses = [
+        abs(min(0.0, realized_net)) for _row, realized_net in false_positive_rows
+    ]
+    false_positive_impact = sum(realized_net for _row, realized_net in false_positive_rows)
     summary = {
         "status": "ready",
         "sample_count": sample_count,
@@ -2789,6 +3101,15 @@ def _performance_summary_from_rows(
         "reward_risk_ratio": round(avg_win / avg_loss, 4) if avg_loss else None,
         "expectancy_bps": round(expectancy, 4),
         "expectancy_formula": "E = (win_rate * avg_win_bps) - (loss_rate * avg_loss_bps)",
+        "false_positive_count": false_positive_count,
+        "false_positive_rate": round(false_positive_count / sample_count, 6),
+        "severe_false_positive_count": severe_false_positive_count,
+        "avg_false_positive_loss_bps": (
+            round(sum(false_positive_losses) / len(false_positive_losses), 4)
+            if false_positive_losses
+            else None
+        ),
+        "false_positive_net_edge_impact_bps": round(false_positive_impact, 4),
         "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
         "composite_score_formula": COMPOSITE_SCORE_FORMULA,
@@ -2799,11 +3120,18 @@ def _performance_summary_from_rows(
 
 
 def _realized_net_edge_from_row(row: dict[str, Any]) -> float:
+    stored = _to_float(row.get("realized_net_edge_bps"))
+    if stored is not None:
+        return stored
+    downside_penalty = _to_float(row.get("downside_risk_penalty_bps"))
+    if downside_penalty is None:
+        downside_penalty = (_to_float(row.get("realized_risk_bps")) or 0.0) * REALIZED_RISK_WEIGHT
     return (
-        (_to_float(row.get("realized_return_bps")) or 0.0)
-        - ((_to_float(row.get("realized_risk_bps")) or 0.0) * REALIZED_RISK_WEIGHT)
+        (_to_float(row.get("future_return_bps") or row.get("realized_return_bps")) or 0.0)
         - (_to_float(row.get("trading_cost_bps")) or 0.0)
-        - (_to_float(row.get("slippage_cost_bps")) or 0.0)
+        - (_to_float(row.get("slippage_bps") or row.get("slippage_cost_bps")) or 0.0)
+        - (_to_float(row.get("tax_bps")) or 0.0)
+        - downside_penalty
     )
 
 
@@ -2875,6 +3203,42 @@ def _empty_unit_performance() -> dict[str, Any]:
     }
 
 
+def _empty_net_edge_split(*, sample_source: str, top_count: int = 0) -> dict[str, Any]:
+    empty = _empty_top10_performance()
+    return {
+        **empty,
+        "top_count": top_count,
+        "sample_source": sample_source,
+        "concentration": {
+            "sample_count": 0,
+            "max_symbol_share": None,
+            "max_sector_share": None,
+            "max_theme_share": None,
+        },
+    }
+
+
+def _empty_net_edge_aggregate_splits() -> dict[str, Any]:
+    return {
+        "all_observed_candidates": _empty_net_edge_split(
+            sample_source="all_observed_symbol_horizon_deduped_candidates"
+        ),
+        "executable_candidates_only": _empty_net_edge_split(
+            sample_source="executable_symbol_horizon_deduped_candidates"
+        ),
+        "risk_rejected_candidates": _empty_net_edge_split(
+            sample_source="risk_rejected_symbol_horizon_deduped_candidates"
+        ),
+        "top_rank_executable_only": _empty_net_edge_split(
+            sample_source="top_rank_executable_symbol_horizon_deduped_candidates",
+            top_count=10,
+        ),
+        "calibration_only_candidates": _empty_net_edge_split(
+            sample_source="calibration_only_symbol_horizon_deduped_candidates"
+        ),
+    }
+
+
 def _candidate_label_performance_from_store(path: Path) -> dict[str, Any]:
     if not path.exists():
         return _empty_win_rate(CANDIDATE_LABEL_UNIT)
@@ -2897,6 +3261,9 @@ def _candidate_label_performance_from_store(path: Path) -> dict[str, Any]:
                 id, scan_id, label_horizon_key, symbol, scan_time, observed_at,
                 realized_return_bps, realized_risk_bps, expected_return_bps,
                 expected_risk_bps, trading_cost_bps, slippage_cost_bps,
+                slippage_bps, tax_bps, downside_risk_penalty_bps,
+                realized_net_edge_bps, net_edge_label, false_positive_flag,
+                severe_false_positive_flag, sample_weight,
                 net_edge_bps, raw_score, composite_score, market_segment,
                 sector, theme, raw_json
             FROM ranked
@@ -2921,6 +3288,15 @@ def _candidate_label_performance_from_store(path: Path) -> dict[str, Any]:
         "win_rate": performance["win_rate"],
         "avg_return_bps": performance["avg_return_bps"],
         "avg_realized_net_edge_bps": performance["avg_realized_net_edge_bps"],
+        "mae_net_edge_error_bps": performance.get("mae_net_edge_error_bps"),
+        "false_positive_count": performance.get("false_positive_count"),
+        "false_positive_rate": performance.get("false_positive_rate"),
+        "severe_false_positive_count": performance.get(
+            "severe_false_positive_count"
+        ),
+        "false_positive_net_edge_impact_bps": performance.get(
+            "false_positive_net_edge_impact_bps"
+        ),
         "sample_source": performance["sample_source"],
         "concentration": performance.get("concentration"),
     }
@@ -3100,6 +3476,11 @@ def _empty_top10_performance(limit: int | None = None) -> dict[str, Any]:
         "avg_loss_bps": None,
         "reward_risk_ratio": None,
         "expectancy_bps": None,
+        "false_positive_count": 0,
+        "false_positive_rate": 0.0,
+        "severe_false_positive_count": 0,
+        "avg_false_positive_loss_bps": None,
+        "false_positive_net_edge_impact_bps": 0.0,
         "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
         "concentration": {
@@ -3227,6 +3608,11 @@ def _empty_sample_summary() -> dict[str, Any]:
         "net_edge_win_count": 0,
         "net_edge_loss_count": 0,
         "net_edge_win_rate": None,
+        "false_positive_count": 0,
+        "false_positive_rate": 0.0,
+        "severe_false_positive_count": 0,
+        "avg_false_positive_loss_bps": None,
+        "false_positive_net_edge_impact_bps": 0.0,
         "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
     }
@@ -3241,6 +3627,7 @@ def _sample_summary_from_row(row: dict[str, Any]) -> dict[str, Any]:
     loss_count = int(row.get("loss_count") or 0)
     net_edge_win_count = int(row.get("net_edge_win_count") or 0)
     net_edge_loss_count = int(row.get("net_edge_loss_count") or 0)
+    false_positive_count = int(row.get("false_positive_count") or 0)
     if sample_count <= 0:
         return _empty_sample_summary()
     return {
@@ -3280,6 +3667,18 @@ def _sample_summary_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "net_edge_win_count": net_edge_win_count,
         "net_edge_loss_count": net_edge_loss_count,
         "net_edge_win_rate": round(net_edge_win_count / sample_count, 4),
+        "false_positive_count": false_positive_count,
+        "false_positive_rate": round(false_positive_count / sample_count, 6),
+        "severe_false_positive_count": int(
+            row.get("severe_false_positive_count") or 0
+        ),
+        "avg_false_positive_loss_bps": _round_optional(
+            row.get("avg_false_positive_loss_bps")
+        ),
+        "false_positive_net_edge_impact_bps": _round_optional(
+            row.get("false_positive_net_edge_impact_bps")
+        )
+        or 0.0,
         "net_edge_formula": "net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost)",
         "realized_net_edge_formula": REALIZED_NET_EDGE_FORMULA,
         "composite_score_formula": COMPOSITE_SCORE_FORMULA,
@@ -3296,21 +3695,27 @@ def _sample_row(row: sqlite3.Row) -> dict[str, Any]:
         "expected_risk_bps",
         "trading_cost_bps",
         "slippage_cost_bps",
+        "slippage_bps",
+        "tax_bps",
+        "downside_risk_penalty_bps",
+        "future_return_bps",
+        "realized_net_edge_bps",
+        "sample_weight",
         "net_edge_bps",
         "composite_score",
     ):
         item[key] = _round_optional(item.get(key))
-    item["realized_net_edge_bps"] = _round_optional(
-        (_to_float(item.get("realized_return_bps")) or 0.0)
-        - ((_to_float(item.get("realized_risk_bps")) or 0.0) * REALIZED_RISK_WEIGHT)
-        - (_to_float(item.get("trading_cost_bps")) or 0.0)
-        - (_to_float(item.get("slippage_cost_bps")) or 0.0)
-    )
+    item["realized_net_edge_bps"] = _round_optional(_realized_net_edge_from_row(item))
     item["net_edge_error_bps"] = _round_optional(
         (_to_float(item.get("realized_net_edge_bps")) or 0.0)
         - (_to_float(item.get("net_edge_bps")) or 0.0)
         if item.get("net_edge_bps") is not None
         else None
+    )
+    item["net_edge_label"] = _to_int(item.get("net_edge_label"))
+    item["false_positive_flag"] = bool(_to_int(item.get("false_positive_flag")))
+    item["severe_false_positive_flag"] = bool(
+        _to_int(item.get("severe_false_positive_flag"))
     )
     return item
 
@@ -3345,11 +3750,14 @@ def _accumulate(
     vector: list[float],
     features: list[float],
     target: float,
+    *,
+    weight: float = 1.0,
 ) -> None:
+    weight = max(0.1, min(10.0, float(weight or 1.0)))
     for row_index, row_value in enumerate(features):
-        vector[row_index] += row_value * target
+        vector[row_index] += row_value * target * weight
         for col_index, col_value in enumerate(features):
-            matrix[row_index][col_index] += row_value * col_value
+            matrix[row_index][col_index] += row_value * col_value * weight
 
 
 def _ridge_matrix(dimension: int, ridge_lambda: float) -> list[list[float]]:
@@ -3917,6 +4325,15 @@ def _gate_from_metrics(
     top10_win_rate = _to_float(top10_performance.get("win_rate"))
     top10_net_edge_mae = _to_float(top10_performance.get("mae_net_edge_error_bps"))
     top10_profit_factor = estimate_profit_factor_from_top10(top10_performance)
+    top10_metric_samples = int(
+        top10_performance.get("metric_sample_count")
+        or top10_performance.get("sample_count")
+        or 0
+    )
+    false_positive_rate = _to_float(top10_performance.get("false_positive_rate"))
+    severe_false_positive_count = int(
+        top10_performance.get("severe_false_positive_count") or 0
+    )
 
     if top10_avg_return is None or top10_avg_return < min_top10_return:
         failures.append(
@@ -3946,6 +4363,16 @@ def _gate_from_metrics(
             f"mae_net_edge_error_bps {top10_net_edge_mae} >= {max_net_edge_mae}"
         )
 
+    if (
+        false_positive_rate is not None
+        and false_positive_rate >= 0.25
+        and top10_metric_samples >= 20
+    ):
+        failures.append("false_positive_rate too high")
+
+    if severe_false_positive_count >= 2 and top10_metric_samples >= 20:
+        failures.append("severe false positives detected")
+
     concentration = top10_performance.get("concentration") or {}
     if isinstance(concentration, dict):
         concentration_sample_count = int(
@@ -3971,6 +4398,11 @@ def _gate_from_metrics(
                 )
 
     recent_ic = _to_float((ic_metrics or {}).get("ic"))
+    broker_paper_order_size_multiplier = 0.1 if recent_ic is not None and recent_ic < 0 else 1.0
+    broker_paper_new_entries_allowed = not (
+        recent_ic is not None and recent_ic < -0.1
+    )
+    live_trading_allowed = not (recent_ic is not None and recent_ic < 0)
 
     if recent_ic is None or recent_ic < min_recent_ic:
         failures.append(f"recent_ic {recent_ic} < {min_recent_ic}")
@@ -3980,7 +4412,7 @@ def _gate_from_metrics(
         cost_coverages: list[float] = []
 
         for candidate in candidates:
-            if not _is_edge_training_sample_status_allowed(
+            if not _is_executable_edge_sample_status(
                 candidate.get("status") or candidate.get("decision")
             ):
                 continue
@@ -4038,6 +4470,9 @@ def _gate_from_metrics(
         },
         "fill_adjustment": fill_adjustment,
         "ic_metrics": ic_metrics,
+        "broker_paper_order_size_multiplier": broker_paper_order_size_multiplier,
+        "broker_paper_new_entries_allowed": broker_paper_new_entries_allowed,
+        "live_trading_allowed": live_trading_allowed,
         "best_fill_adjusted_edge_bps": (
             round(best_fill_adjusted_edge, 4)
             if best_fill_adjusted_edge is not None
@@ -4066,6 +4501,9 @@ def _gate_from_metrics(
             "max_symbol_share": max_symbol_share,
             "max_sector_share": max_sector_share,
             "max_theme_share": max_theme_share,
+            "max_false_positive_rate": 0.25,
+            "false_positive_min_samples": 20,
+            "max_severe_false_positive_count": 1,
         },
     }
 
@@ -4246,11 +4684,36 @@ def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
         "expected_risk_bps",
         "trading_cost_bps",
         "slippage_cost_bps",
+        "slippage_bps",
+        "tax_bps",
+        "downside_risk_penalty_bps",
+        "future_return_bps",
+        "realized_net_edge_bps",
         "net_edge_bps",
         "composite_score",
     ):
         _ensure_column(conn, "edge_training_samples", column, "REAL")
+    _ensure_column(conn, "edge_training_samples", "net_edge_label", "INTEGER")
+    _ensure_column(
+        conn,
+        "edge_training_samples",
+        "false_positive_flag",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _ensure_column(
+        conn,
+        "edge_training_samples",
+        "severe_false_positive_flag",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _ensure_column(
+        conn,
+        "edge_training_samples",
+        "sample_weight",
+        "REAL NOT NULL DEFAULT 1.0",
+    )
     _backfill_training_sample_metrics(conn)
+    _backfill_training_sample_net_edge_labels(conn)
     _backfill_training_sample_label_spans(conn)
     _backfill_training_sample_identity(conn)
 
@@ -4324,6 +4787,71 @@ def _backfill_training_sample_metrics(conn: sqlite3.Connection) -> None:
                 slippage_cost_bps = COALESCE(slippage_cost_bps, ?),
                 net_edge_bps = COALESCE(net_edge_bps, ?),
                 composite_score = COALESCE(composite_score, ?)
+            WHERE id = ?
+            """,
+            updates,
+        )
+
+
+def _backfill_training_sample_net_edge_labels(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
+    last_id = 0
+    while True:
+        rows = conn.execute(
+            """
+            SELECT
+                id, realized_return_bps, realized_risk_bps, trading_cost_bps,
+                slippage_cost_bps, slippage_bps, tax_bps,
+                downside_risk_penalty_bps, realized_net_edge_bps,
+                future_return_bps, net_edge_bps, sample_weight
+            FROM edge_training_samples
+            WHERE id > ?
+              AND (
+                  future_return_bps IS NULL
+                  OR slippage_bps IS NULL
+                  OR tax_bps IS NULL
+                  OR downside_risk_penalty_bps IS NULL
+                  OR realized_net_edge_bps IS NULL
+                  OR net_edge_label IS NULL
+                  OR sample_weight IS NULL
+              )
+            ORDER BY id ASC
+            LIMIT 200
+            """,
+            (last_id,),
+        ).fetchall()
+        if not rows:
+            break
+        last_id = int(rows[-1]["id"])
+        updates = []
+        for row in rows:
+            components = _net_edge_label_components(dict(row))
+            updates.append(
+                (
+                    components["future_return_bps"],
+                    components["slippage_bps"],
+                    components["tax_bps"],
+                    components["downside_risk_penalty_bps"],
+                    components["realized_net_edge_bps"],
+                    components["net_edge_label"],
+                    components["false_positive_flag"],
+                    components["severe_false_positive_flag"],
+                    components["sample_weight"],
+                    row["id"],
+                )
+            )
+        conn.executemany(
+            """
+            UPDATE edge_training_samples
+            SET future_return_bps = COALESCE(future_return_bps, ?),
+                slippage_bps = COALESCE(slippage_bps, ?),
+                tax_bps = COALESCE(tax_bps, ?),
+                downside_risk_penalty_bps = COALESCE(downside_risk_penalty_bps, ?),
+                realized_net_edge_bps = COALESCE(realized_net_edge_bps, ?),
+                net_edge_label = COALESCE(net_edge_label, ?),
+                false_positive_flag = ?,
+                severe_false_positive_flag = ?,
+                sample_weight = COALESCE(sample_weight, ?)
             WHERE id = ?
             """,
             updates,
