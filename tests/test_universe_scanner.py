@@ -809,7 +809,7 @@ def test_paper_bootstrap_soft_pass_collecting_gate_only(monkeypatch):
     collecting_gate = {
         "status": "blocked",
         "approved": False,
-        "message": "Calibration performance gate blocked entries: sample_count 0/600",
+        "message": "Calibration performance gate blocked entries: sample_count 0/100",
     }
     mature_blocked_gate = {
         "status": "blocked",
@@ -1142,7 +1142,7 @@ def test_latest_universe_scan_broker_paper_overlay_marks_stale_psk_ready(
         "status": "SKIPPED",
         "reason": (
             "composite momentum; Calibration performance gate blocked entries: "
-            "sample_count 281/600"
+            "sample_count 281/100"
         ),
         "current_price": 20_000,
         "change_rate": 3.0,

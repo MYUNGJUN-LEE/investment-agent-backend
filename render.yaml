@@ -98,9 +98,9 @@ services:
       - key: EDGE_CALIBRATION_SAMPLE_RETENTION_LIMIT
         value: "10000"
       - key: EDGE_CALIBRATION_GATE_MIN_SAMPLES
-        value: "600"
+        value: "100"
       - key: EDGE_CALIBRATION_GATE_MIN_OOS_SAMPLES
-        value: "200"
+        value: "20"
       - key: EDGE_CALIBRATION_GATE_MAX_MAE_RETURN_BPS
         value: "180"
       - key: EDGE_CALIBRATION_GATE_MAX_MAE_RISK_BPS

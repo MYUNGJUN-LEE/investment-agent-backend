@@ -986,7 +986,7 @@ def test_broker_paper_claimed_candidate_without_submit_is_not_submitted(
                 112.0,
                 75.0,
                 1,
-                "sample_count 0/600",
+                "sample_count 0/100",
                 "CLAIMED",
                 "BUY",
                 10000.0,
