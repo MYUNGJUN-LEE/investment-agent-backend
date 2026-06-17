@@ -4229,6 +4229,17 @@ def _apply_broker_paper_calibration_policy(
     }
 
 
+def _broker_paper_top10_bootstrap_gate_enabled(
+    *,
+    execution_mode: str | None,
+) -> bool:
+    return (
+        str(execution_mode or "").lower() == "broker_paper"
+        and bool(settings.kis_is_paper)
+        and bool(settings.broker_paper_bootstrap_enabled)
+    )
+
+
 def _gate_from_metrics(
     *,
     sample_count: int,
@@ -4242,6 +4253,9 @@ def _gate_from_metrics(
     execution_mode: str | None = None,
 ) -> dict[str, Any]:
     failures: list[str] = []
+    top10_bootstrap_gate = _broker_paper_top10_bootstrap_gate_enabled(
+        execution_mode=execution_mode,
+    )
 
     min_samples = int(settings.edge_calibration_gate_min_samples or 1000)
     min_oos = int(settings.edge_calibration_gate_min_oos_samples or 200)
@@ -4308,23 +4322,34 @@ def _gate_from_metrics(
     best_fill_adjusted_edge: float | None = None
     best_cost_coverage: float | None = None
 
-    if sample_count < min_samples:
+    if not top10_bootstrap_gate and sample_count < min_samples:
         failures.append(f"sample_count {sample_count}/{min_samples}")
 
-    if oos_sample_count < min_oos:
+    if not top10_bootstrap_gate and oos_sample_count < min_oos:
         failures.append(f"oos_sample_count {oos_sample_count}/{min_oos}")
 
-    if mae_return_bps is None or mae_return_bps > max_return_mae:
+    if not top10_bootstrap_gate and (
+        mae_return_bps is None or mae_return_bps > max_return_mae
+    ):
         failures.append(f"mae_return_bps {mae_return_bps} > {max_return_mae}")
 
-    if mae_risk_bps is None or mae_risk_bps > max_risk_mae:
+    if not top10_bootstrap_gate and (
+        mae_risk_bps is None or mae_risk_bps > max_risk_mae
+    ):
         failures.append(f"mae_risk_bps {mae_risk_bps} > {max_risk_mae}")
 
     top10_avg_return = _to_float(top10_performance.get("avg_return_bps"))
     top10_expectancy = _to_float(top10_performance.get("expectancy_bps"))
     top10_win_rate = _to_float(top10_performance.get("win_rate"))
+    top10_realized_net_edge = _to_float(
+        top10_performance.get("avg_realized_net_edge_bps")
+    )
+    top10_predicted_edge = _to_float(
+        top10_performance.get("avg_predicted_net_edge_bps")
+    )
     top10_net_edge_mae = _to_float(top10_performance.get("mae_net_edge_error_bps"))
     top10_profit_factor = estimate_profit_factor_from_top10(top10_performance)
+    top10_sample_count = int(top10_performance.get("sample_count") or 0)
     top10_metric_samples = int(
         top10_performance.get("metric_sample_count")
         or top10_performance.get("sample_count")
@@ -4340,6 +4365,13 @@ def _gate_from_metrics(
             f"top10_avg_return_bps {top10_avg_return} < {min_top10_return}"
         )
 
+    if top10_bootstrap_gate and (
+        top10_realized_net_edge is None or top10_realized_net_edge <= 0
+    ):
+        failures.append(
+            f"top10_realized_net_edge_bps {top10_realized_net_edge} <= 0"
+        )
+
     if top10_expectancy is None or top10_expectancy <= min_top10_expectancy:
         failures.append(
             f"top10_expectancy_bps {top10_expectancy} <= {min_top10_expectancy}"
@@ -4350,13 +4382,21 @@ def _gate_from_metrics(
             f"top10_win_rate {top10_win_rate} < {target_top10_win_rate}"
         )
 
-    if top10_profit_factor is None or top10_profit_factor < min_profit_factor:
+    if top10_bootstrap_gate:
+        if top10_sample_count <= 0:
+            failures.append("top10_sample_count 0")
+        if top10_predicted_edge is None or top10_predicted_edge <= 0:
+            failures.append(
+                f"top10_predicted_edge_bps {top10_predicted_edge} <= 0"
+            )
+    elif top10_profit_factor is None or top10_profit_factor < min_profit_factor:
         failures.append(
             f"top10_profit_factor {top10_profit_factor} < {min_profit_factor}"
         )
 
     if (
-        "mae_net_edge_error_bps" in top10_performance
+        not top10_bootstrap_gate
+        and "mae_net_edge_error_bps" in top10_performance
         and (top10_net_edge_mae is None or top10_net_edge_mae >= max_net_edge_mae)
     ):
         failures.append(
@@ -4364,17 +4404,22 @@ def _gate_from_metrics(
         )
 
     if (
-        false_positive_rate is not None
+        not top10_bootstrap_gate
+        and false_positive_rate is not None
         and false_positive_rate >= 0.25
         and top10_metric_samples >= 20
     ):
         failures.append("false_positive_rate too high")
 
-    if severe_false_positive_count >= 2 and top10_metric_samples >= 20:
+    if (
+        not top10_bootstrap_gate
+        and severe_false_positive_count >= 2
+        and top10_metric_samples >= 20
+    ):
         failures.append("severe false positives detected")
 
     concentration = top10_performance.get("concentration") or {}
-    if isinstance(concentration, dict):
+    if not top10_bootstrap_gate and isinstance(concentration, dict):
         concentration_sample_count = int(
             concentration.get("sample_count")
             or top10_performance.get("candidate_sample_count")
@@ -4404,10 +4449,10 @@ def _gate_from_metrics(
     )
     live_trading_allowed = not (recent_ic is not None and recent_ic < 0)
 
-    if recent_ic is None or recent_ic < min_recent_ic:
+    if not top10_bootstrap_gate and (recent_ic is None or recent_ic < min_recent_ic):
         failures.append(f"recent_ic {recent_ic} < {min_recent_ic}")
 
-    if candidates:
+    if candidates and not top10_bootstrap_gate:
         candidate_edges: list[float] = []
         cost_coverages: list[float] = []
 
@@ -4456,7 +4501,38 @@ def _gate_from_metrics(
             else "Calibration performance gate blocked entries: " + "; ".join(failures)
         ),
         "sample_count": sample_count,
+        "all_sample_count": sample_count,
         "oos_sample_count": oos_sample_count,
+        "gate_metric_source": (
+            "top10_performance"
+            if top10_bootstrap_gate
+            else "candidate_label_all_samples"
+        ),
+        "top10_sample_count": top10_sample_count,
+        "top10_avg_return_bps": _round_optional(top10_avg_return),
+        "top10_realized_net_edge_bps": _round_optional(top10_realized_net_edge),
+        "top10_win_rate": _round_optional(top10_win_rate, digits=6),
+        "top10_expectancy_bps": _round_optional(top10_expectancy),
+        "top10_predicted_edge_bps": _round_optional(top10_predicted_edge),
+        "gate_avg_return_bps": _round_optional(top10_avg_return)
+        if top10_bootstrap_gate
+        else None,
+        "gate_win_rate": _round_optional(top10_win_rate, digits=6)
+        if top10_bootstrap_gate
+        else None,
+        "gate_realized_net_edge_bps": _round_optional(top10_realized_net_edge)
+        if top10_bootstrap_gate
+        else None,
+        "gate_expectancy_bps": _round_optional(top10_expectancy)
+        if top10_bootstrap_gate
+        else None,
+        "gate_predicted_edge_bps": _round_optional(top10_predicted_edge)
+        if top10_bootstrap_gate
+        else None,
+        "all_sample_mae_return_bps": mae_return_bps,
+        "all_sample_mae_risk_bps": mae_risk_bps,
+        "all_sample_oos_sample_count": oos_sample_count,
+        "ignored_all_sample_gate_metrics": bool(top10_bootstrap_gate),
         "mae_return_bps": mae_return_bps,
         "mae_risk_bps": mae_risk_bps,
         "top10_performance": {

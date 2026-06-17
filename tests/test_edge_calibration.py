@@ -978,6 +978,68 @@ def test_broker_paper_bootstrap_makes_candidate_label_gate_observe_only(
     assert "broker_paper bootstrap observe-only" in gate["message"]
 
 
+def test_broker_paper_bootstrap_gate_uses_top10_metrics_over_all_sample_failures(
+    monkeypatch,
+):
+    monkeypatch.setattr(edge_calibration.settings, "kis_is_paper", True)
+    monkeypatch.setattr(edge_calibration.settings, "broker_paper_bootstrap_enabled", True)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_samples", 600)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_oos_samples", 200)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_return_bps", 180)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_max_mae_risk_bps", 180)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_avg_return_bps", 2)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_win_rate", 0.50)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_top10_expectancy_bps", 0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_gate_min_fill_adjusted_edge_bps", 60)
+
+    gate = edge_calibration._gate_from_metrics(
+        sample_count=26,
+        oos_sample_count=0,
+        mae_return_bps=999,
+        mae_risk_bps=999,
+        top10_performance={
+            "status": "ready",
+            "sample_count": 9,
+            "metric_sample_count": 9,
+            "top_count": 10,
+            "avg_return_bps": 35.0,
+            "avg_realized_net_edge_bps": 18.0,
+            "avg_predicted_net_edge_bps": 120.0,
+            "win_rate": 0.667,
+            "loss_rate": 0.333,
+            "avg_win_bps": 80.0,
+            "avg_loss_bps": 20.0,
+            "expectancy_bps": 46.7,
+            "mae_net_edge_error_bps": 999,
+        },
+        fill_adjustment={"multiplier": 1.0},
+        ic_metrics={"ic": -0.2},
+        candidates=[
+            {
+                "symbol": "005930",
+                "status": "READY",
+                "net_edge": 10,
+                "expected_return": 20,
+                "trading_cost": 49.4,
+                "slippage_cost": 10,
+                "liquidity_drag_bps": 0,
+            }
+        ],
+        execution_mode="broker_paper",
+    )
+
+    assert gate["approved"] is True
+    assert gate["gate_metric_source"] == "top10_performance"
+    assert gate["all_sample_count"] == 26
+    assert gate["top10_sample_count"] == 9
+    assert gate["gate_avg_return_bps"] == 35.0
+    assert gate["gate_win_rate"] == 0.667
+    assert gate["gate_realized_net_edge_bps"] == 18.0
+    assert gate["ignored_all_sample_gate_metrics"] is True
+    assert "mae_return_bps" not in gate["message"]
+    assert "recent_ic" not in gate["message"]
+
+
 def test_broker_paper_bootstrap_disabled_keeps_candidate_label_hard_blocking(
     tmp_path,
     monkeypatch,

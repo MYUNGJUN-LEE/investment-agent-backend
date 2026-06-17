@@ -367,6 +367,58 @@ def test_broker_paper_status_separates_candidate_labels_from_broker_fills(
     )
 
 
+def test_broker_paper_status_exposes_top10_gate_metric_source(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    edge_path = settings.storage_path(settings.edge_calibration_db_path)
+    edge_path.parent.mkdir(parents=True, exist_ok=True)
+    edge_path.touch()
+
+    monkeypatch.setattr(
+        execution_status.edge_calibration,
+        "edge_entry_gate",
+        lambda **kwargs: {
+            "status": "approved",
+            "approved": True,
+            "sample_count": 26,
+            "all_sample_count": 26,
+            "top10_sample_count": 9,
+            "gate_metric_source": "top10_performance",
+            "top10_avg_return_bps": 35.0,
+            "top10_realized_net_edge_bps": 18.0,
+            "top10_win_rate": 0.667,
+            "top10_expectancy_bps": 46.7,
+            "top10_predicted_edge_bps": 120.0,
+            "gate_avg_return_bps": 35.0,
+            "gate_win_rate": 0.667,
+            "gate_realized_net_edge_bps": 18.0,
+            "ignored_all_sample_gate_metrics": True,
+        },
+    )
+    monkeypatch.setattr(
+        execution_status.edge_calibration,
+        "get_edge_training_sample_summary",
+        lambda **kwargs: {
+            "summary": {"sample_count": 26},
+            "unit_performance": {},
+        },
+    )
+
+    status = execution_status.trading_status_snapshot(execution_mode="broker_paper")
+
+    assert status["gate_metric_source"] == "top10_performance"
+    assert status["all_sample_count"] == 26
+    assert status["top10_sample_count"] == 9
+    assert status["gate_avg_return_bps"] == 35.0
+    assert status["gate_win_rate"] == 0.667
+    assert status["gate_realized_net_edge_bps"] == 18.0
+    assert status["top10_predicted_edge_bps"] == 120.0
+    assert status["dashboard_edge_sample_count"] == 26
+    assert status["ignored_all_sample_gate_metrics"] is True
+
+
 def test_broker_paper_status_blocks_submit_during_kis_token_backoff(
     tmp_path,
     monkeypatch,
