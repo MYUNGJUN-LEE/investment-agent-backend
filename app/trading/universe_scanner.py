@@ -517,6 +517,11 @@ def _apply_runtime_execution_overlay(
     hurdle_rate = _worker_hurdle_rate_bps(mode)
     overlaid: list[dict[str, Any]] = []
     for index, candidate in enumerate(final_candidates, start=1):
+        candidate = _broker_paper_promote_exclude_to_watch_if_eligible(
+            candidate,
+            hurdle_rate=hurdle_rate,
+            execution_mode=mode,
+        )
         rank = _to_int(candidate.get("rank")) or index
         status, reason = _execution_status_for_candidate(
             candidate,
@@ -526,6 +531,14 @@ def _apply_runtime_execution_overlay(
             entry_gate=entry_gate,
             execution_mode=mode,
         )
+        relaxed_check = _broker_paper_bootstrap_relaxed_check(
+            candidate,
+            entry_gate=entry_gate,
+            execution_mode=mode,
+        )
+        relaxed = bool(relaxed_check.get("eligible")) and (
+            "broker_paper bootstrap relaxed pass" in reason
+        )
         overlaid.append(
             {
                 **candidate,
@@ -533,6 +546,17 @@ def _apply_runtime_execution_overlay(
                 "status": status,
                 "candidate_state": _candidate_state_for_status(status, reason),
                 "reason": reason,
+                "broker_paper_bootstrap_relaxed": relaxed,
+                "broker_paper_bootstrap_reason": (
+                    str(relaxed_check.get("reason") or "") if relaxed else None
+                ),
+                "broker_paper_bootstrap_thresholds": relaxed_check.get("thresholds"),
+                "broker_paper_bootstrap_order_size_multiplier": relaxed_check.get(
+                    "order_size_multiplier"
+                ),
+                "broker_paper_bootstrap_max_order_amount_krw": relaxed_check.get(
+                    "max_order_amount_krw"
+                ),
                 "broker_paper_bootstrap_allowed": bool(
                     entry_gate.get("broker_paper_bootstrap_allowed")
                 ),
@@ -560,6 +584,10 @@ def _apply_runtime_execution_overlay(
             }
         )
 
+    overlaid = _apply_broker_paper_bootstrap_symbol_limit(
+        overlaid,
+        execution_mode=mode,
+    )
     ready_candidates = [item for item in overlaid if item.get("status") == "READY"]
     return {
         **scan,
@@ -2712,6 +2740,11 @@ def _rank_execution_candidates(
             hurdle_rate=hurdle_rate,
             execution_mode=execution_mode,
         )
+        candidate = _broker_paper_promote_exclude_to_watch_if_eligible(
+            candidate,
+            hurdle_rate=hurdle_rate,
+            execution_mode=execution_mode,
+        )
         scored.append(candidate)
 
     entry_gate = _edge_entry_gate_for_mode(scored, execution_mode=execution_mode)
@@ -2736,6 +2769,14 @@ def _rank_execution_candidates(
             entry_gate=entry_gate,
             execution_mode=execution_mode,
         )
+        relaxed_check = _broker_paper_bootstrap_relaxed_check(
+            item,
+            entry_gate=entry_gate,
+            execution_mode=execution_mode,
+        )
+        relaxed = bool(relaxed_check.get("eligible")) and (
+            "broker_paper bootstrap relaxed pass" in reason
+        )
         prepared.append(
             {
                 **item,
@@ -2748,6 +2789,17 @@ def _rank_execution_candidates(
                 "entry_gate": entry_gate,
                 "paper_bootstrap_soft_pass": (
                     "paper bootstrap soft-pass for collecting calibration gate" in reason
+                ),
+                "broker_paper_bootstrap_relaxed": relaxed,
+                "broker_paper_bootstrap_reason": (
+                    str(relaxed_check.get("reason") or "") if relaxed else None
+                ),
+                "broker_paper_bootstrap_thresholds": relaxed_check.get("thresholds"),
+                "broker_paper_bootstrap_order_size_multiplier": relaxed_check.get(
+                    "order_size_multiplier"
+                ),
+                "broker_paper_bootstrap_max_order_amount_krw": relaxed_check.get(
+                    "max_order_amount_krw"
                 ),
                 "broker_paper_bootstrap_allowed": bool(
                     entry_gate.get("broker_paper_bootstrap_allowed")
@@ -2777,7 +2829,10 @@ def _rank_execution_candidates(
                 "calibration_gate_mode": entry_gate.get("calibration_gate_mode"),
             }
         )
-    return prepared
+    return _apply_broker_paper_bootstrap_symbol_limit(
+        prepared,
+        execution_mode=execution_mode,
+    )
 
 
 def _apply_market_safety_to_candidate(
@@ -2907,6 +2962,178 @@ def _is_broker_paper_observe_only_entry_gate(
     )
 
 
+def _broker_paper_bootstrap_thresholds() -> dict[str, Any]:
+    return {
+        "min_score": float(settings.broker_paper_bootstrap_min_score or 40.0),
+        "min_net_edge_bps": float(
+            settings.broker_paper_bootstrap_min_net_edge_bps or -20.0
+        ),
+        "min_expected_return_bps": float(
+            settings.broker_paper_bootstrap_min_expected_return_bps or 60.0
+        ),
+        "min_predicted_edge_bps": float(
+            settings.broker_paper_bootstrap_min_predicted_edge_bps or 40.0
+        ),
+        "allow_watch": bool(settings.broker_paper_bootstrap_allow_watch),
+        "allow_promoted_watch": bool(
+            settings.broker_paper_bootstrap_allow_promoted_watch
+        ),
+        "order_size_multiplier": float(
+            settings.broker_paper_bootstrap_order_size_multiplier or 0.20
+        ),
+        "max_order_amount_krw": float(
+            settings.broker_paper_bootstrap_max_order_amount_krw or 100_000.0
+        ),
+        "max_symbols_per_cycle": int(
+            settings.broker_paper_bootstrap_max_symbols_per_cycle or 1
+        ),
+    }
+
+
+def _is_broker_paper_bootstrap_mode(
+    execution_mode: str | None,
+    entry_gate: dict[str, Any] | None,
+) -> bool:
+    if str(execution_mode or "").lower() != "broker_paper":
+        return False
+    if not bool(settings.kis_is_paper):
+        return False
+    if not bool(settings.broker_paper_bootstrap_relaxed_enabled):
+        return False
+    if not isinstance(entry_gate, dict):
+        return False
+    if entry_gate.get("candidate_label_gate_hard_blocking"):
+        return False
+    if entry_gate.get("broker_paper_fill_gate_hard_blocking"):
+        return False
+    if _is_collecting_entry_gate(entry_gate):
+        return True
+    if _is_broker_paper_observe_only_entry_gate(entry_gate):
+        return True
+
+    fill_count = _to_int(entry_gate.get("broker_paper_fill_sample_count"))
+    min_fill_count = _to_int(entry_gate.get("broker_paper_min_fill_samples"))
+    if fill_count is not None and min_fill_count is not None and fill_count < min_fill_count:
+        return True
+
+    sample_count = _to_int(
+        entry_gate.get("candidate_label_sample_count")
+        or entry_gate.get("sample_count")
+        or entry_gate.get("all_sample_count")
+    )
+    min_sample_count = _to_int(
+        entry_gate.get("candidate_label_min_samples")
+        or entry_gate.get("required_sample_count")
+        or entry_gate.get("min_samples")
+        or settings.edge_calibration_gate_min_samples
+    )
+    return (
+        sample_count is not None
+        and min_sample_count is not None
+        and sample_count < min_sample_count
+    )
+
+
+def _broker_paper_bootstrap_relaxed_check(
+    candidate: dict[str, Any],
+    *,
+    entry_gate: dict[str, Any] | None,
+    execution_mode: str | None,
+) -> dict[str, Any]:
+    thresholds = _broker_paper_bootstrap_thresholds()
+    result: dict[str, Any] = {
+        "eligible": False,
+        "reason": None,
+        "thresholds": thresholds,
+        "order_size_multiplier": thresholds["order_size_multiplier"],
+        "max_order_amount_krw": thresholds["max_order_amount_krw"],
+    }
+
+    if not _is_broker_paper_bootstrap_mode(execution_mode, entry_gate):
+        result["reason"] = "broker_paper bootstrap relaxed mode is not active"
+        return result
+    if _has_explicit_safety_block(candidate):
+        result["reason"] = "broker_paper bootstrap relaxed blocked by safety flag"
+        return result
+    if _has_large_cap_gate_block(candidate):
+        result["reason"] = "broker_paper bootstrap relaxed blocked by large-cap gate"
+        return result
+    if not candidate.get("current_price"):
+        result["reason"] = "broker_paper bootstrap relaxed blocked by missing price"
+        return result
+
+    decision = str(candidate.get("decision") or "").lower()
+    if decision == "watch" and not thresholds["allow_watch"]:
+        result["reason"] = "broker_paper bootstrap relaxed watch candidates disabled"
+        return result
+    if decision not in {"buy_candidate", "watch"}:
+        result["reason"] = "broker_paper bootstrap relaxed requires buy/watch candidate"
+        return result
+
+    score = _to_float(
+        candidate.get("score")
+        or candidate.get("composite_score")
+        or candidate.get("raw_score")
+    )
+    net_edge = _to_float(candidate.get("net_edge_bps") or candidate.get("net_edge"))
+    expected_return = _to_float(
+        candidate.get("expected_return_bps") or candidate.get("expected_return")
+    )
+    predicted_edge = _to_float(
+        candidate.get("predicted_edge_bps")
+        or candidate.get("expected_net_edge")
+        or candidate.get("net_edge_bps")
+        or candidate.get("net_edge")
+    )
+    metrics = {
+        "score": score,
+        "net_edge_bps": net_edge,
+        "expected_return_bps": expected_return,
+        "predicted_edge_bps": predicted_edge,
+    }
+    result["metrics"] = metrics
+
+    if score is None or score < thresholds["min_score"]:
+        result["reason"] = (
+            f"broker_paper bootstrap relaxed blocked: score {score or 0:.2f} "
+            f"< {thresholds['min_score']:.2f}"
+        )
+        return result
+    if net_edge is None or net_edge < thresholds["min_net_edge_bps"]:
+        result["reason"] = (
+            f"broker_paper bootstrap relaxed blocked: net_edge {net_edge or 0:.2f}bps "
+            f"< {thresholds['min_net_edge_bps']:.2f}bps"
+        )
+        return result
+    if (
+        expected_return is None
+        or expected_return < thresholds["min_expected_return_bps"]
+    ):
+        result["reason"] = (
+            "broker_paper bootstrap relaxed blocked: expected_return "
+            f"{expected_return or 0:.2f}bps < {thresholds['min_expected_return_bps']:.2f}bps"
+        )
+        return result
+    if predicted_edge is None:
+        predicted_edge = net_edge
+        metrics["predicted_edge_bps"] = predicted_edge
+    if predicted_edge is None or predicted_edge < thresholds["min_predicted_edge_bps"]:
+        result["reason"] = (
+            "broker_paper bootstrap relaxed blocked: predicted_edge "
+            f"{predicted_edge or 0:.2f}bps < {thresholds['min_predicted_edge_bps']:.2f}bps"
+        )
+        return result
+
+    result["eligible"] = True
+    result["reason"] = (
+        "broker_paper bootstrap relaxed pass "
+        f"(score {score:.2f}, net_edge {net_edge:.2f}bps, "
+        f"expected_return {expected_return or 0:.2f}bps, "
+        f"predicted_edge {predicted_edge:.2f}bps)"
+    )
+    return result
+
+
 def _has_explicit_safety_block(candidate: dict[str, Any]) -> bool:
     if candidate.get("status") == "EXCLUDED":
         return True
@@ -3011,6 +3238,104 @@ def _paper_promote_exclude_to_watch_if_eligible(
             f"(score {score:.2f}, net_edge {net_edge:.2f}bps)"
         ).strip("; "),
     }
+
+
+def _broker_paper_promote_exclude_to_watch_if_eligible(
+    candidate: dict[str, Any],
+    *,
+    hurdle_rate: float,
+    execution_mode: str = "paper",
+) -> dict[str, Any]:
+    if str(execution_mode or "").lower() != "broker_paper":
+        return candidate
+
+    if not bool(settings.kis_is_paper):
+        return candidate
+
+    if not bool(settings.broker_paper_bootstrap_relaxed_enabled):
+        return candidate
+
+    if not bool(settings.broker_paper_bootstrap_allow_promoted_watch):
+        return candidate
+
+    if str(candidate.get("decision") or "").lower() != "exclude":
+        return candidate
+
+    if _has_explicit_safety_block(candidate):
+        return candidate
+
+    if _has_large_cap_gate_block(candidate):
+        return candidate
+
+    if not candidate.get("current_price"):
+        return candidate
+
+    thresholds = _broker_paper_bootstrap_thresholds()
+    score = float(
+        candidate.get("score")
+        or candidate.get("raw_score")
+        or candidate.get("composite_score")
+        or 0.0
+    )
+    if score < thresholds["min_score"]:
+        return candidate
+
+    net_edge = float(candidate.get("net_edge") or 0.0)
+    if net_edge < thresholds["min_net_edge_bps"]:
+        return candidate
+
+    reason = str(candidate.get("reason") or "")
+    return {
+        **candidate,
+        "decision": "watch",
+        "broker_paper_promoted_to_watch": True,
+        "reason": (
+            f"{reason}; broker_paper bootstrap relaxed promoted exclude to watch "
+            f"(score {score:.2f}, net_edge {net_edge:.2f}bps)"
+        ).strip("; "),
+    }
+
+
+def _apply_broker_paper_bootstrap_symbol_limit(
+    candidates: list[dict[str, Any]],
+    *,
+    execution_mode: str | None,
+) -> list[dict[str, Any]]:
+    if str(execution_mode or "").lower() != "broker_paper":
+        return candidates
+    if not bool(settings.kis_is_paper):
+        return candidates
+    limit = int(settings.broker_paper_bootstrap_max_symbols_per_cycle or 0)
+    if limit <= 0:
+        return candidates
+
+    relaxed_ready_seen = 0
+    limited: list[dict[str, Any]] = []
+    for item in candidates:
+        if (
+            item.get("status") == "READY"
+            and item.get("broker_paper_bootstrap_relaxed")
+        ):
+            relaxed_ready_seen += 1
+            if relaxed_ready_seen > limit:
+                reason = _join_reasons(
+                    [
+                        str(item.get("reason") or ""),
+                        (
+                            "broker_paper bootstrap relaxed max symbols per cycle "
+                            f"reached ({limit})"
+                        ),
+                    ]
+                )
+                item = {
+                    **item,
+                    "status": "SKIPPED",
+                    "candidate_state": _candidate_state_for_status("SKIPPED", reason),
+                    "reason": reason,
+                    "broker_paper_executable": False,
+                }
+        limited.append(item)
+    return limited
 
 
 def _execution_priority(candidate: dict[str, Any]) -> float:
@@ -3370,6 +3695,12 @@ def _execution_status_for_candidate(
 ) -> tuple[str, str]:
     reasons = [str(candidate.get("reason") or "")]
     paper_bootstrap = _is_paper_mode(execution_mode)
+    broker_relaxed = _broker_paper_bootstrap_relaxed_check(
+        candidate,
+        entry_gate=entry_gate,
+        execution_mode=execution_mode,
+    )
+    broker_paper_relaxed = bool(broker_relaxed.get("eligible"))
 
     large_cap_gate = candidate.get("large_cap_top10_gate") or _large_cap_top10_gate(candidate)
     if not large_cap_gate.get("passed", True):
@@ -3406,7 +3737,12 @@ def _execution_status_for_candidate(
         if decision == "watch":
             reasons.append("watch candidate allowed as lower-priority paper sub-candidate")
     else:
-        if decision != "buy_candidate":
+        if broker_paper_relaxed:
+            if decision == "watch":
+                reasons.append(
+                    "watch candidate allowed by broker_paper bootstrap relaxed pass"
+                )
+        elif decision != "buy_candidate":
             reasons.append("not a buy candidate")
             return "SKIPPED", _join_reasons(reasons)
 
@@ -3418,7 +3754,7 @@ def _execution_status_for_candidate(
         reasons.extend(str(item) for item in high_loss_risk.get("reasons") or [])
         return RISK_REJECTED_STATUS, _join_reasons(reasons)
 
-    if _strict_order_execution_mode(execution_mode):
+    if _strict_order_execution_mode(execution_mode) and not broker_paper_relaxed:
         predicted_edge = _to_float(
             candidate.get("predicted_edge_bps")
             or candidate.get("expected_net_edge")
@@ -3438,7 +3774,7 @@ def _execution_status_for_candidate(
     reward_risk = candidate.get("edge_reward_risk") or {}
     expected_value = _to_float(reward_risk.get("expected_value_after_cost_bps"))
 
-    if paper_bootstrap:
+    if paper_bootstrap or broker_paper_relaxed:
         if expected_value is not None and expected_value < -20.0:
             reasons.append(f"expected value {expected_value:.2f}bps is below -20bps")
             return "SKIPPED", _join_reasons(reasons)
@@ -3449,7 +3785,7 @@ def _execution_status_for_candidate(
 
     reward_risk_ratio = _to_float(reward_risk.get("reward_risk_ratio"))
 
-    if paper_bootstrap:
+    if paper_bootstrap or broker_paper_relaxed:
         if reward_risk_ratio is not None and reward_risk_ratio < 0.5:
             reasons.append(f"reward/risk {reward_risk_ratio:.2f} is below 0.5")
             return "SKIPPED", _join_reasons(reasons)
@@ -3460,7 +3796,7 @@ def _execution_status_for_candidate(
 
     net_edge = float(candidate.get("net_edge") or 0.0)
 
-    if paper_bootstrap:
+    if paper_bootstrap or broker_paper_relaxed:
         min_bootstrap_edge = min(float(hurdle_rate or 0.0), -20.0)
         if net_edge < min_bootstrap_edge:
             reasons.append(
@@ -3486,6 +3822,10 @@ def _execution_status_for_candidate(
                 "paper bootstrap soft-pass for collecting calibration gate: "
                 f"{gate_message}"
             )
+        elif broker_paper_relaxed:
+            reasons.append(
+                f"{broker_relaxed.get('reason')}: {gate_message}"
+            )
         else:
             reasons.append(gate_message)
             return "SKIPPED", _join_reasons(reasons)
@@ -3500,6 +3840,9 @@ def _execution_status_for_candidate(
 
     if paper_bootstrap:
         reasons.append("paper bootstrap executable")
+    elif broker_paper_relaxed:
+        reasons.append(str(broker_relaxed.get("reason") or "broker_paper bootstrap relaxed pass"))
+        reasons.append("broker_paper executable")
     elif str(execution_mode or "").lower() == "broker_paper":
         reasons.append("broker_paper executable")
     else:
@@ -4021,6 +4364,26 @@ def _to_symbol_config(
         candidate_status=str(candidate.get("status") or "") or None,
         candidate_decision=str(candidate.get("decision") or "") or None,
         candidate_reason=str(candidate.get("reason") or "") or None,
+        entry_gate=(
+            candidate.get("entry_gate") if isinstance(candidate.get("entry_gate"), dict) else None
+        ),
+        broker_paper_bootstrap_relaxed=bool(
+            candidate.get("broker_paper_bootstrap_relaxed")
+        ),
+        broker_paper_bootstrap_reason=(
+            str(candidate.get("broker_paper_bootstrap_reason") or "") or None
+        ),
+        broker_paper_bootstrap_thresholds=(
+            candidate.get("broker_paper_bootstrap_thresholds")
+            if isinstance(candidate.get("broker_paper_bootstrap_thresholds"), dict)
+            else None
+        ),
+        broker_paper_bootstrap_order_size_multiplier=_to_float(
+            candidate.get("broker_paper_bootstrap_order_size_multiplier")
+        ),
+        broker_paper_bootstrap_max_order_amount_krw=_to_float(
+            candidate.get("broker_paper_bootstrap_max_order_amount_krw")
+        ),
         final_entry_edge=_to_float(candidate.get("final_entry_edge"))
         or _to_float(candidate.get("net_edge")),
         fresh_quote_used=(
@@ -4096,6 +4459,24 @@ def _compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
                 "corporate_event_check": item.get("corporate_event_check"),
                 "paper_bootstrap_soft_pass": item.get("paper_bootstrap_soft_pass"),
                 "paper_promoted_to_watch": item.get("paper_promoted_to_watch"),
+                "broker_paper_promoted_to_watch": item.get(
+                    "broker_paper_promoted_to_watch"
+                ),
+                "broker_paper_bootstrap_relaxed": item.get(
+                    "broker_paper_bootstrap_relaxed"
+                ),
+                "broker_paper_bootstrap_reason": item.get(
+                    "broker_paper_bootstrap_reason"
+                ),
+                "broker_paper_bootstrap_thresholds": item.get(
+                    "broker_paper_bootstrap_thresholds"
+                ),
+                "broker_paper_bootstrap_order_size_multiplier": item.get(
+                    "broker_paper_bootstrap_order_size_multiplier"
+                ),
+                "broker_paper_bootstrap_max_order_amount_krw": item.get(
+                    "broker_paper_bootstrap_max_order_amount_krw"
+                ),
                 "broker_paper_bootstrap_allowed": item.get(
                     "broker_paper_bootstrap_allowed"
                 ),

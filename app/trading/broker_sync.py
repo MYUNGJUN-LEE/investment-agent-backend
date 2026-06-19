@@ -17,6 +17,22 @@ from app.config import settings
 
 KIS_TOKEN_EXPIRED_CODE = "EGW00123"
 
+CASH_FIELD_KEYS = (
+    "dnca_tot_amt",
+    "ord_psbl_cash",
+    "ord_psbl_amt",
+    "buying_power",
+    "cash_available",
+    "withdrawable_cash",
+    "wdrw_psbl_tot_amt",
+    "nxdy_excc_amt",
+    "max_buy_amt",
+    "cash",
+    "total_cash",
+    "nass_amt",
+    "tot_evlu_amt",
+)
+
 
 def _is_kis_token_expired_error(exc: Exception) -> bool:
     """Return True when KIS says the access token has expired."""
@@ -391,8 +407,158 @@ def record_kis_sync(
         "execution_count": len(orders),
         "total_cash": totals.get("total_cash"),
         "total_value": totals.get("total_value"),
+        "cash_available": totals.get("cash_available"),
+        "buying_power": totals.get("buying_power"),
+        "withdrawable_cash": totals.get("withdrawable_cash"),
+        "raw_cash_fields": totals.get("raw_cash_fields") or {},
         "synced_at": now,
     }
+
+
+def broker_account_check_from_sync_result(
+    sync_result: dict[str, Any] | None,
+    *,
+    account_no: str | None = None,
+    account_product_code: str | None = None,
+) -> dict[str, Any]:
+    sync_result = sync_result or {}
+    status = str(sync_result.get("status") or "unknown")
+    account_no_value = str(
+        account_no
+        or sync_result.get("account_no")
+        or settings.kis_account_no
+        or ""
+    )
+    account_product_code_value = str(
+        account_product_code
+        or sync_result.get("account_product_code")
+        or settings.kis_account_product_code
+        or ""
+    )
+    check: dict[str, Any] = {
+        "status": "unknown",
+        "connected": False,
+        "rate_limited": False,
+        "token_rate_limited": False,
+        "account_rate_limited": False,
+        "account_no_configured": bool(account_no_value),
+        "account_product_code_configured": bool(account_product_code_value),
+        "account_no": account_no_value,
+        "account_product_code": account_product_code_value,
+        "total_cash": None,
+        "cash_available": None,
+        "buying_power": None,
+        "withdrawable_cash": None,
+        "raw_cash_fields": {},
+        "block_reason": None,
+        "message": sync_result.get("message"),
+        "last_sync_at": sync_result.get("synced_at") or sync_result.get("created_at"),
+    }
+
+    if status == "token_backoff":
+        check.update(
+            {
+                "status": "rate_limited",
+                "rate_limited": True,
+                "token_rate_limited": True,
+                "block_reason": "token_rate_limited",
+                "message": sync_result.get("message") or "KIS token is rate limited.",
+            }
+        )
+        return check
+    if status == "account_backoff":
+        check.update(
+            {
+                "status": "rate_limited",
+                "rate_limited": True,
+                "account_rate_limited": True,
+                "block_reason": "account_rate_limited",
+                "message": sync_result.get("message") or "KIS account ledger is rate limited.",
+            }
+        )
+        return check
+    if status == "config_error":
+        check.update(
+            {
+                "status": "blocked",
+                "block_reason": "account_config_missing",
+                "message": sync_result.get("message")
+                or "KIS account configuration is missing or invalid.",
+            }
+        )
+        return check
+    if status != "success":
+        check.update(
+            {
+                "status": "blocked",
+                "block_reason": "kis_balance_sync_failed",
+                "message": sync_result.get("message") or "KIS balance sync did not succeed.",
+            }
+        )
+        return check
+
+    raw_cash_fields = _sanitize_cash_fields(sync_result.get("raw_cash_fields") or {})
+    total_cash = _to_float(sync_result.get("total_cash"))
+    cash_available = _to_float(sync_result.get("cash_available"))
+    buying_power = _to_float(sync_result.get("buying_power"))
+    withdrawable_cash = _to_float(sync_result.get("withdrawable_cash"))
+    check.update(
+        {
+            "connected": True,
+            "total_cash": total_cash,
+            "cash_available": cash_available,
+            "buying_power": buying_power,
+            "withdrawable_cash": withdrawable_cash,
+            "raw_cash_fields": raw_cash_fields,
+        }
+    )
+
+    if not raw_cash_fields and all(
+        value is None for value in (total_cash, cash_available, buying_power)
+    ):
+        check.update(
+            {
+                "status": "blocked",
+                "block_reason": "cash_unavailable",
+                "message": "KIS balance sync succeeded but cash fields were unavailable.",
+            }
+        )
+        return check
+    if total_cash is not None and total_cash <= 0:
+        check.update(
+            {
+                "status": "blocked",
+                "block_reason": "total_cash_zero",
+                "message": "KIS account total_cash is zero.",
+            }
+        )
+        return check
+    if buying_power is not None and buying_power <= 0:
+        check.update(
+            {
+                "status": "blocked",
+                "block_reason": "buying_power_zero",
+                "message": "KIS account buying_power is zero.",
+            }
+        )
+        return check
+    if cash_available is not None and cash_available <= 0 and total_cash is None:
+        check.update(
+            {
+                "status": "blocked",
+                "block_reason": "cash_unavailable",
+                "message": "KIS account cash_available is zero or unavailable.",
+            }
+        )
+        return check
+
+    check.update(
+        {
+            "status": "ready",
+            "message": "KIS account balance is connected.",
+        }
+    )
+    return check
 
 
 def _kis_config_error_result(
@@ -422,6 +588,32 @@ def _kis_config_error_result(
     }
 
 
+def _extract_cash_fields(data: dict[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    rows = [*(_rows(data, "output2", "output")), data]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in CASH_FIELD_KEYS:
+            if key not in row:
+                continue
+            value = row.get(key)
+            if value in (None, ""):
+                continue
+            fields[key] = value
+    return _sanitize_cash_fields(fields)
+
+
+def _sanitize_cash_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key not in CASH_FIELD_KEYS:
+            continue
+        number = _to_float(value)
+        sanitized[key] = number if number is not None else str(value)
+    return sanitized
+
+
 def _parse_balance_totals(data: dict[str, Any]) -> dict[str, Any]:
     rows = _rows(data, "output2")
     row = rows[0] if rows else {}
@@ -429,6 +621,8 @@ def _parse_balance_totals(data: dict[str, Any]) -> dict[str, Any]:
         "total_cash": _pick_float(
             row,
             "dnca_tot_amt",
+            "total_cash",
+            "cash",
             "nass_amt",
             "tot_evlu_amt",
         ),
@@ -438,6 +632,27 @@ def _parse_balance_totals(data: dict[str, Any]) -> dict[str, Any]:
             "scts_evlu_amt",
             "evlu_amt_smtl_amt",
         ),
+        "cash_available": _pick_float(
+            row,
+            "ord_psbl_cash",
+            "ord_psbl_amt",
+            "cash_available",
+            "dnca_tot_amt",
+        ),
+        "buying_power": _pick_float(
+            row,
+            "buying_power",
+            "max_buy_amt",
+            "ord_psbl_amt",
+            "ord_psbl_cash",
+        ),
+        "withdrawable_cash": _pick_float(
+            row,
+            "withdrawable_cash",
+            "wdrw_psbl_tot_amt",
+            "nxdy_excc_amt",
+        ),
+        "raw_cash_fields": _extract_cash_fields(data),
     }
 
 

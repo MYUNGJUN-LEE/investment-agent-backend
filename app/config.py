@@ -271,6 +271,16 @@ class Settings(BaseSettings):
     broker_paper_candidate_label_gate_mode: str = "observe_only"
     broker_paper_min_fill_samples: int = 200
     broker_paper_min_oos_fill_samples: int = 50
+    broker_paper_bootstrap_relaxed_enabled: bool = True
+    broker_paper_bootstrap_min_score: float = 40.0
+    broker_paper_bootstrap_min_net_edge_bps: float = -20.0
+    broker_paper_bootstrap_allow_watch: bool = True
+    broker_paper_bootstrap_allow_promoted_watch: bool = True
+    broker_paper_bootstrap_order_size_multiplier: float = 0.20
+    broker_paper_bootstrap_max_order_amount_krw: float = 100_000.0
+    broker_paper_bootstrap_min_expected_return_bps: float = 60.0
+    broker_paper_bootstrap_min_predicted_edge_bps: float = 40.0
+    broker_paper_bootstrap_max_symbols_per_cycle: int = 1
     dynamic_risk_limits_enabled: bool = True
     dynamic_risk_min_multiplier: float = 0.35
     dynamic_risk_max_multiplier: float = 1.15

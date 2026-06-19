@@ -910,6 +910,86 @@ def test_broker_paper_bootstrap_observe_only_candidate_label_gate(monkeypatch):
     assert blocked_status == "SKIPPED"
 
 
+def test_broker_paper_relaxed_bootstrap_allows_watch_candidate(monkeypatch):
+    monkeypatch.setattr(universe_scanner.settings, "kis_is_paper", True)
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "broker_paper_bootstrap_relaxed_enabled",
+        True,
+    )
+    monkeypatch.setattr(universe_scanner.settings, "broker_paper_bootstrap_min_score", 40.0)
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "broker_paper_bootstrap_min_net_edge_bps",
+        -20.0,
+    )
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "broker_paper_bootstrap_min_expected_return_bps",
+        60.0,
+    )
+    monkeypatch.setattr(
+        universe_scanner.settings,
+        "broker_paper_bootstrap_min_predicted_edge_bps",
+        40.0,
+    )
+    candidate = {
+        "symbol": "123456",
+        "decision": "watch",
+        "current_price": 10_000,
+        "score": 43.0,
+        "composite_score": 43.0,
+        "net_edge": 10.0,
+        "expected_return": 80.0,
+        "predicted_edge_bps": 45.0,
+        "edge_reward_risk": {
+            "expected_value_after_cost_bps": 0.0,
+            "reward_risk_ratio": 0.8,
+        },
+        "large_cap_top10_gate": {"passed": True},
+    }
+    collecting_gate = {
+        "status": "collecting",
+        "approved": False,
+        "message": "Calibration performance gate blocked entries: sample_count 26/100",
+        "sample_count": 26,
+        "required_sample_count": 100,
+        "broker_paper_fill_sample_count": 0,
+        "broker_paper_min_fill_samples": 200,
+    }
+
+    status, reason = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate=collecting_gate,
+        execution_mode="broker_paper",
+    )
+    live_status, _ = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate=collecting_gate,
+        execution_mode="live",
+    )
+    monkeypatch.setattr(universe_scanner.settings, "kis_is_paper", False)
+    non_paper_kis_status, _ = universe_scanner._execution_status_for_candidate(
+        candidate,
+        rank=1,
+        execution_limit=10,
+        hurdle_rate=40.0,
+        entry_gate=collecting_gate,
+        execution_mode="broker_paper",
+    )
+
+    assert status == "READY"
+    assert "broker_paper bootstrap relaxed pass" in reason
+    assert live_status == "SKIPPED"
+    assert non_paper_kis_status == "SKIPPED"
+
+
 def test_high_loss_risk_candidate_is_risk_rejected():
     candidate = {
         "symbol": "123456",

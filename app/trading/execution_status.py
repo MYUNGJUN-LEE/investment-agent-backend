@@ -10,6 +10,7 @@ from typing import Any
 
 from app.config import settings
 from app.brokers.kis_client import KIS_PAPER_BASE_URL, KisClient
+from app.trading import broker_sync
 from app.trading import edge_calibration, paper_trading
 from app.trading import auto_trading_store
 from app.trading import order_state as order_state_store
@@ -55,8 +56,6 @@ def trading_status_snapshot(
     )
     kis_token = _kis_token_status(mode=mode, broker_provider=broker_provider)
     kis_account = _kis_account_status(mode=mode, broker_provider=broker_provider)
-    if broker_safety["broker_submit_blocked"]:
-        mode_flags["submits_to_broker"] = False
 
     planned_entry_count = _planned_entry_count(latest_session)
     paper_orders_count = _table_count(
@@ -110,9 +109,25 @@ def trading_status_snapshot(
         resolved_mode=mode,
         active_sessions=active_sessions,
     )
+    broker_account_check = _broker_account_check_status(
+        paths["broker_sync_db_path"],
+        mode=mode,
+        broker_provider=broker_provider,
+        broker_safety=broker_safety,
+        kis_token=kis_token,
+        kis_account=kis_account,
+    )
+    effective_broker_safety = _effective_broker_submit_safety(
+        broker_safety=broker_safety,
+        broker_account_check=broker_account_check,
+        session_mismatch=session_mismatch,
+        execution_mode=mode,
+    )
+    if effective_broker_safety["broker_submit_blocked"]:
+        mode_flags["submits_to_broker"] = False
     broker_enabled = bool(
         mode_flags["submits_to_broker"]
-        and not broker_safety["broker_submit_blocked"]
+        and not effective_broker_safety["broker_submit_blocked"]
         and not session_mismatch["session_mode_mismatch"]
     )
     guard_counts = _broker_guard_counts(latest_session)
@@ -125,8 +140,14 @@ def trading_status_snapshot(
         **provider_info,
         "resolved_execution_mode": mode,
         "active_session_execution_mode": session_mode,
+        "active_session_id": (latest_session or {}).get("session_id"),
+        "active_session_status": (latest_session or {}).get("status"),
+        "active_sessions": active_sessions,
         "session_mode_mismatch": session_mismatch["session_mode_mismatch"],
         "session_mode_mismatch_reason": session_mismatch["session_mode_mismatch_reason"],
+        "session_mode_mismatch_message": session_mismatch.get(
+            "session_mode_mismatch_message"
+        ),
         "requires_session_restart": session_mismatch["requires_session_restart"],
         "broker_submit_enabled": broker_enabled,
         "DATA_DIR": storage.get("resolved_data_dir"),
@@ -162,12 +183,13 @@ def trading_status_snapshot(
         "last_broker_sync_at": _last_broker_sync_at(paths["broker_sync_db_path"]),
         **kis_token,
         **kis_account,
-        "broker_submit_blocked": broker_safety["broker_submit_blocked"],
-        "broker_submit_block_reason": broker_safety["broker_submit_block_reason"],
-        "broker_submit_block_code": broker_safety.get("broker_submit_block_code"),
+        "broker_account_check": broker_account_check,
+        "broker_submit_blocked": effective_broker_safety["broker_submit_blocked"],
+        "broker_submit_block_reason": effective_broker_safety["broker_submit_block_reason"],
+        "broker_submit_block_code": effective_broker_safety.get("broker_submit_block_code"),
         "last_broker_sync_error": _last_broker_sync_error(paths["broker_sync_db_path"]),
         "broker_submit_status": _broker_submit_status(
-            broker_safety=broker_safety,
+            broker_safety=effective_broker_safety,
             latest_event=order_state.get("latest_broker_order_event"),
         ),
         "broker_execution_status": (
@@ -539,11 +561,23 @@ def _session_mode_mismatch(
         return {
             "session_mode_mismatch": False,
             "session_mode_mismatch_reason": None,
+            "session_mode_mismatch_message": None,
             "requires_session_restart": False,
         }
+    message = (
+        "Active session is still running in paper mode; restart the session "
+        "to apply broker_paper mode."
+        if resolved_mode == "broker_paper"
+        and any(
+            str(session.get("execution_mode") or "paper").lower() == "paper"
+            for session in mismatched
+        )
+        else "Active session execution_mode differs from resolved execution_mode; restart the session to apply the configured mode."
+    )
     return {
         "session_mode_mismatch": True,
         "session_mode_mismatch_reason": "active_session_execution_mode_differs_from_config",
+        "session_mode_mismatch_message": message,
         "requires_session_restart": True,
         "mismatched_session_ids": [session.get("session_id") for session in mismatched],
     }
@@ -729,6 +763,163 @@ def _broker_submit_static_status(
         "broker_submit_block_code": None,
         "kis_paper_endpoint": KIS_PAPER_BASE_URL,
     }
+
+
+def _broker_account_check_status(
+    path: Path,
+    *,
+    mode: str,
+    broker_provider: str,
+    broker_safety: dict[str, Any],
+    kis_token: dict[str, Any],
+    kis_account: dict[str, Any],
+) -> dict[str, Any]:
+    defaults = {
+        "status": "not_applicable",
+        "connected": False,
+        "rate_limited": False,
+        "token_rate_limited": False,
+        "account_rate_limited": False,
+        "account_no_configured": bool(settings.kis_account_no),
+        "account_product_code_configured": bool(settings.kis_account_product_code),
+        "account_no": settings.kis_account_no or "",
+        "account_product_code": settings.kis_account_product_code or "",
+        "total_cash": None,
+        "cash_available": None,
+        "buying_power": None,
+        "withdrawable_cash": None,
+        "raw_cash_fields": {},
+        "block_reason": None,
+        "message": None,
+        "last_sync_at": None,
+    }
+    if str(broker_provider or "").lower() != "kis":
+        return defaults
+    if str(mode or "").lower() not in {"broker_paper", "live"}:
+        return defaults
+
+    code = str(broker_safety.get("broker_submit_block_code") or "")
+    if code == "kis_token_unavailable_rate_limited":
+        return broker_sync.broker_account_check_from_sync_result(
+            {
+                "status": "token_backoff",
+                "message": "kis_token_rate_limited",
+                "synced_at": kis_token.get("kis_token_last_refresh_attempt_at"),
+            }
+        )
+    if code == "kis_account_rate_limited":
+        return broker_sync.broker_account_check_from_sync_result(
+            {
+                "status": "account_backoff",
+                "message": "kis_account_rate_limited",
+                "synced_at": kis_account.get("kis_account_last_probe_at"),
+            }
+        )
+    if code in {"kis_config_missing", "kis_is_paper_false", "broker_provider_not_kis"}:
+        return {
+            **defaults,
+            "status": "blocked",
+            "block_reason": "account_config_missing"
+            if code == "kis_config_missing"
+            else code,
+            "message": broker_safety.get("broker_submit_block_reason"),
+        }
+
+    latest = _latest_broker_balance_snapshot(path)
+    if latest:
+        raw_balance = latest.get("raw_balance") or {}
+        totals = (
+            broker_sync._parse_balance_totals(raw_balance)
+            if isinstance(raw_balance, dict)
+            else {}
+        )
+        sync_result = {
+            "status": "success",
+            "account_no": latest.get("account_no"),
+            "total_cash": totals.get("total_cash", latest.get("total_cash")),
+            "total_value": totals.get("total_value", latest.get("total_value")),
+            "cash_available": totals.get("cash_available"),
+            "buying_power": totals.get("buying_power"),
+            "withdrawable_cash": totals.get("withdrawable_cash"),
+            "raw_cash_fields": totals.get("raw_cash_fields") or {},
+            "synced_at": latest.get("created_at"),
+        }
+        return broker_sync.broker_account_check_from_sync_result(sync_result)
+
+    return {
+        **defaults,
+        "status": "unknown",
+        "message": "No broker balance snapshot has been synced yet.",
+    }
+
+
+def _latest_broker_balance_snapshot(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        with sqlite3.connect(path, timeout=2) as conn:
+            conn.row_factory = sqlite3.Row
+            if not _table_exists(conn, "broker_balance_snapshots"):
+                return None
+            row = conn.execute(
+                """
+                SELECT created_at, account_no, total_cash, total_value, raw_json
+                FROM broker_balance_snapshots
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                return None
+            data = dict(row)
+            data["raw_balance"] = _parse_json(data.pop("raw_json", None), {})
+            return data
+    except sqlite3.Error:
+        return None
+
+
+def _effective_broker_submit_safety(
+    *,
+    broker_safety: dict[str, Any],
+    broker_account_check: dict[str, Any],
+    session_mismatch: dict[str, Any],
+    execution_mode: str,
+) -> dict[str, Any]:
+    effective = dict(broker_safety)
+    account_block = broker_account_check.get("block_reason")
+    if (
+        str(execution_mode or "").lower() == "broker_paper"
+        and not effective.get("broker_submit_blocked")
+        and account_block in {
+            "account_rate_limited",
+            "token_rate_limited",
+            "cash_unavailable",
+            "total_cash_zero",
+            "buying_power_zero",
+            "account_config_missing",
+            "kis_balance_sync_failed",
+        }
+    ):
+        effective.update(
+            {
+                "broker_submit_blocked": True,
+                "broker_submit_block_reason": account_block,
+                "broker_submit_block_code": account_block,
+                "broker_account_check": broker_account_check,
+            }
+        )
+    if session_mismatch.get("session_mode_mismatch"):
+        effective.update(
+            {
+                "broker_submit_blocked": True,
+                "broker_submit_block_reason": "session_mode_mismatch",
+                "broker_submit_block_code": "session_mode_mismatch",
+                "session_mode_mismatch_message": session_mismatch.get(
+                    "session_mode_mismatch_message"
+                ),
+            }
+        )
+    return effective
 
 
 def _broker_submit_status(

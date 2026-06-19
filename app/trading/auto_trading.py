@@ -1663,6 +1663,52 @@ def _apply_candidate_position_sizing(
     )
 
 
+def _apply_broker_paper_bootstrap_order_cap(
+    req: AutoTradeStartRequest,
+    symbol_cfg: AutoTradeSymbolConfig,
+) -> AutoTradeSymbolConfig:
+    if str(req.execution_mode or "").lower() != "broker_paper":
+        return symbol_cfg
+    if not bool(symbol_cfg.broker_paper_bootstrap_relaxed):
+        return symbol_cfg
+
+    max_amount = _safe_float(
+        symbol_cfg.broker_paper_bootstrap_max_order_amount_krw,
+        _safe_float(settings.broker_paper_bootstrap_max_order_amount_krw, 100_000.0),
+    )
+    multiplier = _safe_float(
+        symbol_cfg.broker_paper_bootstrap_order_size_multiplier,
+        _safe_float(settings.broker_paper_bootstrap_order_size_multiplier, 0.20),
+    )
+    if max_amount <= 0:
+        return symbol_cfg
+    multiplier = max(0.0, min(1.0, multiplier))
+
+    existing_cash = _safe_float(symbol_cfg.cash_available, 0.0)
+    price = _safe_float(
+        symbol_cfg.price or symbol_cfg.order_price or symbol_cfg.decision_price,
+        0.0,
+    )
+    if existing_cash > 0:
+        target_cash = existing_cash * multiplier if multiplier > 0 else existing_cash
+        cash_cap = min(target_cash, max_amount, existing_cash)
+        if price > 0 and price <= min(existing_cash, max_amount) and cash_cap < price:
+            cash_cap = price
+    else:
+        cash_cap = max_amount
+
+    account_equity = _safe_float(
+        symbol_cfg.account_equity,
+        _safe_float(req.account_equity, 0.0),
+    )
+    updates: dict[str, Any] = {
+        "cash_available": round(max(0.0, cash_cap), 4),
+    }
+    if account_equity > 0:
+        updates["position_size"] = round(max(0.0, cash_cap) / account_equity, 6)
+    return symbol_cfg.model_copy(update=updates)
+
+
 def _entry_symbols_from_scanner_candidates(
     *,
     req: AutoTradeStartRequest,
@@ -1836,6 +1882,7 @@ def _entry_symbols_from_scanner_candidates(
             symbol_cfg=symbol_cfg,
             candidate=candidate,
         )
+        symbol_cfg = _apply_broker_paper_bootstrap_order_cap(req, symbol_cfg)
         symbols.append(symbol_cfg)
 
     return symbols
@@ -2146,19 +2193,16 @@ def _prepare_symbols_for_account_balance(
     account = _resolve_account_balance(req)
     if account["status"] != "ready":
         reason = str(account.get("broker_submit_block_reason") or "")
-        claimed_reason = (
-            "kis_account_rate_limited"
-            if reason == "kis_account_rate_limited"
-            else "kis_cash_or_buying_power_zero"
-            if req.execution_mode in ("live", "broker_paper")
-            else "unknown_post_claim_block"
-        )
+        claimed_reason = _claimed_no_order_reason_from_account_block(reason, req)
         account_blocks = [
-            _claimed_no_order_result(
-                req=req,
-                symbol_cfg=symbol_cfg,
-                message=account["message"],
-                reason=claimed_reason,
+            _attach_account_check_to_claimed_result(
+                _claimed_no_order_result(
+                    req=req,
+                    symbol_cfg=symbol_cfg,
+                    message=account["message"],
+                    reason=claimed_reason,
+                ),
+                account,
             )
             for symbol_cfg in priced_symbols
         ]
@@ -2183,6 +2227,59 @@ def _prepare_symbols_for_account_balance(
     }
 
 
+def _claimed_no_order_reason_from_account_block(
+    reason: str,
+    req: AutoTradeStartRequest,
+) -> str:
+    if reason in {
+        "account_rate_limited",
+        "kis_account_rate_limited",
+    }:
+        return "kis_account_rate_limited"
+    if reason in {
+        "token_rate_limited",
+        "kis_token_unavailable_rate_limited",
+    }:
+        return "kis_token_unavailable_rate_limited"
+    if reason in {
+        "cash_unavailable",
+        "total_cash_zero",
+        "buying_power_zero",
+        "kis_cash_or_buying_power_zero",
+    }:
+        return "kis_cash_or_buying_power_zero"
+    if reason in {
+        "account_config_missing",
+        "kis_balance_sync_failed",
+    }:
+        return reason
+    if req.execution_mode in ("live", "broker_paper"):
+        return "unknown_post_claim_block"
+    return "unknown_post_claim_block"
+
+
+def _attach_account_check_to_claimed_result(
+    result: dict[str, Any],
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    check = account.get("broker_account_check")
+    if not isinstance(check, dict):
+        return result
+    result["broker_account_check"] = check
+    result["broker_account_check_status"] = check.get("status")
+    result["broker_account_block_reason"] = check.get("block_reason")
+    trace = result.get("post_claim_diagnostics")
+    if isinstance(trace, dict):
+        trace["broker_account_check"] = check
+        trace["broker_account_check_status"] = check.get("status")
+        trace["broker_account_block_reason"] = check.get("block_reason")
+        trace["broker_submit_blocked"] = True
+        trace["broker_submit_block_reason"] = account.get("broker_submit_block_reason")
+        trace["broker_submit_block_code"] = account.get("broker_submit_block_reason")
+        result["post_claim_diagnostics"] = trace
+    return result
+
+
 def _resolve_account_balance(req: AutoTradeStartRequest) -> dict[str, Any]:
     if req.execution_mode in ("live", "broker_paper"):
         try:
@@ -2192,24 +2289,45 @@ def _resolve_account_balance(req: AutoTradeStartRequest) -> dict[str, Any]:
                 "status": "blocked",
                 "mode": req.execution_mode,
                 "message": f"Broker account balance check failed; no orders will be attempted: {exc}",
+                "broker_submit_blocked": True,
+                "broker_submit_block_reason": "kis_balance_sync_failed",
+                "broker_account_check": broker_sync.broker_account_check_from_sync_result(
+                    {
+                        "status": "error",
+                        "message": str(exc),
+                    }
+                ),
             }
-        if sync_result.get("status") == "account_backoff":
+        account_check = broker_sync.broker_account_check_from_sync_result(sync_result)
+        if account_check.get("status") != "ready":
+            reason = str(account_check.get("block_reason") or "kis_balance_sync_failed")
             return {
                 "status": "blocked",
                 "mode": req.execution_mode,
-                "message": "Broker account ledger is rate limited; broker submit is temporarily blocked.",
+                "message": str(
+                    account_check.get("message")
+                    or "Broker account check blocked order submission."
+                ),
                 "broker_submit_blocked": True,
-                "broker_submit_block_reason": "kis_account_rate_limited",
+                "broker_submit_block_reason": reason,
                 "broker_sync": sync_result,
+                "broker_account_check": account_check,
             }
-        cash_available = _to_float(sync_result.get("total_cash"))
+        cash_available = (
+            _to_float(account_check.get("buying_power"))
+            or _to_float(account_check.get("cash_available"))
+            or _to_float(account_check.get("total_cash"))
+        )
         account_equity = _to_float(sync_result.get("total_value")) or req.account_equity
         if cash_available is None:
             return {
                 "status": "blocked",
                 "mode": req.execution_mode,
                 "message": "Broker account cash balance is unavailable; no orders will be attempted.",
+                "broker_submit_blocked": True,
+                "broker_submit_block_reason": "cash_unavailable",
                 "broker_sync": sync_result,
+                "broker_account_check": account_check,
             }
         return {
             "status": "ready",
@@ -2217,6 +2335,7 @@ def _resolve_account_balance(req: AutoTradeStartRequest) -> dict[str, Any]:
             "account_equity": float(account_equity),
             "cash_available": max(0.0, float(cash_available)),
             "broker_sync": sync_result,
+            "broker_account_check": account_check,
         }
 
     snapshot = paper_trading.get_paper_account_snapshot(
@@ -2450,6 +2569,14 @@ def _insufficient_cash_result(
     }
     trace["broker_submit_block_reason"] = "insufficient_cash"
     trace["broker_submit_block_code"] = "insufficient_cash"
+    account_check = account.get("broker_account_check")
+    if isinstance(account_check, dict):
+        result["broker_account_check"] = account_check
+        result["broker_account_check_status"] = account_check.get("status")
+        result["broker_account_block_reason"] = account_check.get("block_reason")
+        trace["broker_account_check"] = account_check
+        trace["broker_account_check_status"] = account_check.get("status")
+        trace["broker_account_block_reason"] = account_check.get("block_reason")
     if reason == "missing price":
         claimed_reason = "price_zero_or_missing"
     elif "minimum executable quantity" in reason:
@@ -2746,6 +2873,19 @@ def _post_claim_diagnostics_base(
         "entry_signal_source": "scanner_candidate" if claimed else "manual_request",
         "candidate_decision": symbol_cfg.candidate_decision,
         "candidate_status": symbol_cfg.candidate_status,
+        "candidate_reason": symbol_cfg.candidate_reason,
+        "entry_gate": symbol_cfg.entry_gate,
+        "broker_paper_bootstrap_relaxed": symbol_cfg.broker_paper_bootstrap_relaxed,
+        "broker_paper_bootstrap_reason": symbol_cfg.broker_paper_bootstrap_reason,
+        "broker_paper_bootstrap_thresholds": (
+            symbol_cfg.broker_paper_bootstrap_thresholds
+        ),
+        "broker_paper_bootstrap_order_size_multiplier": (
+            symbol_cfg.broker_paper_bootstrap_order_size_multiplier
+        ),
+        "broker_paper_bootstrap_max_order_amount_krw": (
+            symbol_cfg.broker_paper_bootstrap_max_order_amount_krw
+        ),
         "final_entry_edge": symbol_cfg.final_entry_edge,
         "quantity": quantity or None,
         "order_price": price or None,
@@ -2754,6 +2894,9 @@ def _post_claim_diagnostics_base(
         "broker_submit_blocked": False,
         "broker_submit_block_code": None,
         "broker_submit_block_reason": None,
+        "broker_account_check_status": None,
+        "broker_account_block_reason": None,
+        "broker_account_check": None,
         "risk_approved": None,
         "risk_code": None,
         "risk_message": None,
@@ -2768,7 +2911,6 @@ def _post_claim_diagnostics_base(
         "fresh_quote_used": symbol_cfg.fresh_quote_used,
         "fresh_quote_age_seconds": symbol_cfg.fresh_quote_age_seconds,
         "cached_snapshot_age_seconds": symbol_cfg.cached_snapshot_age_seconds,
-        "candidate_reason": symbol_cfg.candidate_reason,
         "claimed_by_worker": symbol_cfg.claimed_by_worker,
     }
 
@@ -2780,9 +2922,19 @@ def _claimed_no_order_reason_from_block_code(code: Any, message: Any = None) -> 
         return "risk_manager_rejected"
     if text in {
         "kis_account_rate_limited",
+        "account_rate_limited",
         "kis_token_unavailable_rate_limited",
+        "token_rate_limited",
         "kis_cash_or_buying_power_zero",
     }:
+        if text == "account_rate_limited":
+            return "kis_account_rate_limited"
+        if text == "token_rate_limited":
+            return "kis_token_unavailable_rate_limited"
+        return text
+    if text in {"cash_unavailable", "total_cash_zero", "buying_power_zero"}:
+        return "kis_cash_or_buying_power_zero"
+    if text in {"account_config_missing", "kis_balance_sync_failed"}:
         return text
     if text in {
         "duplicate_scan_symbol_side",
@@ -3246,7 +3398,8 @@ def _apply_order_sizing_defaults(
             updates["take_profit"] = levels["take_profit"]
         if symbol_cfg.trailing_stop is None and levels["trailing_stop"] is not None:
             updates["trailing_stop"] = levels["trailing_stop"]
-    return symbol_cfg.model_copy(update=updates) if updates else symbol_cfg
+    updated = symbol_cfg.model_copy(update=updates) if updates else symbol_cfg
+    return _apply_broker_paper_bootstrap_order_cap(req, updated)
 
 
 def _to_live_order_request(

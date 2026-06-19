@@ -4,7 +4,11 @@ import sqlite3
 
 from app.brokers.kis_client import KisApiError
 from app.trading import broker_sync_worker
-from app.trading.broker_sync import record_kis_sync, sync_kis_account
+from app.trading.broker_sync import (
+    broker_account_check_from_sync_result,
+    record_kis_sync,
+    sync_kis_account,
+)
 
 
 def test_record_kis_sync_stores_positions_and_executions(tmp_path):
@@ -263,6 +267,50 @@ def test_sync_kis_account_returns_account_backoff_for_egw00201():
     assert result["recoverable"] is True
     assert result["kis_account"]["kis_account_rate_limited"] is True
     assert "config" not in result["status"]
+
+
+def test_broker_account_check_marks_account_rate_limit():
+    check = broker_account_check_from_sync_result(
+        {"status": "account_backoff", "message": "kis_account_rate_limited"}
+    )
+
+    assert check["status"] == "rate_limited"
+    assert check["rate_limited"] is True
+    assert check["account_rate_limited"] is True
+    assert check["block_reason"] == "account_rate_limited"
+
+
+def test_broker_account_check_marks_total_cash_zero():
+    check = broker_account_check_from_sync_result(
+        {
+            "status": "success",
+            "account_no": "50189471",
+            "total_cash": 0,
+            "total_value": 0,
+            "raw_cash_fields": {"dnca_tot_amt": "0"},
+            "synced_at": "2026-06-11T09:00:00",
+        }
+    )
+
+    assert check["status"] == "blocked"
+    assert check["connected"] is True
+    assert check["block_reason"] == "total_cash_zero"
+
+
+def test_broker_account_check_marks_cash_fields_missing():
+    check = broker_account_check_from_sync_result(
+        {
+            "status": "success",
+            "account_no": "50189471",
+            "position_count": 0,
+            "execution_count": 0,
+            "raw_cash_fields": {},
+            "synced_at": "2026-06-11T09:00:00",
+        }
+    )
+
+    assert check["status"] == "blocked"
+    assert check["block_reason"] == "cash_unavailable"
 
 
 def test_broker_sync_once_does_not_reconcile_when_sync_has_config_error(monkeypatch):

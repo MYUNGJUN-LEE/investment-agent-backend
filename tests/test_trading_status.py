@@ -10,7 +10,7 @@ from app.config import settings
 from app.main import app
 from app.models import AutoTradeStartRequest, PaperRunRequest
 from app.brokers.kis_client import KisClient
-from app.trading import auto_trading, edge_calibration, execution_status, paper_trading, risk_manager
+from app.trading import auto_trading, broker_sync, edge_calibration, execution_status, paper_trading, risk_manager
 from app.trading import auto_trading_store
 from app.trading import universe_scanner
 from app.workers import trading_worker
@@ -211,9 +211,17 @@ def test_active_paper_session_mismatch_requires_restart(tmp_path, monkeypatch):
 
     assert status["resolved_execution_mode"] == "broker_paper"
     assert status["active_session_execution_mode"] == "paper"
+    assert status["active_session_id"]
+    assert status["active_session_status"] == "active"
+    assert status["active_sessions"][0]["execution_mode"] == "paper"
     assert status["session_mode_mismatch"] is True
+    assert status["session_mode_mismatch_message"] == (
+        "Active session is still running in paper mode; restart the session "
+        "to apply broker_paper mode."
+    )
     assert status["requires_session_restart"] is True
     assert status["broker_submit_enabled"] is False
+    assert status["broker_submit_block_reason"] == "session_mode_mismatch"
 
 
 def test_trading_restart_stops_stale_paper_session_and_starts_broker_paper(
@@ -502,6 +510,45 @@ def test_broker_paper_status_blocks_submit_during_kis_account_backoff(
     assert status["broker_submit_blocked"] is True
     assert status["broker_submit_block_reason"] == "kis_account_rate_limited"
     assert status["broker_submit_block_code"] == "kis_account_rate_limited"
+    assert status["broker_account_check"]["status"] == "rate_limited"
+    assert status["broker_account_check"]["account_rate_limited"] is True
+    assert status["broker_account_check"]["block_reason"] == "account_rate_limited"
+    assert status["submits_to_broker"] is False
+
+
+def test_broker_paper_status_exposes_zero_cash_account_check(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_data_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "kis_is_paper", True)
+    monkeypatch.setattr(settings, "kis_app_key", "account-app-key")
+    monkeypatch.setattr(settings, "kis_app_secret", "account-app-secret")
+    monkeypatch.setattr(settings, "kis_account_no", "12345678")
+    monkeypatch.setattr(settings, "kis_account_product_code", "01")
+    broker_sync.record_kis_sync(
+        balance={
+            "output1": [],
+            "output2": [
+                {
+                    "dnca_tot_amt": "0",
+                    "ord_psbl_cash": "0",
+                    "tot_evlu_amt": "0",
+                }
+            ],
+        },
+        executions={"output1": []},
+        account_no="12345678",
+        db_path=settings.storage_path(settings.broker_sync_db_path),
+    )
+
+    status = execution_status.trading_status_snapshot(execution_mode="broker_paper")
+
+    assert status["broker_account_check"]["connected"] is True
+    assert status["broker_account_check"]["total_cash"] == 0
+    assert status["broker_account_check"]["block_reason"] == "total_cash_zero"
+    assert status["broker_submit_blocked"] is True
+    assert status["broker_submit_block_reason"] == "total_cash_zero"
     assert status["submits_to_broker"] is False
 
 

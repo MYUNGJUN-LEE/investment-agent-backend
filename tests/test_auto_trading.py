@@ -588,6 +588,29 @@ def test_broker_paper_observe_only_gate_creates_planned_entry(monkeypatch):
     assert [symbol.symbol for symbol in plan["entry_symbols"]] == ["005930"]
 
 
+def test_broker_paper_relaxed_bootstrap_cap_preserves_one_share(monkeypatch):
+    monkeypatch.setattr(settings, "broker_paper_bootstrap_order_size_multiplier", 0.20)
+    monkeypatch.setattr(settings, "broker_paper_bootstrap_max_order_amount_krw", 100_000.0)
+    symbol_cfg = AutoTradeSymbolConfig(
+        symbol="005930",
+        market="KR",
+        strategy_type="swing",
+        requested_action="entry",
+        price=75_000,
+        account_equity=10_000_000,
+        cash_available=100_000,
+        broker_paper_bootstrap_relaxed=True,
+    )
+
+    capped = auto_trading._apply_broker_paper_bootstrap_order_cap(
+        AutoTradeStartRequest(execution_mode="broker_paper"),
+        symbol_cfg,
+    )
+
+    assert capped.cash_available == 75_000
+    assert capped.position_size == 0.0075
+
+
 def test_orchestrator_caps_position_near_ten_percent_and_weights_edge(monkeypatch):
     monkeypatch.setattr(
         auto_trading.risk_manager,

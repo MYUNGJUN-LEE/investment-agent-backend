@@ -764,6 +764,67 @@ def test_claimed_broker_paper_candidate_records_no_order_reason(
     assert result["post_claim_diagnostics"]["risk_approved"] is False
 
 
+def test_claimed_broker_paper_candidate_records_account_block_diagnostics(
+    tmp_path,
+    monkeypatch,
+):
+    _use_tmp_kis_paper_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        auto_trading,
+        "broker_paper_safety_check",
+        lambda **kwargs: {"approved": True, "broker_submit_blocked": False},
+    )
+    monkeypatch.setattr(
+        auto_trading.broker_sync,
+        "sync_kis_account",
+        lambda **kwargs: {
+            "status": "success",
+            "account_no": "12345678",
+            "total_cash": 0,
+            "total_value": 0,
+            "raw_cash_fields": {"dnca_tot_amt": "0"},
+            "execution_count": 0,
+            "synced_at": "2026-06-06T09:00:00",
+        },
+    )
+
+    response = client.post(
+        "/auto-trading/run-once",
+        headers=_auth_headers(),
+        json={
+            "execution_mode": "broker_paper",
+            "broker_provider": "kis",
+            "auto_discover_symbols": False,
+            "symbols": [
+                {
+                    "symbol": "005930",
+                    "price": 75000,
+                    "quantity": 1,
+                    "claimed": True,
+                    "claim_time": "2026-06-06T09:00:00",
+                    "candidate_status": "CLAIMED",
+                    "candidate_decision": "buy_candidate",
+                    "candidate_reason": "test claimed candidate",
+                    "expected_gross_edge_bps": 100,
+                    "expected_win_bps": 100,
+                    "expected_loss_bps": 40,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["results"][-1]
+    assert result["claimed"] is True
+    assert result["broker_submit_attempted"] is False
+    assert result["claimed_no_order_reason"] == "kis_cash_or_buying_power_zero"
+    assert result["broker_account_block_reason"] == "total_cash_zero"
+    diagnostics = result["post_claim_diagnostics"]
+    assert diagnostics["candidate_reason"] == "test claimed candidate"
+    assert diagnostics["broker_account_check_status"] == "blocked"
+    assert diagnostics["broker_account_block_reason"] == "total_cash_zero"
+
+
 def test_claimed_broker_paper_candidate_blocked_by_open_order_has_diagnostics(
     tmp_path,
     monkeypatch,

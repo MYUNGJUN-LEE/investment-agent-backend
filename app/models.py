@@ -379,6 +379,12 @@ class AutoTradeSymbolConfig(BaseModel):
     candidate_status: str | None = None
     candidate_decision: str | None = None
     candidate_reason: str | None = None
+    entry_gate: dict[str, Any] | None = None
+    broker_paper_bootstrap_relaxed: bool = False
+    broker_paper_bootstrap_reason: str | None = None
+    broker_paper_bootstrap_thresholds: dict[str, Any] | None = None
+    broker_paper_bootstrap_order_size_multiplier: float | None = Field(None, ge=0)
+    broker_paper_bootstrap_max_order_amount_krw: float | None = Field(None, ge=0)
     fresh_quote_used: bool | None = None
     fresh_quote_age_seconds: float | None = None
     cached_snapshot_age_seconds: float | None = None
