@@ -26,6 +26,7 @@ from app.trading.edge_calibration import (
     edge_entry_gate,
     estimate_expected_edges,
     load_edge_model,
+    refresh_edge_training_samples,
 )
 from app.trading.market_safety import market_safety_check
 from app.trading.atr_exits import atr_exit_levels_from_price_data
@@ -427,6 +428,9 @@ def scan_universe_for_auto_trade(
         ),
         "symbols": symbols,
     }
+    edge_label_refresh = _edge_label_refresh_after_scan(path)
+    result["edge_label_refresh_after_scan"] = edge_label_refresh
+    result["label_refresh"] = edge_label_refresh
     _record_scan_run(path, result)
     return result
 
@@ -3578,18 +3582,36 @@ def _with_expected_value_scores(
     heuristic_risk = _estimate_expected_risk_penalty_bps(candidate, raw_score)
     calibrated = estimate_expected_edges(candidate, raw_score, model=edge_model)
     edge_model_name = (calibrated or {}).get("edge_model", "heuristic_v1")
-    expected_return = (
-        max(float(calibrated["expected_return"]), heuristic_return * 0.65)
-        if calibrated
-        else heuristic_return
-    )
-    expected_risk = (
-        min(float(calibrated["expected_risk"]), max(35.0, heuristic_risk * 1.10))
-        if calibrated
-        else heuristic_risk
-    )
+    calibration_confidence = _to_float((calibrated or {}).get("calibration_confidence"))
+    if calibration_confidence is None:
+        calibration_confidence = (
+            float(settings.edge_calibration_min_confidence_for_calibrated_edge or 0.5)
+            if calibrated
+            else 0.0
+        )
+    calibration_confidence = max(0.0, min(1.0, calibration_confidence))
+    optimistic_floor_used = False
     if calibrated:
-        edge_model_name = f"{edge_model_name}+heuristic_floor"
+        calibrated_return = float(calibrated["expected_return"])
+        calibrated_risk = float(calibrated["expected_risk"])
+        if bool(settings.edge_calibration_use_optimistic_heuristic_floor):
+            expected_return = max(calibrated_return, heuristic_return * 0.65)
+            expected_risk = min(calibrated_risk, max(35.0, heuristic_risk * 1.10))
+            optimistic_floor_used = True
+            edge_model_name = f"{edge_model_name}+heuristic_floor"
+        else:
+            expected_return = (
+                calibration_confidence * calibrated_return
+                + (1.0 - calibration_confidence) * heuristic_return
+            )
+            expected_risk = (
+                calibration_confidence * calibrated_risk
+                + (1.0 - calibration_confidence) * heuristic_risk
+            )
+            edge_model_name = f"{edge_model_name}+confidence_blend"
+    else:
+        expected_return = heuristic_return
+        expected_risk = heuristic_risk
     quality = _swing_edge_quality(candidate, raw_score)
     reward_risk = _atr_reward_risk_estimate(candidate, raw_score, quality["score"])
     if (
@@ -3627,7 +3649,33 @@ def _with_expected_value_scores(
         - float(quality["slippage_discount_bps"]),
     )
     liquidity_drag = float((calibrated or {}).get("liquidity_drag_bps") or 0.0)
-    net_edge = (expected_return - expected_risk * EDGE_RISK_WEIGHT - trading_cost - slippage_cost - liquidity_drag)
+    formula_net_edge = (
+        expected_return
+        - expected_risk * EDGE_RISK_WEIGHT
+        - trading_cost
+        - slippage_cost
+        - liquidity_drag
+    )
+    predicted_net_edge_direct = _to_float(
+        (calibrated or {}).get("predicted_net_edge_direct")
+    )
+    net_edge_direct_weight = _to_float((calibrated or {}).get("net_edge_direct_weight"))
+    if predicted_net_edge_direct is not None and net_edge_direct_weight is not None:
+        net_edge = (
+            net_edge_direct_weight * predicted_net_edge_direct
+            + (1.0 - net_edge_direct_weight) * formula_net_edge
+        )
+    else:
+        net_edge = formula_net_edge
+    recent_ic = _to_float((calibrated or {}).get("recent_ic"))
+    ic_edge_multiplier = _to_float((calibrated or {}).get("ic_edge_multiplier")) or 1.0
+    if recent_ic is not None and recent_ic < 0:
+        net_edge *= ic_edge_multiplier
+    ranking_mode = str((calibrated or {}).get("ranking_mode") or "heuristic")
+    if recent_ic is not None and recent_ic < float(
+        settings.edge_calibration_defensive_fallback_ic_threshold or -0.05
+    ):
+        ranking_mode = "defensive_fallback"
 
     expected_return_score = _score_bps(expected_return, cap_bps=350)
     net_edge_score = _score_bps(net_edge, cap_bps=250)
@@ -3681,6 +3729,23 @@ def _with_expected_value_scores(
         "edge_reward_risk": reward_risk,
         "large_cap_top10_gate": large_cap_gate,
         "liquidity_drag_bps": round(liquidity_drag, 4),
+        "predicted_net_edge_direct": (
+            round(predicted_net_edge_direct, 4)
+            if predicted_net_edge_direct is not None
+            else None
+        ),
+        "formula_net_edge": round(formula_net_edge, 4),
+        "final_net_edge": round(net_edge, 4),
+        "net_edge_direct_weight": (
+            round(net_edge_direct_weight, 4)
+            if net_edge_direct_weight is not None
+            else 0.0
+        ),
+        "calibration_confidence": round(calibration_confidence, 4),
+        "ranking_mode": ranking_mode,
+        "recent_ic": round(recent_ic, 6) if recent_ic is not None else None,
+        "ic_edge_multiplier": round(ic_edge_multiplier, 4),
+        "optimistic_heuristic_floor_used": optimistic_floor_used,
     }
 
 
@@ -4749,6 +4814,38 @@ def _record_scan_run(path: Path, result: dict[str, Any]) -> None:
             )
 
     sqlite_write_with_retry(operation)
+
+
+def _edge_label_refresh_after_scan(path: Path) -> dict[str, Any]:
+    enabled = bool(
+        settings.edge_calibration_enabled
+        and settings.edge_calibration_refresh_after_scan
+    )
+    if not enabled:
+        return {
+            "enabled": False,
+            "status": "skipped",
+            "message": "Edge calibration refresh after scan is disabled",
+        }
+    try:
+        refresh = refresh_edge_training_samples(
+            universe_db_path=path,
+            candidate_limit=max(
+                1,
+                int(settings.edge_calibration_refresh_after_scan_limit or 200),
+            ),
+        )
+        return {
+            "enabled": True,
+            **refresh,
+        }
+    except Exception as exc:
+        logger.warning("edge label refresh after scan failed: %s", exc)
+        return {
+            "enabled": True,
+            "status": "error",
+            "message": str(exc),
+        }
 
 
 def _serializable_result(result: dict[str, Any]) -> dict[str, Any]:

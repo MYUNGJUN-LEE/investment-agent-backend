@@ -237,6 +237,19 @@ EXPECTED_NET_EDGE_FORMULA = (
     "- trading_cost_bps - slippage_cost_bps - liquidity_drag_bps"
 )
 
+DEFAULT_NET_EDGE_COEFFICIENTS = {
+    feature: (
+        float(DEFAULT_RETURN_COEFFICIENTS.get(feature, 0.0))
+        - float(DEFAULT_RISK_COEFFICIENTS.get(feature, 0.0)) * EXPECTED_RISK_WEIGHT
+        - (
+            DEFAULT_ROUND_TRIP_TRADING_COST_BPS + MAX_ALLOWED_SLIPPAGE_BPS
+            if feature == "bias"
+            else 0.0
+        )
+    )
+    for feature in FEATURE_NAMES
+}
+
 EXECUTABLE_EDGE_SAMPLE_STATUSES = {
     "BUY",
     "BUY_CANDIDATE",
@@ -409,6 +422,7 @@ def estimate_expected_edges(
     model = model or load_edge_model()
     return_coefficients = model.get("expected_return")
     risk_coefficients = model.get("expected_risk")
+    net_edge_coefficients = model.get("expected_net_edge")
     if not return_coefficients or not risk_coefficients:
         return None
 
@@ -436,12 +450,38 @@ def estimate_expected_edges(
     expected_return = max(0.0, min(500.0, expected_return))
     expected_risk = max(0.0, min(500.0, expected_risk))
 
-    expected_net_edge = estimate_expected_net_edge_bps(
+    formula_net_edge = estimate_expected_net_edge_bps(
         expected_return_bps=expected_return,
         expected_risk_bps=expected_risk,
         trading_cost_bps=trading_cost_bps,
         slippage_cost_bps=slippage_cost_bps,
         liquidity_drag_bps=liquidity_drag_bps,
+    )
+    predicted_net_edge_direct = (
+        _predict(net_edge_coefficients, feature_map)
+        if net_edge_coefficients
+        else None
+    )
+    model_sample_count = _model_sample_count(model)
+    direct_weight = 0.0
+    if predicted_net_edge_direct is not None:
+        direct_weight = (
+            0.7
+            if model_sample_count >= int(settings.edge_calibration_bootstrap_sample_threshold or 600)
+            else 0.3
+        )
+    expected_net_edge = (
+        direct_weight * float(predicted_net_edge_direct or 0.0)
+        + (1.0 - direct_weight) * formula_net_edge
+    )
+    calibration_confidence = _calibration_confidence_from_model(model)
+    recent_ic = _model_recent_ic(model)
+    ic_multiplier = _ic_edge_multiplier(recent_ic)
+    ranking_mode = (
+        "defensive_fallback"
+        if recent_ic is not None
+        and recent_ic < float(settings.edge_calibration_defensive_fallback_ic_threshold or -0.05)
+        else ("blended" if calibration_confidence < 1.0 else "calibrated")
     )
 
     total_cost_bps = trading_cost_bps + slippage_cost_bps + liquidity_drag_bps
@@ -452,6 +492,17 @@ def estimate_expected_edges(
 
         # Net edge after cost/risk adjustment
         "expected_net_edge": round(expected_net_edge, 4),
+        "predicted_net_edge_direct": _round_optional(predicted_net_edge_direct),
+        "formula_net_edge": round(formula_net_edge, 4),
+        "final_net_edge": round(expected_net_edge, 4),
+        "net_edge_direct_weight": round(direct_weight, 4),
+        "net_edge_model_available": predicted_net_edge_direct is not None,
+        "training_sample_count": model_sample_count,
+        "calibration_confidence": round(calibration_confidence, 4),
+        "recent_ic": _round_optional(recent_ic),
+        "ic_edge_multiplier": round(ic_multiplier, 4),
+        "ranking_mode": ranking_mode,
+        "optimistic_heuristic_floor_used": False,
 
         # Cost breakdown
         "trading_cost_bps": round(trading_cost_bps, 4),
@@ -469,7 +520,7 @@ def estimate_expected_edges(
         "total_cost_bps": round(total_cost_bps, 4),
 
         "expected_net_edge_formula": EXPECTED_NET_EDGE_FORMULA,
-        "edge_model": "calibrated_ridge_v2_cost_adjusted",
+        "edge_model": "calibrated_ridge_v3_direct_net_edge",
         "fill_adjustment": round(fill_adjustment, 4),
     }
 
@@ -489,11 +540,100 @@ def _is_executable_edge_sample_status(value: Any) -> bool:
     return status in EXECUTABLE_EDGE_SAMPLE_STATUSES
 
 
+def _sample_weight_multiplier_for_status(value: Any) -> float:
+    status = _normalize_sample_status(value)
+    if status in CALIBRATION_ONLY_EDGE_SAMPLE_STATUSES:
+        return max(
+            0.0,
+            float(settings.edge_calibration_observe_only_sample_weight or 0.5),
+        )
+    if status in RISK_REJECTED_EDGE_SAMPLE_STATUSES:
+        return max(
+            0.0,
+            float(settings.edge_calibration_risk_rejected_sample_weight or 0.25),
+        )
+    return 1.0
+
+
+def _sample_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT UPPER(COALESCE(status, '')) AS status, COUNT(*) AS sample_count
+        FROM edge_training_samples
+        GROUP BY UPPER(COALESCE(status, ''))
+        """
+    ).fetchall()
+    return {str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in rows}
+
+
+def _edge_training_scope_from_counts(
+    *,
+    eligible_count: int,
+    observed_count: int,
+) -> dict[str, Any]:
+    threshold = max(
+        1,
+        int(settings.edge_calibration_bootstrap_sample_threshold or 600),
+    )
+    include_observed = bool(
+        settings.edge_calibration_include_observed_statuses_during_bootstrap
+    ) and eligible_count < threshold
+    training_count = observed_count if include_observed else eligible_count
+    return {
+        "where_sql": (
+            OBSERVED_EDGE_SAMPLE_STATUS_SQL
+            if include_observed
+            else ELIGIBLE_EDGE_SAMPLE_STATUS_SQL
+        ),
+        "eligible_sample_count": int(eligible_count or 0),
+        "observed_sample_count": int(observed_count or 0),
+        "training_sample_count": int(training_count or 0),
+        "bootstrap_observed_statuses_included": include_observed,
+        "bootstrap_sample_threshold": threshold,
+    }
+
+
+def _edge_training_scope(conn: sqlite3.Connection) -> dict[str, Any]:
+    eligible_count = int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM edge_training_samples WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}"
+        ).fetchone()[0]
+        or 0
+    )
+    observed_count = int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM edge_training_samples WHERE {OBSERVED_EDGE_SAMPLE_STATUS_SQL}"
+        ).fetchone()[0]
+        or 0
+    )
+    scope = _edge_training_scope_from_counts(
+        eligible_count=eligible_count,
+        observed_count=observed_count,
+    )
+    scope["sample_count_by_status"] = _sample_status_counts(conn)
+    return scope
+
+
+def _edge_training_scope_for_path(path: Path) -> dict[str, Any]:
+    initialize_edge_calibration_db(path)
+    with sqlite3.connect(path) as conn:
+        return _edge_training_scope(conn)
+
+
 def _row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
     try:
         return row[key]
     except (KeyError, IndexError):
         return default
+
+
+def _increment_reason(target: dict[str, Any], key: str, reason: str) -> None:
+    bucket = target.get(key)
+    if not isinstance(bucket, dict):
+        bucket = {}
+        target[key] = bucket
+    normalized = str(reason or "unknown")
+    bucket[normalized] = int(bucket.get(normalized) or 0) + 1
 
 
 def _net_edge_label_components(payload: dict[str, Any]) -> dict[str, Any]:
@@ -667,6 +807,7 @@ def refresh_edge_training_samples(
     )
     snapshot_sync = _append_labeling_price_snapshots(
         universe_path=universe_path,
+        calibration_path=calibration_path,
         horizon_seconds=resolved_horizon,
     )
     refresh_result = _refresh_training_samples(
@@ -722,6 +863,7 @@ def calibrate_edge_model(
 
     snapshot_sync = _append_labeling_price_snapshots(
         universe_path=universe_path,
+        calibration_path=calibration_path,
         horizon_seconds=horizon_seconds,
     )
     refresh_result = _refresh_training_samples(
@@ -743,12 +885,20 @@ def calibrate_edge_model(
     dimension = len(FEATURE_NAMES)
     return_matrix = _ridge_matrix(dimension, ridge_lambda)
     risk_matrix = _ridge_matrix(dimension, ridge_lambda)
+    net_edge_matrix = _ridge_matrix(dimension, ridge_lambda)
     return_vector = [0.0] * dimension
     risk_vector = [0.0] * dimension
+    net_edge_vector = [0.0] * dimension
 
     train_samples, oos_samples = _performance_split(samples)
     for sample in train_samples:
-        features, realized_return_bps, realized_risk_bps, sample_weight = sample
+        (
+            features,
+            realized_return_bps,
+            realized_risk_bps,
+            realized_net_edge_bps,
+            sample_weight,
+        ) = sample
         _accumulate(
             return_matrix,
             return_vector,
@@ -761,6 +911,13 @@ def calibrate_edge_model(
             risk_vector,
             features,
             realized_risk_bps,
+            weight=sample_weight,
+        )
+        _accumulate(
+            net_edge_matrix,
+            net_edge_vector,
+            features,
+            realized_net_edge_bps,
             weight=sample_weight,
         )
 
@@ -779,6 +936,7 @@ def calibrate_edge_model(
             "horizon_seconds": horizon_seconds,
             "refresh": refresh_result,
             "label_snapshot_sync": snapshot_sync,
+            "training_sample_scope": _edge_training_scope_for_path(calibration_path),
             "gate": gate,
         }
         _record_run(calibration_path, result)
@@ -786,6 +944,7 @@ def calibrate_edge_model(
 
     fitted_return = _coefficients_from_solution(_solve(return_matrix, return_vector))
     fitted_risk = _coefficients_from_solution(_solve(risk_matrix, risk_vector))
+    fitted_net_edge = _coefficients_from_solution(_solve(net_edge_matrix, net_edge_vector))
     previous = load_edge_model(calibration_db_path=calibration_path, include_defaults=True)
     blended_return = _blend_coefficients(
         previous.get("expected_return", DEFAULT_RETURN_COEFFICIENTS),
@@ -797,18 +956,29 @@ def calibrate_edge_model(
         fitted_risk,
         blend=blend,
     )
+    blended_net_edge = _blend_coefficients(
+        previous.get("expected_net_edge", DEFAULT_NET_EDGE_COEFFICIENTS),
+        fitted_net_edge,
+        blend=blend,
+    )
     train_metrics = _model_metrics_for_samples(
         train_samples,
         return_coefficients=blended_return,
         risk_coefficients=blended_risk,
+        net_edge_coefficients=blended_net_edge,
     )
     oos_metrics = _model_metrics_for_samples(
         oos_samples,
         return_coefficients=blended_return,
         risk_coefficients=blended_risk,
+        net_edge_coefficients=blended_net_edge,
     )
     top10_performance = _top10_performance_from_store(calibration_path=calibration_path)
     _record_top10_performance(calibration_path, top10_performance)
+    ic_metrics = _recent_ic_from_store(
+        calibration_path=calibration_path,
+        limit=300,
+    )
     fill_adjustment = record_fill_adjustment_from_fills(
         calibration_db_path=calibration_path,
     )
@@ -819,6 +989,7 @@ def calibrate_edge_model(
         mae_risk_bps=oos_metrics["mae_risk_bps"],
         top10_performance=top10_performance,
         fill_adjustment=fill_adjustment,
+        ic_metrics=ic_metrics,
     )
     result = {
         "status": "success",
@@ -830,15 +1001,20 @@ def calibrate_edge_model(
         "horizon_seconds": horizon_seconds,
         "mae_return_bps": oos_metrics["mae_return_bps"],
         "mae_risk_bps": oos_metrics["mae_risk_bps"],
+        "mae_net_edge_direct_bps": oos_metrics["mae_net_edge_direct_bps"],
+        "mae_net_edge_formula_bps": oos_metrics["mae_net_edge_formula_bps"],
+        "mae_net_edge_blended_bps": oos_metrics["mae_net_edge_blended_bps"],
         "train_metrics": train_metrics,
         "oos_metrics": oos_metrics,
         "top10_performance": top10_performance,
+        "ic_metrics": ic_metrics,
         "fill_adjustment": fill_adjustment,
         "gate": gate,
         "refresh": refresh_result,
         "label_snapshot_sync": snapshot_sync,
         "blend": blend,
-        "coefficient_count": len(FEATURE_NAMES) * 2,
+        "training_sample_scope": _edge_training_scope_for_path(calibration_path),
+        "coefficient_count": len(FEATURE_NAMES) * 3,
     }
     run_id = _record_run(calibration_path, result)
     _store_coefficients(
@@ -846,6 +1022,7 @@ def calibrate_edge_model(
         run_id=run_id,
         return_coefficients=blended_return,
         risk_coefficients=blended_risk,
+        net_edge_coefficients=blended_net_edge,
         updated_at=now,
     )
     _write_meta(calibration_path, "last_success_at", now)
@@ -862,6 +1039,14 @@ def get_edge_calibration_status(
             "status": "empty",
             "message": "No edge calibration DB has been created yet",
             "enabled": settings.edge_calibration_enabled,
+            "stored_sample_count": 0,
+            "eligible_sample_count": 0,
+            "observed_sample_count": 0,
+            "training_sample_count": 0,
+            "bootstrap_observed_statuses_included": bool(
+                settings.edge_calibration_include_observed_statuses_during_bootstrap
+            ),
+            "sample_count_by_status": {},
         }
     initialize_edge_calibration_db(path)
     with sqlite3.connect(path) as conn:
@@ -877,14 +1062,20 @@ def get_edge_calibration_status(
         coefficient_count = conn.execute(
             "SELECT COUNT(*) FROM edge_coefficients"
         ).fetchone()[0]
-        stored_sample_count = conn.execute(
-            f"SELECT COUNT(*) FROM edge_training_samples WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}"
-        ).fetchone()[0]
+        training_scope = _edge_training_scope(conn)
+        stored_sample_count = training_scope["training_sample_count"]
     return {
         "status": "ready" if coefficient_count else "empty",
         "enabled": settings.edge_calibration_enabled,
         "coefficient_count": int(coefficient_count or 0),
         "stored_sample_count": int(stored_sample_count or 0),
+        "eligible_sample_count": training_scope["eligible_sample_count"],
+        "observed_sample_count": training_scope["observed_sample_count"],
+        "training_sample_count": training_scope["training_sample_count"],
+        "bootstrap_observed_statuses_included": training_scope[
+            "bootstrap_observed_statuses_included"
+        ],
+        "sample_count_by_status": training_scope["sample_count_by_status"],
         "last_run": dict(run) if run else None,
         "latest_gate": _latest_raw_json(path, "gate"),
         "latest_top10_performance": (
@@ -912,6 +1103,13 @@ def get_edge_training_sample_summary(
             "status": "empty",
             "message": _empty_sample_message(diagnostics),
             "sample_count": 0,
+            "eligible_sample_count": 0,
+            "observed_sample_count": 0,
+            "training_sample_count": 0,
+            "bootstrap_observed_statuses_included": bool(
+                settings.edge_calibration_include_observed_statuses_during_bootstrap
+            ),
+            "sample_count_by_status": {},
             "summary": _empty_sample_summary(),
             "top10_performance": _empty_top10_performance(),
             "net_edge_aggregate_splits": _empty_net_edge_aggregate_splits(),
@@ -927,6 +1125,8 @@ def get_edge_training_sample_summary(
     limit = max(1, min(int(limit or 20), 100))
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
+        training_scope = _edge_training_scope(conn)
+        training_where_sql = str(training_scope["where_sql"])
         aggregate = conn.execute(
             f"""
             WITH canonical AS (
@@ -939,7 +1139,7 @@ def get_edge_training_sample_summary(
                             ORDER BY observed_at ASC, id ASC
                         ) AS symbol_horizon_rank
                     FROM edge_training_samples
-                    WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                    WHERE {training_where_sql}
                 )
                 WHERE symbol_horizon_rank = 1
             )
@@ -1027,7 +1227,7 @@ def get_edge_training_sample_summary(
                             ORDER BY observed_at ASC, id ASC
                         ) AS symbol_horizon_rank
                     FROM edge_training_samples
-                    WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                    WHERE {training_where_sql}
                 )
                 WHERE symbol_horizon_rank = 1
             )
@@ -1059,7 +1259,7 @@ def get_edge_training_sample_summary(
                             ORDER BY observed_at ASC, id ASC
                         ) AS symbol_horizon_rank
                     FROM edge_training_samples
-                    WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                    WHERE {training_where_sql}
                 )
                 WHERE symbol_horizon_rank = 1
             )
@@ -1094,6 +1294,13 @@ def get_edge_training_sample_summary(
             else _empty_sample_message(diagnostics)
         ),
         "sample_count": summary["sample_count"],
+        "eligible_sample_count": training_scope["eligible_sample_count"],
+        "observed_sample_count": training_scope["observed_sample_count"],
+        "training_sample_count": training_scope["training_sample_count"],
+        "bootstrap_observed_statuses_included": training_scope[
+            "bootstrap_observed_statuses_included"
+        ],
+        "sample_count_by_status": training_scope["sample_count_by_status"],
         "summary": summary,
         "top10_performance": top10_performance,
         "net_edge_aggregate_splits": net_edge_aggregate_splits,
@@ -1112,6 +1319,11 @@ def get_edge_data_diagnostics(
     calibration_path = _db_path(calibration_db_path)
     universe_path = settings.storage_path(settings.universe_scanner_db_path)
     auto_path = settings.storage_path(settings.auto_trading_db_path)
+    training_scope = (
+        _edge_training_scope_for_path(calibration_path)
+        if calibration_path.exists()
+        else _edge_training_scope_from_counts(eligible_count=0, observed_count=0)
+    )
     return {
         "calibration_db_path": str(calibration_path),
         "calibration_db_exists": calibration_path.exists(),
@@ -1123,6 +1335,13 @@ def get_edge_data_diagnostics(
             calibration_path,
             f"SELECT COUNT(*) FROM edge_training_samples WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}",
         ),
+        "eligible_sample_count": training_scope["eligible_sample_count"],
+        "observed_sample_count": training_scope["observed_sample_count"],
+        "training_sample_count": training_scope["training_sample_count"],
+        "bootstrap_observed_statuses_included": training_scope[
+            "bootstrap_observed_statuses_included"
+        ],
+        "sample_count_by_status": training_scope.get("sample_count_by_status", {}),
         "edge_top10_sample_count": _safe_sqlite_scalar(
             calibration_path,
             f"""
@@ -1219,9 +1438,9 @@ def load_edge_model(
     *,
     calibration_db_path: Path | str | None = None,
     include_defaults: bool = False,
-) -> dict[str, dict[str, float]]:
+) -> dict[str, Any]:
     path = _db_path(calibration_db_path)
-    model: dict[str, dict[str, float]] = {}
+    model: dict[str, Any] = {}
     if path.exists():
         initialize_edge_calibration_db(path)
         with connect_sqlite(path) as conn:
@@ -1231,13 +1450,41 @@ def load_edge_model(
                 FROM edge_coefficients
                 """
             ).fetchall()
+            latest_run = conn.execute(
+                """
+                SELECT sample_count, oos_sample_count, raw_json
+                FROM edge_calibration_runs
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
         for target, feature, coefficient in rows:
             model.setdefault(str(target), {})[str(feature)] = float(coefficient)
+        if latest_run:
+            raw = _parse_json(latest_run[2], {})
+            if not isinstance(raw, dict):
+                raw = {}
+            oos_metrics = raw.get("oos_metrics") if isinstance(raw.get("oos_metrics"), dict) else {}
+            top10 = raw.get("top10_performance") if isinstance(raw.get("top10_performance"), dict) else {}
+            model["_meta"] = {
+                "sample_count": int(latest_run[0] or raw.get("sample_count") or 0),
+                "oos_sample_count": int(latest_run[1] or raw.get("oos_sample_count") or 0),
+                "mae_net_edge_blended_bps": _to_float(
+                    raw.get("mae_net_edge_blended_bps")
+                    or oos_metrics.get("mae_net_edge_blended_bps")
+                    or top10.get("mae_net_edge_error_bps")
+                ),
+                "recent_ic": _to_float((raw.get("ic_metrics") or {}).get("ic"))
+                if isinstance(raw.get("ic_metrics"), dict)
+                else None,
+            }
     if include_defaults:
         if "expected_return" not in model:
             model["expected_return"] = dict(DEFAULT_RETURN_COEFFICIENTS)
         if "expected_risk" not in model:
             model["expected_risk"] = dict(DEFAULT_RISK_COEFFICIENTS)
+        if "expected_net_edge" not in model:
+            model["expected_net_edge"] = dict(DEFAULT_NET_EDGE_COEFFICIENTS)
     return model
 
 def _clamp(value: float, lower: float, upper: float) -> float:
@@ -1347,6 +1594,7 @@ def _recent_ic_from_store(
 
     with sqlite3.connect(calibration_path) as conn:
         conn.row_factory = sqlite3.Row
+        training_where_sql = str(_edge_training_scope(conn)["where_sql"])
         rows = conn.execute(
             f"""
             SELECT
@@ -1361,7 +1609,7 @@ def _recent_ic_from_store(
                 realized_net_edge_bps
             FROM edge_training_samples
             WHERE net_edge_bps IS NOT NULL
-              AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+              AND {training_where_sql}
             ORDER BY observed_at DESC, id DESC
             LIMIT ?
             """,
@@ -1563,13 +1811,8 @@ def edge_entry_gate(
 
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        stored_sample_count = conn.execute(
-            f"""
-            SELECT COUNT(*)
-            FROM edge_training_samples
-            WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
-            """
-        ).fetchone()[0]
+        training_scope = _edge_training_scope(conn)
+        stored_sample_count = training_scope["training_sample_count"]
         run = conn.execute(
             """
             SELECT *
@@ -1611,7 +1854,8 @@ def edge_entry_gate(
     )
 
     return _apply_broker_paper_calibration_policy(
-        _gate_from_metrics(
+        {
+            **_gate_from_metrics(
             sample_count=int(stored_sample_count or run["sample_count"] or 0),
             oos_sample_count=int(raw.get("oos_sample_count") or run["oos_sample_count"] or 0),
             mae_return_bps=_to_float(run["mae_return_bps"]),
@@ -1621,7 +1865,15 @@ def edge_entry_gate(
             ic_metrics=ic_metrics,
             candidates=candidates,
             execution_mode=execution_mode,
-        ),
+            ),
+            "eligible_sample_count": training_scope["eligible_sample_count"],
+            "observed_sample_count": training_scope["observed_sample_count"],
+            "training_sample_count": training_scope["training_sample_count"],
+            "bootstrap_observed_statuses_included": training_scope[
+                "bootstrap_observed_statuses_included"
+            ],
+            "sample_count_by_status": training_scope["sample_count_by_status"],
+        },
         execution_mode=execution_mode,
     )
 
@@ -1856,6 +2108,21 @@ def label_policy_summary() -> dict[str, Any]:
             settings.edge_calibration_label_horizon_tolerance_seconds or 0
         ),
         "refresh_after_scan": bool(settings.edge_calibration_refresh_after_scan),
+        "refresh_after_scan_limit": int(
+            settings.edge_calibration_refresh_after_scan_limit or 200
+        ),
+        "late_label_backfill_enabled": bool(
+            settings.edge_calibration_late_label_backfill_enabled
+        ),
+        "late_label_min_age_seconds": int(
+            settings.edge_calibration_late_label_min_age_seconds or 0
+        ),
+        "late_label_max_age_seconds": int(
+            settings.edge_calibration_late_label_max_age_seconds or 0
+        ),
+        "late_label_sample_weight": float(
+            settings.edge_calibration_late_label_sample_weight or 0.5
+        ),
         "label_price_rule": (
             "Wait until the horizon has elapsed, then use eligible snapshots "
             "near the horizon timestamp."
@@ -1911,6 +2178,76 @@ def _label_window_contains_now(scan_time: str, horizon_seconds: int) -> bool:
     return start_dt <= now <= end_dt
 
 
+def _late_backfill_candidate_state(
+    scan_time: str,
+    horizon_seconds: int,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if not settings.edge_calibration_late_label_backfill_enabled:
+        return {"eligible": False, "reason": "disabled"}
+    try:
+        scan_dt = datetime.fromisoformat(str(scan_time))
+    except (TypeError, ValueError):
+        return {"eligible": False, "reason": "invalid_scan_time"}
+
+    now_dt = now or datetime.now()
+    age_seconds = (now_dt - scan_dt).total_seconds()
+    min_age = max(
+        0,
+        int(
+            settings.edge_calibration_late_label_min_age_seconds
+            or settings.edge_calibration_horizon_seconds
+            or horizon_seconds
+        ),
+    )
+    max_age = max(
+        min_age,
+        int(settings.edge_calibration_late_label_max_age_seconds or 7 * 86400),
+    )
+    horizon_dt = scan_dt + timedelta(seconds=max(60, int(horizon_seconds or 86400)))
+    late_by_seconds = max(0.0, (now_dt - horizon_dt).total_seconds())
+    if age_seconds < min_age:
+        return {
+            "eligible": False,
+            "reason": "too_young",
+            "age_seconds": round(age_seconds, 4),
+            "min_age_seconds": min_age,
+            "late_by_seconds": round(late_by_seconds, 4),
+        }
+    if age_seconds > max_age:
+        return {
+            "eligible": False,
+            "reason": "too_old",
+            "age_seconds": round(age_seconds, 4),
+            "max_age_seconds": max_age,
+            "late_by_seconds": round(late_by_seconds, 4),
+        }
+    if now_dt < horizon_dt:
+        return {
+            "eligible": False,
+            "reason": "horizon_not_elapsed",
+            "age_seconds": round(age_seconds, 4),
+            "late_by_seconds": round(late_by_seconds, 4),
+        }
+    return {
+        "eligible": True,
+        "reason": "eligible",
+        "age_seconds": round(age_seconds, 4),
+        "target_horizon_seconds": max(60, int(horizon_seconds or 86400)),
+        "horizon_at": horizon_dt.isoformat(timespec="seconds"),
+        "late_by_seconds": round(late_by_seconds, 4),
+    }
+
+
+def _late_backfill_allowed_for_snapshot_sync(
+    scan_time: str,
+    horizon_seconds: int,
+) -> bool:
+    state = _late_backfill_candidate_state(scan_time, horizon_seconds)
+    return bool(state.get("eligible"))
+
+
 def _fetch_future_price_rows(
     conn: sqlite3.Connection,
     *,
@@ -1953,6 +2290,58 @@ def _fetch_future_price_rows(
     estimated = max(32, int(horizon_seconds / 30) + 10)
     row_limit = max(configured, estimated)
     return rows[:row_limit]
+
+
+def _fetch_late_backfill_price_rows(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str,
+    scan_id: str,
+    scan_time: str,
+    horizon_seconds: int,
+    diagnostics: dict[str, Any] | None = None,
+) -> tuple[list[sqlite3.Row], dict[str, Any]]:
+    state = _late_backfill_candidate_state(scan_time, horizon_seconds)
+    if diagnostics is not None:
+        diagnostics["late_backfill_examined_count"] = int(
+            diagnostics.get("late_backfill_examined_count") or 0
+        ) + 1
+    if not state.get("eligible"):
+        if diagnostics is not None:
+            _increment_reason(
+                diagnostics,
+                "late_backfill_skipped_by_reason",
+                str(state.get("reason") or "not_eligible"),
+            )
+        return [], state
+
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT created_at, current_price, raw_json
+        FROM universe_price_snapshots
+        WHERE symbol = ?
+          AND scan_id != ?
+          AND created_at > ?
+          AND current_price IS NOT NULL
+          AND current_price > 0
+        ORDER BY created_at ASC
+        """,
+        (
+            symbol,
+            scan_id,
+            scan_time,
+        ),
+    ).fetchall()
+    if not rows:
+        if diagnostics is not None:
+            _increment_reason(
+                diagnostics,
+                "late_backfill_skipped_by_reason",
+                "no_later_snapshot",
+            )
+        return [], {**state, "reason": "no_later_snapshot"}
+    return rows, state
 
 
 def _fetch_excursion_price_rows(
@@ -2077,9 +2466,33 @@ def _iter_label_candidates(
     cutoff: str,
     batch_size: int,
     max_rows: int | None,
+    newest_first: bool = False,
 ) -> Iterator[sqlite3.Row]:
-    """Walk candidate history oldest-first so labels are not dropped by horizon expiry."""
+    """Walk candidate history for label refresh without starving newer scans."""
     source_conn.row_factory = sqlite3.Row
+    if newest_first:
+        rows = source_conn.execute(
+            f"""
+            SELECT *
+            FROM scanner_candidate_history
+            WHERE scan_time >= ?
+              AND current_price IS NOT NULL
+              AND current_price > 0
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (cutoff, max(1, int(max_rows or batch_size))),
+        ).fetchall()
+        yielded = 0
+        for row in rows:
+            if int(row["id"]) in labeled_ids:
+                continue
+            yield row
+            yielded += 1
+            if max_rows is not None and yielded >= max_rows:
+                return
+        return
+
     last_id = 0
     yielded = 0
     while True:
@@ -2113,6 +2526,7 @@ def _iter_label_candidates(
 def _append_labeling_price_snapshots(
     *,
     universe_path: Path,
+    calibration_path: Path | str | None = None,
     horizon_seconds: int,
     max_symbols: int | None = None,
 ) -> dict[str, Any]:
@@ -2128,8 +2542,8 @@ def _append_labeling_price_snapshots(
         1,
         int(max_symbols or settings.edge_calibration_label_snapshot_max_symbols or 200),
     )
-    calibration_path = _db_path()
-    labeled_ids = _labeled_candidate_ids(calibration_path)
+    resolved_calibration_path = _db_path(calibration_path)
+    labeled_ids = _labeled_candidate_ids(resolved_calibration_path)
     cutoff = _candidate_cutoff_time(horizon_seconds)
     symbols: list[str] = []
 
@@ -2152,11 +2566,16 @@ def _append_labeling_price_snapshots(
         for row in rows:
             if int(row["id"]) in labeled_ids:
                 continue
-            if settings.edge_calibration_label_at_horizon_end and not _label_window_contains_now(
-                str(row["scan_time"]),
-                horizon_seconds,
-            ):
-                continue
+            if settings.edge_calibration_label_at_horizon_end:
+                scan_time = str(row["scan_time"])
+                if not _label_window_contains_now(
+                    scan_time,
+                    horizon_seconds,
+                ) and not _late_backfill_allowed_for_snapshot_sync(
+                    scan_time,
+                    horizon_seconds,
+                ):
+                    continue
             symbol = str(row["symbol"])
             if symbol in seen:
                 continue
@@ -2244,6 +2663,7 @@ def _training_payload_from_candidate_row(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     horizon_seconds: int,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     status = _row_value(row, "status")
     if not _is_edge_training_sample_status_allowed(status):
@@ -2261,8 +2681,22 @@ def _training_payload_from_candidate_row(
         scan_time=scan_time,
         horizon_seconds=horizon_seconds,
     )
+    label_mode = "horizon_window"
+    label_price_source = "latest_snapshot"
+    late_backfill_state: dict[str, Any] | None = None
     if not future_rows:
-        return None
+        future_rows, late_backfill_state = _fetch_late_backfill_price_rows(
+            conn,
+            symbol=str(row["symbol"]),
+            scan_id=scan_id,
+            scan_time=scan_time,
+            horizon_seconds=horizon_seconds,
+            diagnostics=diagnostics,
+        )
+        if not future_rows:
+            return None
+        label_mode = "late_backfill"
+        label_price_source = "latest_snapshot"
     excursion_rows = _fetch_excursion_price_rows(
         conn,
         symbol=str(row["symbol"]),
@@ -2328,6 +2762,13 @@ def _training_payload_from_candidate_row(
         scan_time=scan_time,
         horizon_seconds=horizon_seconds,
     )
+    status_weight_multiplier = _sample_weight_multiplier_for_status(status)
+    late_sample_weight = (
+        max(0.0, float(settings.edge_calibration_late_label_sample_weight or 0.5))
+        if label_mode == "late_backfill"
+        else 1.0
+    )
+    base_weight = status_weight_multiplier * late_sample_weight
     return {
         "source_candidate_id": int(row["id"]),
         "scan_id": scan_id,
@@ -2351,6 +2792,7 @@ def _training_payload_from_candidate_row(
         "composite_score": _to_float(row["composite_score"]),
         "rank": _to_int(row["rank"]),
         "status": row["status"],
+        "base_weight": base_weight,
         **metadata,
         "raw_json": {
             "scan_id": scan_id,
@@ -2358,6 +2800,15 @@ def _training_payload_from_candidate_row(
             "candidate": raw_payload,
             "feature_map": feature_map,
             "label_policy": label_policy_summary(),
+            "label_mode": label_mode,
+            "target_horizon_seconds": horizon_seconds,
+            "late_by_seconds": (
+                _round_optional((late_backfill_state or {}).get("late_by_seconds"))
+                if late_backfill_state
+                else None
+            ),
+            "original_scan_time": scan_time,
+            "label_price_source": label_price_source,
             "label_observation_span_seconds": label_observation_span,
             "risk_policy": {
                 "realized_risk_bps": realized_risk_bps,
@@ -2374,6 +2825,9 @@ def _training_payload_from_candidate_row(
                 "liquidity_drag_bps": liquidity_drag_bps,
                 "net_edge_bps": net_edge_bps,
                 "composite_score": _to_float(row["composite_score"]),
+                "base_weight": base_weight,
+                "status_weight_multiplier": status_weight_multiplier,
+                "late_backfill_sample_weight": late_sample_weight,
             },
             "source": "scanner_candidate_history",
         },
@@ -2386,11 +2840,17 @@ def _refresh_training_samples(
     universe_path: Path,
     horizon_seconds: int,
     candidate_limit: int | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     inserted_count = 0
     skipped_count = 0
     examined_count = 0
     purged_invalid_count = 0
+    diagnostics: dict[str, Any] = {
+        "late_backfill_examined_count": 0,
+        "late_backfill_inserted_count": 0,
+        "late_backfill_skipped_count": 0,
+        "late_backfill_skipped_by_reason": {},
+    }
     if not universe_path.exists():
         return {
             "examined_count": 0,
@@ -2398,6 +2858,7 @@ def _refresh_training_samples(
             "skipped_count": 0,
             "unlabeled_examined_count": 0,
             "purged_invalid_label_count": 0,
+            **diagnostics,
         }
     initialize_edge_calibration_db(calibration_path)
     cutoff = _candidate_cutoff_time(horizon_seconds)
@@ -2422,17 +2883,38 @@ def _refresh_training_samples(
                 cutoff=cutoff,
                 batch_size=batch_size,
                 max_rows=max_rows,
+                newest_first=candidate_limit is not None,
             ):
                 examined_count += 1
                 payload = _training_payload_from_candidate_row(
                     conn=source_conn,
                     row=row,
                     horizon_seconds=horizon_seconds,
+                    diagnostics=diagnostics,
                 )
                 if payload is None:
                     skipped_count += 1
                     continue
-                inserted_count += _store_training_sample(target_conn, payload)
+                inserted = _store_training_sample(target_conn, payload)
+                inserted_count += inserted
+                raw_json = payload.get("raw_json")
+                if (
+                    isinstance(raw_json, dict)
+                    and raw_json.get("label_mode") == "late_backfill"
+                ):
+                    if inserted:
+                        diagnostics["late_backfill_inserted_count"] = int(
+                            diagnostics.get("late_backfill_inserted_count") or 0
+                        ) + 1
+                    else:
+                        diagnostics["late_backfill_skipped_count"] = int(
+                            diagnostics.get("late_backfill_skipped_count") or 0
+                        ) + 1
+                        _increment_reason(
+                            diagnostics,
+                            "late_backfill_skipped_by_reason",
+                            "deduplicated",
+                        )
                 labeled_ids.add(int(payload["source_candidate_id"]))
             _prune_training_samples(target_conn)
             target_conn.commit()
@@ -2443,14 +2925,28 @@ def _refresh_training_samples(
             "inserted_count": inserted_count,
             "skipped_count": skipped_count,
             "purged_invalid_label_count": purged_invalid_count,
+            **diagnostics,
             "error": str(exc),
         }
+    late_examined = int(diagnostics.get("late_backfill_examined_count") or 0)
+    late_inserted = int(diagnostics.get("late_backfill_inserted_count") or 0)
+    late_skipped_by_reason = diagnostics.get("late_backfill_skipped_by_reason")
+    if isinstance(late_skipped_by_reason, dict):
+        late_reason_total = sum(int(value or 0) for value in late_skipped_by_reason.values())
+    else:
+        late_reason_total = 0
+    diagnostics["late_backfill_skipped_count"] = max(
+        int(diagnostics.get("late_backfill_skipped_count") or 0),
+        max(0, late_examined - late_inserted),
+        late_reason_total,
+    )
     return {
         "examined_count": examined_count,
         "inserted_count": inserted_count,
         "skipped_count": skipped_count,
         "unlabeled_examined_count": examined_count,
         "purged_invalid_label_count": purged_invalid_count,
+        **diagnostics,
     }
 
 
@@ -2589,10 +3085,12 @@ def _iter_training_samples_from_store(
     *,
     calibration_path: Path,
     limit: int,
-) -> Iterator[tuple[list[float], float, float, float]]:
+) -> Iterator[tuple[list[float], float, float, float, float]]:
     initialize_edge_calibration_db(calibration_path)
     with sqlite3.connect(calibration_path) as conn:
         conn.row_factory = sqlite3.Row
+        training_scope = _edge_training_scope(conn)
+        where_sql = str(training_scope["where_sql"])
         rows = conn.execute(
             f"""
             WITH ranked AS (
@@ -2603,9 +3101,14 @@ def _iter_training_samples_from_store(
                         ORDER BY observed_at ASC, id ASC
                     ) AS symbol_horizon_rank
                 FROM edge_training_samples
-                WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                WHERE {where_sql}
             )
-            SELECT features_json, realized_return_bps, realized_risk_bps, sample_weight
+            SELECT
+                features_json,
+                realized_return_bps,
+                realized_risk_bps,
+                {REALIZED_NET_EDGE_SQL} AS realized_net_edge_bps,
+                sample_weight
             FROM (
                 SELECT *
                 FROM ranked
@@ -2629,7 +3132,7 @@ def _iter_training_samples_from_store(
 
 def _training_sample_from_row(
     row: sqlite3.Row,
-) -> tuple[list[float], float, float, float] | None:
+) -> tuple[list[float], float, float, float, float] | None:
     features = _parse_json(row["features_json"], None)
     if not isinstance(features, list) or len(features) != len(FEATURE_NAMES):
         return None
@@ -2644,6 +3147,13 @@ def _training_sample_from_row(
             0.0,
             800.0,
         )
+        realized_net_edge_bps = _clip_bps(
+            _to_float(_row_value(row, "realized_net_edge_bps")) or (
+                realized_return_bps - realized_risk_bps * REALIZED_RISK_WEIGHT
+            ),
+            -1200.0,
+            1200.0,
+        )
         sample_weight = _clip_bps(
             _to_float(_row_value(row, "sample_weight")) or 1.0,
             0.1,
@@ -2653,6 +3163,7 @@ def _training_sample_from_row(
             [float(value) for value in features],
             realized_return_bps,
             realized_risk_bps,
+            realized_net_edge_bps,
             sample_weight,
         )
     except (TypeError, ValueError):
@@ -2689,10 +3200,10 @@ def _evaluate_model(
 
 
 def _performance_split(
-    samples: list[tuple[list[float], float, float, float]],
+    samples: list[tuple[list[float], float, float, float, float]],
 ) -> tuple[
-    list[tuple[list[float], float, float, float]],
-    list[tuple[list[float], float, float, float]],
+    list[tuple[list[float], float, float, float, float]],
+    list[tuple[list[float], float, float, float, float]],
 ]:
     if len(samples) <= 1:
         return samples, []
@@ -2702,23 +3213,65 @@ def _performance_split(
 
 
 def _model_metrics_for_samples(
-    samples: list[tuple[list[float], float, float, float]],
+    samples: list[tuple[list[float], float, float, float, float]],
     *,
     return_coefficients: dict[str, float],
     risk_coefficients: dict[str, float],
+    net_edge_coefficients: dict[str, float] | None = None,
 ) -> dict[str, float | None]:
     count = 0
     return_error = 0.0
     risk_error = 0.0
-    for features, realized_return_bps, realized_risk_bps, _sample_weight in samples:
+    net_edge_formula_error = 0.0
+    net_edge_direct_error = 0.0
+    net_edge_blended_error = 0.0
+    direct_count = 0
+    direct_weight = 0.7 if len(samples) >= 600 else 0.3
+    for (
+        features,
+        realized_return_bps,
+        realized_risk_bps,
+        realized_net_edge_bps,
+        _sample_weight,
+    ) in samples:
         feature_map = dict(zip(FEATURE_NAMES, features, strict=True))
-        return_error += abs(_predict(return_coefficients, feature_map) - realized_return_bps)
-        risk_error += abs(_predict(risk_coefficients, feature_map) - realized_risk_bps)
+        predicted_return = _predict(return_coefficients, feature_map)
+        predicted_risk = _predict(risk_coefficients, feature_map)
+        predicted_formula_net_edge = estimate_expected_net_edge_bps(
+            expected_return_bps=predicted_return,
+            expected_risk_bps=predicted_risk,
+        )
+        return_error += abs(predicted_return - realized_return_bps)
+        risk_error += abs(predicted_risk - realized_risk_bps)
+        net_edge_formula_error += abs(
+            predicted_formula_net_edge - realized_net_edge_bps
+        )
+        if net_edge_coefficients:
+            predicted_direct_net_edge = _predict(net_edge_coefficients, feature_map)
+            blended_net_edge = (
+                direct_weight * predicted_direct_net_edge
+                + (1.0 - direct_weight) * predicted_formula_net_edge
+            )
+            net_edge_direct_error += abs(
+                predicted_direct_net_edge - realized_net_edge_bps
+            )
+            net_edge_blended_error += abs(blended_net_edge - realized_net_edge_bps)
+            direct_count += 1
         count += 1
     return {
         "sample_count": count,
         "mae_return_bps": round(return_error / count, 4) if count else None,
         "mae_risk_bps": round(risk_error / count, 4) if count else None,
+        "mae_net_edge_formula_bps": (
+            round(net_edge_formula_error / count, 4) if count else None
+        ),
+        "mae_net_edge_direct_bps": (
+            round(net_edge_direct_error / direct_count, 4) if direct_count else None
+        ),
+        "mae_net_edge_blended_bps": (
+            round(net_edge_blended_error / direct_count, 4) if direct_count else None
+        ),
+        "net_edge_direct_weight": round(direct_weight, 4) if direct_count else 0.0,
     }
 
 
@@ -2750,6 +3303,7 @@ def _top10_candidate_rows(
 ) -> list[dict[str, Any]]:
     with sqlite3.connect(calibration_path) as conn:
         conn.row_factory = sqlite3.Row
+        training_where_sql = str(_edge_training_scope(conn)["where_sql"])
         rows = conn.execute(
             f"""
             WITH ranked AS (
@@ -2762,7 +3316,7 @@ def _top10_candidate_rows(
                 FROM edge_training_samples
                 WHERE rank IS NOT NULL
                   AND rank <= 10
-                  AND {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}
+                  AND {training_where_sql}
             )
             SELECT
                 id, source_candidate_id, scan_id, label_horizon_key, symbol,
@@ -3539,10 +4093,7 @@ def _record_top10_performance(
 def _stored_sample_count(path: Path) -> int:
     initialize_edge_calibration_db(path)
     with sqlite3.connect(path) as conn:
-        return int(
-            conn.execute(f"SELECT COUNT(*) FROM edge_training_samples WHERE {ELIGIBLE_EDGE_SAMPLE_STATUS_SQL}").fetchone()[0]
-            or 0
-        )
+        return int(_edge_training_scope(conn)["training_sample_count"] or 0)
 
 
 def _empty_sample_message(diagnostics: dict[str, Any]) -> str:
@@ -3745,6 +4296,62 @@ def _round_optional(value: Any, digits: int = 4) -> float | None:
     return round(float(value), digits)
 
 
+def _model_sample_count(model: dict[str, Any] | None) -> int:
+    meta = (model or {}).get("_meta") if isinstance(model, dict) else None
+    if isinstance(meta, dict):
+        return int(_to_float(meta.get("sample_count")) or 0)
+    return 0
+
+
+def _model_oos_sample_count(model: dict[str, Any] | None) -> int:
+    meta = (model or {}).get("_meta") if isinstance(model, dict) else None
+    if isinstance(meta, dict):
+        return int(_to_float(meta.get("oos_sample_count")) or 0)
+    return 0
+
+
+def _model_recent_ic(model: dict[str, Any] | None) -> float | None:
+    meta = (model or {}).get("_meta") if isinstance(model, dict) else None
+    if isinstance(meta, dict):
+        return _to_float(meta.get("recent_ic"))
+    return None
+
+
+def _model_mae_net_edge(model: dict[str, Any] | None) -> float | None:
+    meta = (model or {}).get("_meta") if isinstance(model, dict) else None
+    if isinstance(meta, dict):
+        return _to_float(meta.get("mae_net_edge_blended_bps"))
+    return None
+
+
+def _calibration_confidence_from_model(model: dict[str, Any] | None) -> float:
+    sample_count = _model_sample_count(model)
+    oos_sample_count = _model_oos_sample_count(model)
+    recent_ic = _model_recent_ic(model)
+    mae_net_edge = _model_mae_net_edge(model)
+    confidence = 0.0
+    if sample_count >= int(settings.edge_calibration_gate_min_samples or 100):
+        confidence += 0.4
+    if oos_sample_count >= int(settings.edge_calibration_gate_min_oos_samples or 20):
+        confidence += 0.3
+    if recent_ic is not None and recent_ic >= 0.02:
+        confidence += 0.2
+    threshold = float(settings.edge_calibration_gate_max_mae_net_edge_bps or 180.0)
+    if mae_net_edge is not None and mae_net_edge <= threshold:
+        confidence += 0.1
+    return max(0.0, min(1.0, confidence))
+
+
+def _ic_edge_multiplier(recent_ic: float | None) -> float:
+    if recent_ic is None:
+        return 1.0
+    if recent_ic < float(settings.edge_calibration_defensive_fallback_ic_threshold or -0.05):
+        return max(0.0, float(settings.edge_calibration_negative_ic_edge_multiplier or 0.5))
+    if recent_ic < 0:
+        return max(0.0, float(settings.edge_calibration_bad_ic_edge_multiplier or 0.7))
+    return 1.0
+
+
 def _accumulate(
     matrix: list[list[float]], 
     vector: list[float],
@@ -3823,12 +4430,14 @@ def _store_coefficients(
     run_id: int,
     return_coefficients: dict[str, float],
     risk_coefficients: dict[str, float],
+    net_edge_coefficients: dict[str, float],
     updated_at: str,
 ) -> None:
     rows = []
     for target, coefficients in (
         ("expected_return", return_coefficients),
         ("expected_risk", risk_coefficients),
+        ("expected_net_edge", net_edge_coefficients),
     ):
         rows.extend(
             (target, feature, float(coefficients[feature]), updated_at, run_id)

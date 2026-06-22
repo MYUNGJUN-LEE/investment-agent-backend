@@ -749,16 +749,24 @@ def _run_cycle(
             return results_prefix
         if settings.edge_calibration_enabled and settings.edge_calibration_refresh_after_scan:
             try:
-                label_refresh = refresh_edge_training_samples()
+                label_refresh = refresh_edge_training_samples(
+                    candidate_limit=max(
+                        1,
+                        int(settings.edge_calibration_refresh_after_scan_limit or 200),
+                    )
+                )
                 results_prefix[0]["label_refresh"] = label_refresh
+                results_prefix[0]["edge_label_refresh_after_scan"] = label_refresh
                 results_prefix[0]["stored_sample_count"] = label_refresh.get(
                     "stored_sample_count"
                 )
             except Exception as exc:
-                results_prefix[0]["label_refresh"] = {
+                label_refresh = {
                     "status": "error",
                     "message": str(exc),
                 }
+                results_prefix[0]["label_refresh"] = label_refresh
+                results_prefix[0]["edge_label_refresh_after_scan"] = label_refresh
 
     if _requires_live_exit_confirmation(req) and any(
         symbol_cfg.requested_action == "exit" for symbol_cfg in symbols

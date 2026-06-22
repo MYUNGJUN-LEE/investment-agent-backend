@@ -641,6 +641,83 @@ def test_high_quality_swing_candidate_lifts_fill_adjusted_edge(monkeypatch):
     assert "atr_rr" in scored["edge_model"]
 
 
+def test_negative_recent_ic_discounts_scanner_net_edge(monkeypatch):
+    candidate = {
+        "symbol": "005930",
+        "name": "Samsung Electronics",
+        "score": 80,
+        "decision": "buy_candidate",
+        "current_price": 70_000,
+        "change_rate": 1.5,
+        "volume": 1_000_000,
+        "volume_ratio": 1.5,
+        "turnover_value": 70_000_000_000,
+        "overheated": False,
+    }
+
+    def calibrated_with_ic(recent_ic):
+        return lambda candidate, raw_score, model=None: {
+            "expected_return": 180.0,
+            "expected_risk": 60.0,
+            "edge_model": "calibrated_test",
+            "calibration_confidence": 1.0,
+            "recent_ic": recent_ic,
+            "ic_edge_multiplier": 0.5,
+            "ranking_mode": "defensive_fallback" if recent_ic < -0.05 else "calibrated",
+        }
+
+    monkeypatch.setattr(
+        universe_scanner,
+        "estimate_expected_edges",
+        calibrated_with_ic(0.05),
+    )
+    positive = universe_scanner._with_expected_value_scores(
+        candidate,
+        expires_at="2026-05-25T10:00:00",
+        edge_model={"expected_return": {"bias": 180.0}, "expected_risk": {"bias": 60.0}},
+    )
+
+    monkeypatch.setattr(
+        universe_scanner,
+        "estimate_expected_edges",
+        calibrated_with_ic(-0.06),
+    )
+    negative = universe_scanner._with_expected_value_scores(
+        candidate,
+        expires_at="2026-05-25T10:00:00",
+        edge_model={"expected_return": {"bias": 180.0}, "expected_risk": {"bias": 60.0}},
+    )
+
+    assert negative["net_edge"] < positive["net_edge"]
+    assert negative["ranking_mode"] == "defensive_fallback"
+    assert negative["ic_edge_multiplier"] == 0.5
+
+
+def test_edge_label_refresh_after_scan_uses_configured_limit(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(universe_scanner.settings, "edge_calibration_enabled", True)
+    monkeypatch.setattr(universe_scanner.settings, "edge_calibration_refresh_after_scan", True)
+    monkeypatch.setattr(universe_scanner.settings, "edge_calibration_refresh_after_scan_limit", 123)
+    monkeypatch.setattr(
+        universe_scanner,
+        "refresh_edge_training_samples",
+        lambda **kwargs: captured.update(kwargs) or {
+            "status": "success",
+            "examined_count": 1,
+            "inserted_count": 1,
+            "late_backfill_inserted_count": 1,
+        },
+    )
+
+    result = universe_scanner._edge_label_refresh_after_scan(tmp_path / "universe.sqlite3")
+
+    assert result["enabled"] is True
+    assert result["status"] == "success"
+    assert result["late_backfill_inserted_count"] == 1
+    assert captured["candidate_limit"] == 123
+    assert captured["universe_db_path"] == tmp_path / "universe.sqlite3"
+
+
 def test_universe_filters_block_illiquid_macro_and_inverse_alignment(monkeypatch):
     base = {
         "symbol": "005930",

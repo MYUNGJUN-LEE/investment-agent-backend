@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import sqlite3
 
 from app.trading import edge_calibration
@@ -56,10 +57,12 @@ def test_edge_calibration_fits_coefficients_from_scanner_history(tmp_path, monke
 
     assert result["status"] == "success"
     assert result["sample_count"] == 2
-    assert status["coefficient_count"] == len(edge_calibration.FEATURE_NAMES) * 2
+    assert status["coefficient_count"] == len(edge_calibration.FEATURE_NAMES) * 3
     assert "expected_return" in model
+    assert "expected_net_edge" in model
     assert estimate is not None
-    assert estimate["edge_model"] == "calibrated_ridge_v2_cost_adjusted"
+    assert estimate["edge_model"] == "calibrated_ridge_v3_direct_net_edge"
+    assert estimate["predicted_net_edge_direct"] is not None
 
 
 def test_label_age_blocks_immediate_future_snapshot(tmp_path, monkeypatch):
@@ -1146,6 +1149,154 @@ def test_broker_paper_fill_gate_hard_blocks_after_enough_bad_fills(monkeypatch):
     assert "Broker-paper fill calibration gate blocked entries" in gate["message"]
 
 
+def test_late_backfill_labels_candidate_after_horizon_window(
+    tmp_path, monkeypatch
+):
+    universe_db = tmp_path / "universe.sqlite3"
+    calibration_db = tmp_path / "edge.sqlite3"
+    now = datetime.now().replace(microsecond=0)
+    scan_time = (now - timedelta(days=2)).isoformat(timespec="seconds")
+    observed_at = now.isoformat(timespec="seconds")
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_horizon_seconds", 3600)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_label_at_horizon_end", True)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_label_horizon_tolerance_seconds", 0)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_min_future_snapshots", 2)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_label_snapshots_enabled", False)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_late_label_backfill_enabled", True)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_late_label_min_age_seconds", 3600)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_late_label_max_age_seconds", 7 * 86400)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_late_label_sample_weight", 0.5)
+
+    universe_scanner.initialize_universe_db(universe_db)
+    with sqlite3.connect(universe_db) as conn:
+        _insert_candidate(
+            conn,
+            scan_id="scan-a",
+            scan_time=scan_time,
+            symbol="005930",
+            raw_score=80,
+            current_price=100,
+        )
+        _insert_price(
+            conn,
+            scan_id="late-snapshot",
+            created_at=observed_at,
+            symbol="005930",
+            price=105,
+        )
+
+    result = edge_calibration.refresh_edge_training_samples(
+        universe_db_path=universe_db,
+        calibration_db_path=calibration_db,
+        horizon_seconds=3600,
+    )
+
+    assert result["inserted_count"] == 1
+    assert result["late_backfill_examined_count"] == 1
+    assert result["late_backfill_inserted_count"] == 1
+    with sqlite3.connect(calibration_db) as conn:
+        row = conn.execute(
+            "SELECT sample_weight, raw_json FROM edge_training_samples"
+        ).fetchone()
+    raw = edge_calibration._parse_json(row[1], {})
+    assert row[0] == 0.5
+    assert raw["label_mode"] == "late_backfill"
+    assert raw["target_horizon_seconds"] == 3600
+    assert raw["label_price_source"] == "latest_snapshot"
+
+
+def test_observed_statuses_are_included_with_bootstrap_weights(
+    tmp_path, monkeypatch
+):
+    calibration_db = tmp_path / "edge.sqlite3"
+    monkeypatch.setattr(
+        edge_calibration.settings,
+        "edge_calibration_include_observed_statuses_during_bootstrap",
+        True,
+    )
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_bootstrap_sample_threshold", 600)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_observe_only_sample_weight", 0.5)
+    monkeypatch.setattr(edge_calibration.settings, "edge_calibration_risk_rejected_sample_weight", 0.25)
+    edge_calibration.initialize_edge_calibration_db(calibration_db)
+    base_payload = {
+        "scan_id": "scan-a",
+        "label_horizon_key": None,
+        "scan_time": "2026-05-24T09:00:00",
+        "observed_at": "2026-05-25T09:00:00",
+        "entry_price": 100.0,
+        "observed_price": 101.0,
+        "features": [1.0] + [0.0] * (len(edge_calibration.FEATURE_NAMES) - 1),
+        "realized_return_bps": 100.0,
+        "realized_risk_bps": 10.0,
+        "trading_cost_bps": 0.0,
+        "slippage_cost_bps": 0.0,
+        "net_edge_bps": 0.0,
+        "rank": 1,
+        "raw_json": {},
+    }
+    with sqlite3.connect(calibration_db) as conn:
+        edge_calibration._store_training_sample(
+            conn,
+            {
+                **base_payload,
+                "source_candidate_id": 1,
+                "symbol": "005930",
+                "status": "READY_OBSERVE_ONLY",
+                "base_weight": edge_calibration._sample_weight_multiplier_for_status(
+                    "READY_OBSERVE_ONLY"
+                ),
+            },
+        )
+        edge_calibration._store_training_sample(
+            conn,
+            {
+                **base_payload,
+                "source_candidate_id": 2,
+                "symbol": "000660",
+                "status": "RISK_REJECTED",
+                "base_weight": edge_calibration._sample_weight_multiplier_for_status(
+                    "RISK_REJECTED"
+                ),
+            },
+        )
+
+    summary = edge_calibration.get_edge_training_sample_summary(
+        calibration_db_path=calibration_db,
+    )
+    samples = list(
+        edge_calibration._iter_training_samples_from_store(
+            calibration_path=calibration_db,
+            limit=10,
+        )
+    )
+
+    assert summary["eligible_sample_count"] == 0
+    assert summary["observed_sample_count"] == 2
+    assert summary["training_sample_count"] == 2
+    assert summary["bootstrap_observed_statuses_included"] is True
+    assert summary["sample_count_by_status"]["READY_OBSERVE_ONLY"] == 1
+    assert summary["sample_count_by_status"]["RISK_REJECTED"] == 1
+    assert [sample[-1] for sample in samples] == [0.5, 0.25]
+
+
+def test_expected_net_edge_direct_falls_back_to_formula_without_coefficients():
+    model = {
+        "expected_return": {"bias": 100.0},
+        "expected_risk": {"bias": 50.0},
+    }
+
+    estimate = edge_calibration.estimate_expected_edges(
+        {"turnover_value": 50_000_000_000},
+        0,
+        model=model,
+    )
+
+    assert estimate is not None
+    assert estimate["predicted_net_edge_direct"] is None
+    assert estimate["net_edge_direct_weight"] == 0.0
+    assert estimate["final_net_edge"] == estimate["formula_net_edge"]
+
+
 def _insert_candidate(
     conn: sqlite3.Connection,
     *,
@@ -1252,7 +1403,7 @@ def _insert_training_sample(
             symbol,
             scan_time,
             observed_at,
-            "[1,0,0,0,0,0,0,0,0,0]",
+            edge_calibration._json([1.0] + [0.0] * (len(edge_calibration.FEATURE_NAMES) - 1)),
             realized_return_bps,
             label_observation_span_seconds,
             raw_score,
