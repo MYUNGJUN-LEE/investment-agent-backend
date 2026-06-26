@@ -2,7 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from app.config import settings
-from app.main import app
+from app.main import _admin_runtime_summary, app
 
 client = TestClient(app)
 
@@ -170,6 +170,28 @@ def test_admin_runtime_status_endpoint_returns_compact_summary():
     )
     assert expanded.status_code == 200
     assert expanded.json()["latest_universe"] is not None
+
+
+def test_admin_runtime_summary_marks_idle_old_scan_as_stale():
+    summary = _admin_runtime_summary(
+        generated_at="2026-06-26T00:00:00",
+        auto_status={"active_sessions": [], "recent_sessions": []},
+        samples={
+            "sample_count": 6,
+            "diagnostics": {
+                "universe_scan_count": 1,
+                "latest_scan_time": "2026-06-25T00:00:00",
+            },
+            "label_policy": {},
+            "top10_performance": {"sample_count": 6},
+        },
+        latest_universe={"scan_id": "scan-old", "status": "success"},
+        workers={"workers": [{"name": "trading_worker", "alive": True}]},
+    )
+
+    assert summary["scanner_state"] == "idle"
+    assert summary["scanner_is_stale"] is True
+    assert summary["latest_scan_age_seconds"] > summary["scanner_stale_after_seconds"]
 
 
 def test_edge_training_samples_refresh_endpoint_returns_diagnostics(monkeypatch):

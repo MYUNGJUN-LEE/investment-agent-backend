@@ -1307,6 +1307,11 @@ def _admin_runtime_summary(
     latest_scan_age_seconds = _age_seconds(latest_scan_time, now_dt)
     next_run_lag_seconds = _age_seconds(latest_next_run_at, now_dt)
     stale_after_seconds = _scanner_stale_after_seconds(active_sessions)
+    scanner_is_stale = bool(
+        scan_count > 0
+        and latest_scan_age_seconds is not None
+        and latest_scan_age_seconds > stale_after_seconds
+    )
     locked_sessions = [
         row
         for row in raw_active_sessions
@@ -1319,9 +1324,7 @@ def _admin_runtime_summary(
 
     if active_sessions and trading_worker_alive:
         if (
-            scan_count > 0
-            and latest_scan_age_seconds is not None
-            and latest_scan_age_seconds > stale_after_seconds
+            scanner_is_stale
             and next_run_lag_seconds is not None
             and next_run_lag_seconds > stale_after_seconds
         ):
@@ -1353,7 +1356,7 @@ def _admin_runtime_summary(
 
     return {
         "scanner_state": scanner_state,
-        "scanner_is_stale": scanner_state == "stale",
+        "scanner_is_stale": scanner_is_stale,
         "sample_state": sample_state,
         "active_session_count": len(active_sessions),
         "latest_session_status": latest_session.get("status") if latest_session else None,
