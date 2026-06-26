@@ -82,13 +82,41 @@ services:
       - key: EDGE_CALIBRATION_FUTURE_PRICE_LIMIT
         value: "1200"
       - key: EDGE_CALIBRATION_REFRESH_AFTER_SCAN
-        value: "false"
+        value: "true"
+      - key: EDGE_CALIBRATION_REFRESH_AFTER_SCAN_LIMIT
+        value: "200"
       - key: EDGE_CALIBRATION_MIN_LABEL_AGE_SECONDS
         value: "300"
       - key: EDGE_CALIBRATION_MIN_FUTURE_SNAPSHOTS
         value: "2"
       - key: EDGE_CALIBRATION_LABEL_AT_HORIZON_END
         value: "true"
+      - key: EDGE_CALIBRATION_LATE_LABEL_BACKFILL_ENABLED
+        value: "true"
+      - key: EDGE_CALIBRATION_LATE_LABEL_MAX_AGE_SECONDS
+        value: "604800"
+      - key: EDGE_CALIBRATION_LATE_LABEL_MIN_AGE_SECONDS
+        value: "86400"
+      - key: EDGE_CALIBRATION_LATE_LABEL_SAMPLE_WEIGHT
+        value: "0.5"
+      - key: EDGE_CALIBRATION_INCLUDE_OBSERVED_STATUSES_DURING_BOOTSTRAP
+        value: "true"
+      - key: EDGE_CALIBRATION_OBSERVE_ONLY_SAMPLE_WEIGHT
+        value: "0.5"
+      - key: EDGE_CALIBRATION_RISK_REJECTED_SAMPLE_WEIGHT
+        value: "0.25"
+      - key: EDGE_CALIBRATION_BOOTSTRAP_SAMPLE_THRESHOLD
+        value: "600"
+      - key: EDGE_CALIBRATION_USE_OPTIMISTIC_HEURISTIC_FLOOR
+        value: "false"
+      - key: EDGE_CALIBRATION_MIN_CONFIDENCE_FOR_CALIBRATED_EDGE
+        value: "0.5"
+      - key: EDGE_CALIBRATION_NEGATIVE_IC_EDGE_MULTIPLIER
+        value: "0.5"
+      - key: EDGE_CALIBRATION_BAD_IC_EDGE_MULTIPLIER
+        value: "0.7"
+      - key: EDGE_CALIBRATION_DEFENSIVE_FALLBACK_IC_THRESHOLD
+        value: "-0.05"
       - key: EDGE_CALIBRATION_RIDGE_LAMBDA
         value: "10"
       - key: EDGE_CALIBRATION_BLEND
